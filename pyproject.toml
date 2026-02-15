@@ -1,0 +1,43 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "memu-memory"
+version = "0.1.0"
+description = "Free, open-source shared memory for AI agents."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [{ name = "Protelynx", email = "hello@protelynx.ai" }]
+keywords = ["ai", "agents", "memory", "vector-search", "pgvector", "rag"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "fastapi>=0.100",
+    "uvicorn>=0.20",
+    "asyncpg>=0.28",
+    "httpx>=0.24",
+    "pydantic>=2.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-asyncio", "ruff", "mypy"]
+
+[project.urls]
+Homepage = "https://github.com/protelynx/memu"
+Documentation = "https://github.com/protelynx/memu#readme"
+Issues = "https://github.com/protelynx/memu/issues"
+Consulting = "https://protelynx.ai"
+
+[project.scripts]
+memu = "memu.api:app"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
