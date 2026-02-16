@@ -6,7 +6,7 @@ CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 CREATE TABLE IF NOT EXISTS memories (
     id            UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     content       TEXT NOT NULL,
-    embedding     vector(1536),
+    embedding     vector(4096),  -- qwen3-embedding dimensions
     memory_type   VARCHAR(20) NOT NULL DEFAULT 'fact'
                   CHECK (memory_type IN ('fact', 'decision', 'lesson', 'pattern', 'failure')),
     agent_id      VARCHAR(64),

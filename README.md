@@ -63,8 +63,8 @@ Your agents' memories belong to you — not a SaaS vendor.
 ### Docker (recommended)
 
 ```bash
-git clone https://github.com/protelynx/memu.git
-cd memu
+git clone https://github.com/mfethe1/fumemory.git
+cd fumemory
 docker compose up -d
 ```
 
@@ -96,8 +96,8 @@ answer = client.chat("What have we learned about deployments?")
 ### From source
 
 ```bash
-git clone https://github.com/protelynx/memu.git
-cd memu
+git clone https://github.com/mfethe1/fumemory.git
+cd fumemory
 pip install -e .
 
 # Start Postgres with pgvector

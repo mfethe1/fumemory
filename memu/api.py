@@ -30,8 +30,9 @@ from memu.models import (
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://memu:memu@localhost:5432/memu")
 MEMU_API_KEY = os.environ.get("MEMU_API_KEY", "memu-dev-key")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
-EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "text-embedding-3-small")
-EMBEDDING_DIMS = int(os.environ.get("EMBEDDING_DIMS", "1536"))
+EMBEDDING_BASE_URL = os.environ.get("EMBEDDING_BASE_URL", "http://localhost:11434")
+EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "qwen3-embedding")
+EMBEDDING_DIMS = int(os.environ.get("EMBEDDING_DIMS", "4096"))
 DEDUP_THRESHOLD = float(os.environ.get("DEDUP_THRESHOLD", "0.95"))
 DECAY_RATE = float(os.environ.get("DECAY_RATE", "0.01"))
 
@@ -68,13 +69,18 @@ async def verify_api_key(key: str | None = Security(api_key_header)) -> str:
 # --- Embedding ---
 
 async def get_embedding(text: str) -> list[float]:
-    """Get embedding vector from OpenAI-compatible API."""
+    """Get embedding vector from any OpenAI-compatible API (Ollama, OpenAI, etc.)."""
     import httpx
 
-    async with httpx.AsyncClient() as client:
+    url = f"{EMBEDDING_BASE_URL.rstrip('/')}/v1/embeddings"
+    headers = {"Content-Type": "application/json"}
+    if OPENAI_API_KEY:
+        headers["Authorization"] = f"Bearer {OPENAI_API_KEY}"
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
         r = await client.post(
-            "https://api.openai.com/v1/embeddings",
-            headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+            url,
+            headers=headers,
             json={"input": text, "model": EMBEDDING_MODEL},
         )
         r.raise_for_status()
