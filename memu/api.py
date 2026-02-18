@@ -250,6 +250,47 @@ async def search_memories(req: SearchRequest, _key: str = Depends(verify_api_key
     return results[: req.limit]
 
 
+@app.post("/search-text")
+async def search_text(
+    query: str,
+    agent_id: str | None = None,
+    memory_type: str | None = None,
+    limit: int = 10,
+    _key: str = Depends(verify_api_key),
+):
+    """
+    Full-text search using PostgreSQL ILIKE — no embeddings needed.
+    Useful for environments without an embedding provider or for exact keyword lookups.
+    """
+    filters = ["content ILIKE $1"]
+    params: list[Any] = [f"%{query}%"]
+    idx = 2
+
+    if agent_id:
+        filters.append(f"agent_id = ${idx}")
+        params.append(agent_id)
+        idx += 1
+    if memory_type:
+        filters.append(f"memory_type = ${idx}")
+        params.append(memory_type)
+        idx += 1
+
+    where = " AND ".join(filters)
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            f"""
+            SELECT * FROM memories
+            WHERE {where}
+            ORDER BY updated_at DESC
+            LIMIT {limit}
+            """,
+            *params,
+        )
+
+    return [_row_to_memory(row) for row in rows]
+
+
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest, _key: str = Depends(verify_api_key)):
     """RAG chat — retrieves relevant memories and generates an answer."""
