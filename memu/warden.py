@@ -48,7 +48,12 @@ HEARTBEAT_TTL_S = int(os.environ.get("WARDEN_HEARTBEAT_TTL", "10"))
 HEARTBEAT_CHECK_INTERVAL_S = float(os.environ.get("WARDEN_CHECK_INTERVAL", "3.0"))
 SANDBOX_TIMEOUT_S = int(os.environ.get("WARDEN_SANDBOX_TIMEOUT", "30"))
 MAX_HYDRATION_TOKENS = int(os.environ.get("WARDEN_MAX_HYDRATION_TOKENS", "8000"))
-WARDEN_SECRET = os.environ.get("WARDEN_SECRET", "warden-dev-secret")
+WARDEN_SECRET = os.environ.get("WARDEN_SECRET", "")
+if not WARDEN_SECRET:
+    logger.warning(
+        "WARDEN_SECRET not set — respawn request signatures will be rejected. "
+        "Set WARDEN_SECRET env var in production."
+    )
 CRASH_LOOP_THRESHOLD = 3  # DLQ after this many crashes
 
 # Base Docker image for gateways
