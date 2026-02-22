@@ -184,7 +184,7 @@ class NATSClusterManager:
                 "servers": [url],
                 "connect_timeout": 5,
                 "reconnect_time_wait": 2,
-                "max_reconnect_attempts": -1,  # infinite
+                "max_reconnect_attempts": 2,  # bounded reconnects for bootstrap reliability
                 "ping_interval": 10,
                 "max_outstanding_pings": 3,
             }

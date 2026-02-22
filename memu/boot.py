@@ -243,6 +243,59 @@ async def start_heartbeat(cluster, interval_s: float = 3.0):
             await asyncio.sleep(1)
 
 
+
+# --- Swarm execution path (smoke mode) ---
+
+async def _run_smoke_task(cluster, task_id: str):
+    """Run a minimal lane-locked task loop so Glass Box sees lane claim + heartbeats."""
+    from uuid import UUID
+
+    from memu.lane_lock import LaneLockedExecution
+    from memu.swarm_models import SwarmEvent, EventType, TaskNode, TaskStatus
+
+    task_uuid = UUID(task_id)
+    task = TaskNode(
+        task_id=task_uuid,
+        root_prompt_id=task_uuid,
+        title=f"smoke-task-{task_id[:8]}",
+        description="Lenny smoke task for Warden/ledger visibility",
+        status=TaskStatus.CLAIMED,
+        assigned_gateway=GATEWAY_ID,
+        resource_lanes=["lane-smoke-task"],
+        rollback_instruction="noop",
+        compute_budget=0.0,
+    )
+
+    nc = cluster.active_connection
+    js = cluster.jetstream
+
+    # Ledger touch #1: explicit TASK_CLAIMED event
+    claimed = SwarmEvent(
+        source_gateway=GATEWAY_ID,
+        event_type=EventType.TASK_CLAIMED,
+        task_id=task_uuid,
+        payload={
+            "gateway_id": GATEWAY_ID,
+            "role": GATEWAY_ROLE,
+            "task_type": "smoke",
+        },
+    )
+    await nc.publish("swarm.events", claimed.model_dump_json().encode())
+
+    while True:
+        try:
+            async with LaneLockedExecution(js, task, GATEWAY_ID, nc) as executor:
+                # Keep lane lock alive so Warden can see heartbeat windows and lane contention.
+                while True:
+                    await asyncio.sleep(2)
+        except Exception as e:
+            # If lane is contested or transient, retry after backoff and keep container alive.
+            logger.warning(
+                "Lane lock or execution error while entering smoke task (%s), retrying", e
+            )
+            await asyncio.sleep(2)
+
+
 _boot_time = time.time()
 
 
@@ -310,12 +363,19 @@ async def main():
         pass  # Signal handlers not available on all platforms
 
     # Step 5: Run the actual agent logic
-    # This is where the gateway-specific agent loop goes.
-    # For now, just keep alive.
+    # If TASK_ID is set, run a deterministic lane-locked smoke task.
+    # Otherwise, keep container available as warm standby.
     try:
-        logger.info("Gateway ready. Waiting for tasks...")
-        while True:
-            await asyncio.sleep(1)
+        if TASK_ID:
+            logger.info("Starting smoke task execution for %s", TASK_ID)
+            try:
+                await _run_smoke_task(cluster, TASK_ID)
+            except Exception as e:
+                logger.exception("Smoke task execution failed: %s", e)
+        else:
+            logger.info("Gateway ready. Warm standby mode: waiting for task assignment...")
+            while True:
+                await asyncio.sleep(1)
     except asyncio.CancelledError:
         pass
     finally:

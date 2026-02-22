@@ -91,12 +91,12 @@ class WardenRuntime:
         nc = self.cluster.active_connection
 
         # Dedicated warden command/heartbeat subjects
-        await nc.subscribe("swarm.warden.heartbeat", self._on_heartbeat)
-        await nc.subscribe("swarm.warden.respawn", self._on_respawn)
+        await nc.subscribe("swarm.warden.heartbeat", cb=self._on_heartbeat)
+        await nc.subscribe("swarm.warden.respawn", cb=self._on_respawn)
         logger.info("Warden subscribed to swarm.warden.heartbeat and swarm.warden.respawn")
 
         # Also observe canonical heartbeat if any gateway publishes it there
-        await nc.subscribe("swarm.events.heartbeat", self._on_event_heartbeat)
+        await nc.subscribe("swarm.events.heartbeat", cb=self._on_event_heartbeat)
 
         logger.info("Warden event loop running")
 
