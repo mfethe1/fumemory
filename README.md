@@ -1,36 +1,46 @@
-# memU
+# memU (FuMemory)
 
-**Free, open-source shared memory for AI agents.**
+Open-source shared memory + coordination primitives for multi-agent systems.
 
-Run your own memory layer on Postgres + pgvector. No monthly SaaS lock-in.
+Run locally with Postgres/pgvector, or integrate into production services (like Railway-hosted APIs) with contract checks and guardrails.
 
-## Why memU
+---
 
-- Own your data (self-hosted)
-- Fast semantic search for agent memory
-- Agent-aware namespacing and filtering
-- Temporal scoring (recency + frequency)
-- Memory decay and reinforcement
-- Duplicate collapse and memory chaining
-- No `/store` endpoint — API is stable on `/memories`, `/search`, `/chat`
+## What this project includes
 
-## Core APIs
+- Persistent memory API (`/memories`, `/search`, `/chat`)
+- Semantic retrieval + metadata filtering
+- Agent-aware memory workflows
+- Coordination components for multi-agent operation
+- Production validation scripts and contract checks
 
-- `GET /health` — health check
-- `POST /memories` — add a memory
-- `POST /search` — semantic query
-- `POST /chat` — RAG-over-memory chat
-- `GET /memories/{id}` — fetch one memory
-- `DELETE /memories/{id}` — remove one memory
-- `POST /memories/bulk` — bulk import
+---
 
-### Auth
+## New system (current)
 
-Every request uses `X-API-Key`.
+memU is used in two modes:
 
-## Quick Start
+1. **OSS / local mode** (this repo)
+   - Standalone memU API on Docker/Postgres
+2. **Integrated production mode**
+   - memU routes mounted under service APIs (example: `/api/v1/memu/*`)
+   - Guarded by auth contract + runtime checks
 
-### Run with Docker (recommended)
+### Production contract notes
+
+- Common integrated routes:
+  - `POST /api/v1/memu/search`
+  - `POST /api/v1/memu/search-text`
+  - `POST /api/v1/memu/add`
+  - `GET /api/v1/memu/health`
+- `add` payload expects `content` (not legacy `text`)
+- Integration checks typically run through:
+  - `scripts/memu_contract_check.sh`
+  - `scripts/lenny_cron_guard.sh`
+
+---
+
+## Quick start (local)
 
 ```bash
 git clone https://github.com/mfethe1/fumemory.git
@@ -38,111 +48,85 @@ cd fumemory
 docker compose up -d
 ```
 
-API: `http://localhost:8000`  
-Bridge: `http://localhost:8001`
+Service: `http://localhost:8000`
 
-### Local install
-
-```bash
-git clone https://github.com/mfethe1/fumemory.git
-cd fumemory
-pip install -e .
-
-docker compose up -d postgres nats
-uvicorn memu.api:app --host 0.0.0.0 --port 8000
-```
-
-## API Examples
+### Basic API calls
 
 ```bash
-curl -X POST http://localhost:8000/memories \
+# Health
+curl -s http://localhost:8000/health
+
+# Add memory
+curl -s -X POST http://localhost:8000/memories \
   -H "Content-Type: application/json" \
-  -H "X-API-Key: your-key" \
+  -H "X-API-Key: memu-dev-key" \
   -d '{
-    "content": "Always rotate API keys before release",
-    "memory_type": "lesson",
-    "agent_id": "lenny",
-    "metadata": {"project": "operations"}
+    "content":"Always rotate keys after auth incidents",
+    "memory_type":"lesson",
+    "agent_id":"macklemore",
+    "metadata":{"source":"incident"}
   }'
 
-curl -X POST http://localhost:8000/search \
+# Search
+curl -s -X POST http://localhost:8000/search \
   -H "Content-Type: application/json" \
-  -H "X-API-Key: your-key" \
-  -d '{
-    "query": "production incidents",
-    "limit": 10,
-    "agent_id": null,
-    "memory_type": "lesson"
-  }'
-
-curl -X POST http://localhost:8000/chat \
-  -H "Content-Type: application/json" \
-  -H "X-API-Key: your-key" \
-  -d '{
-    "question": "What did we learn from last outage?",
-    "agent_id": null
-  }'
+  -H "X-API-Key: memu-dev-key" \
+  -d '{"query":"auth incident","limit":5}'
 ```
 
-## Swarm OS + coordination
+---
 
-memU now includes an agent coordination layer for production-like multi-agent runs:
+## API surface (OSS mode)
 
-- `lane_lock.py`: lane ownership and contention control
-- `warden_runtime.py`: heartbeat watchdog + recovery behavior
-- `bridge_ledger.py`: append-only event log + DAG views
-- `ws_bridge.py`: WebSocket ↔ NATS bridge for cross-network relays
-- `cluster.py` / `boot.py`: startup and cluster registration
-- `hardening.py`: failure-mode mitigations
+- `GET /health`
+- `POST /memories`
+- `GET /memories/{id}`
+- `DELETE /memories/{id}`
+- `POST /search`
+- `POST /chat`
+- `POST /memories/bulk`
 
-NATS subjects used today:
-- `memu.heartbeat`
-- `memu.lane.*`
-- `memu.events`
-- `memu.bridge.*`
+---
 
-## Project layout
+## Coordination layer (Swarm/ops components)
+
+The repo also includes coordination/runtime modules used in multi-agent setups:
+
+- `lane_lock.py` — lane ownership + contention control
+- `warden_runtime.py` — watchdog runtime loop
+- `bridge_ledger.py` — append-only event ledger
+- `ws_bridge.py` — websocket/NATS bridge path
+- `cluster.py`, `boot.py`, `hardening.py` — startup + reliability pieces
+
+---
+
+## Repo structure
 
 ```text
-memu/
-  api.py              # FastAPI service
-  client.py           # Client helper
-  models.py           # Pydantic schemas
-  decay.py            # Decay/strengthen + dedupe
-  boot.py             # Bootstrap sequence
-  cluster.py          # Cluster metadata
-  lane_lock.py        # Exclusive task ownership
-  warden.py           # Warden core
-  warden_runtime.py   # Runtime loop
-  bridge_ledger.py    # Event ledger + trajectory
-  ws_bridge.py        # WebSocket↔NATS
-  hardening.py        # Reliability mitigations
-  projection.py
-  swarm_models.py
-
-docker-compose.yml
-Dockerfile
-pyproject.toml
+fumemory/
+├── memu/                 # API + memory + coordination modules
+├── docs/                 # docs/runbooks
+├── templates/            # templates/examples
+├── docker-compose.yml    # local stack
+├── pyproject.toml        # package config
+└── README.md
 ```
 
-## Environment
+---
 
-- `DATABASE_URL` (required)
-- `MEMU_API_KEY` (required for `X-API-Key`)
-- `OPENAI_API_KEY` (optional embedding source)
-- `EMBEDDING_BASE_URL` (optional)
-- `EMBEDDING_MODEL` (optional)
-- `EMBEDDING_DIMS` (optional)
-- `NATS_LOCAL_URL`, `NATS_RAILWAY_URL`
+## Development
 
-## Deployment (Railway)
+```bash
+pip install -e .
+memu serve
+```
 
-Use the included `Dockerfile` and set at least:
+See also:
+- `CONTRIBUTING.md`
+- `SECURITY.md`
 
-- `DATABASE_URL`
-- `MEMU_API_KEY`
-- `OPENAI_API_KEY` (if embeddings use it)
+---
 
 ## License
 
-MIT — see `LICENSE`
+MIT
