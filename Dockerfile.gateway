@@ -16,11 +16,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # App
 WORKDIR /app
 COPY pyproject.toml .
+COPY README.md .
 COPY memu/ memu/
 
-# Install dependencies
-RUN pip install --no-cache-dir . && \
-    pip install --no-cache-dir nats-py httpx
+# Install runtime deps without package install (hatch packaging is intentionally decoupled).
+RUN pip install --no-cache-dir fastapi==0.100 uvicorn>=0.20 asyncpg>=0.28 httpx>=0.24 pydantic>=2.0 nats-py>=2.7
 
 # Health check via NATS heartbeat (the Warden monitors this)
 HEALTHCHECK --interval=10s --timeout=3s --retries=3 \

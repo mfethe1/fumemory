@@ -10,7 +10,7 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://python.org)
 [![PostgreSQL 16+](https://img.shields.io/badge/postgres-16+-336791.svg)](https://postgresql.org)
 
-[Quick Start](#quick-start) · [Features](#features) · [Why memU?](#why-memu) · [API Reference](#api-reference) · [Contributing](CONTRIBUTING.md)
+[Quick Start](#quick-start) · [Features](#features) · [Architecture](#architecture) · [API Reference](#api-reference) · [Swarm OS](#swarm-os) · [Contributing](CONTRIBUTING.md)
 
 </div>
 
@@ -18,30 +18,29 @@
 
 ## Why pay for memory?
 
-SuperMemory charges you monthly to store and search your AI's memories. Mem0 wants your data on their servers. Zep locks you into their cloud.
+SuperMemory charges you monthly. Mem0 wants your data on their servers. Zep locks you into their cloud.
 
 **memU is free. Forever. Run it on your own Postgres.**
-
-Your agents' memories belong to you — not a SaaS vendor.
 
 ---
 
 ## Features
 
-- 🔍 **Semantic vector search** — pgvector-powered similarity search over all memories
-- 🤖 **Multi-agent namespacing** — multiple agents share one memory pool, search across all or filter by agent
-- ⏰ **Temporal awareness** — recency-weighted search, not just cosine similarity
-- 📉 **Memory decay & reinforcement** — frequently accessed memories get boosted, stale ones fade
-- 🏷️ **Typed memories** — fact, decision, lesson, pattern, failure — structured taxonomy
-- 🔗 **Memory chains** — link related memories (decision → outcome → lesson learned)
-- 🔄 **Deduplication** — detects near-duplicate memories on upsert, merges instead of duplicating
-- 📥 **Bulk import** — ingest markdown files, knowledge bases, existing memory stores
+- 🔍 **Semantic vector search** — pgvector-powered similarity search across all memories
+- 🤖 **Multi-agent namespacing** — agents share one pool, search across all or filter by agent
+- ⏰ **Temporal awareness** — recency-weighted scoring, not just cosine similarity
+- 📉 **Memory decay & reinforcement** — accessed memories get boosted, stale ones fade
+- 🏷️ **Typed memories** — fact, decision, lesson, pattern, failure
+- 🔗 **Memory chains** — link related memories (decision → outcome → lesson)
+- 🔄 **Deduplication** — near-duplicate detection on upsert, merge instead of duplicate
+- 📥 **Bulk import** — ingest markdown, JSON, or existing knowledge bases
 - 💬 **RAG chat** — conversational queries over your entire knowledge base
+- 🐝 **Swarm OS** — NATS-based agent coordination with lane-lock, warden watchdog, and event ledger
 - 🐳 **One command to run** — `docker compose up` and you're done
 
 ---
 
-## Why memU?
+## Comparison
 
 | Feature | memU | SuperMemory | Mem0 | Zep |
 |---------|------|-------------|------|-----|
@@ -49,11 +48,8 @@ Your agents' memories belong to you — not a SaaS vendor.
 | **Self-hosted** | ✅ | ❌ | Partial | Partial |
 | **Multi-agent** | ✅ Native | ❌ | ❌ | ❌ |
 | **Memory decay** | ✅ | ❌ | ❌ | ❌ |
-| **Memory types** | ✅ 5 types | ❌ | ❌ | Basic |
 | **Memory chains** | ✅ | ❌ | ❌ | ❌ |
-| **Deduplication** | ✅ | ❌ | Basic | ❌ |
-| **Temporal weighting** | ✅ | ❌ | ❌ | ✅ |
-| **Your data stays yours** | ✅ | ❌ | ❌ | ❌ |
+| **Agent coordination** | ✅ Swarm OS | ❌ | ❌ | ❌ |
 | **Open source** | ✅ MIT | ❌ | Partial | ❌ |
 
 ---
@@ -68,7 +64,21 @@ cd fumemory
 docker compose up -d
 ```
 
-That's it. memU is running at `http://localhost:8000`.
+memU is running at `http://localhost:8000`. The NATS bridge runs on `:8001`.
+
+### From source
+
+```bash
+git clone https://github.com/mfethe1/fumemory.git
+cd fumemory
+pip install -e .
+
+# Start Postgres + NATS
+docker compose up -d postgres nats
+
+# Run the API
+uvicorn memu.api:app --host 0.0.0.0 --port 8000
+```
 
 ### pip install
 
@@ -82,7 +92,7 @@ from memu import MemUClient
 client = MemUClient("http://localhost:8000", api_key="your-key")
 
 # Store a memory
-client.add("The deployment failed because we forgot to run migrations", 
+client.add("The deployment failed because we forgot to run migrations",
            memory_type="lesson",
            agent_id="lenny")
 
@@ -91,20 +101,6 @@ results = client.search("deployment failures", limit=5)
 
 # Chat with your memory base
 answer = client.chat("What have we learned about deployments?")
-```
-
-### From source
-
-```bash
-git clone https://github.com/mfethe1/fumemory.git
-cd fumemory
-pip install -e .
-
-# Start Postgres with pgvector
-docker compose up -d postgres
-
-# Run the API
-memu serve
 ```
 
 ---
@@ -117,32 +113,37 @@ memu serve
 │  ┌──────┐  ┌──────┐  ┌──────┐  ┌──────┐       │
 │  │Agent1│  │Agent2│  │Agent3│  │Agent4│  ...   │
 │  └──┬───┘  └──┬───┘  └──┬───┘  └──┬───┘       │
-│     │         │         │         │             │
 │     └─────────┴────┬────┴─────────┘             │
-│                    │                             │
-│              ┌─────▼─────┐                       │
-│              │ memU Client│  (Python / REST)     │
-│              └─────┬─────┘                       │
+│              ┌─────▼──────┐                      │
+│              │ memU Client │  (Python / REST)    │
+│              └─────┬──────┘                      │
 └────────────────────┼────────────────────────────┘
                      │
-              ┌──────▼──────┐
-              │  memU API    │  FastAPI
-              │  /memories   │  /search
-              │  /chat       │  /health
-              └──────┬──────┘
-                     │
+         ┌───────────┼───────────┐
+         │           │           │
+  ┌──────▼──────┐  ┌─▼──┐  ┌────▼─────┐
+  │  memU API   │  │NATS│  │ WS Bridge│
+  │  :8000      │  │    │  │  :8001   │
+  │ /memories   │  │    │  │          │
+  │ /search     │  │    │  │          │
+  │ /chat       │  │    │  │          │
+  └──────┬──────┘  └─┬──┘  └────┬─────┘
+         │           │           │
+         └───────────┼───────────┘
               ┌──────▼──────┐
               │  PostgreSQL  │
               │  + pgvector  │
-              │              │
-              │ ┌──────────┐ │
-              │ │embeddings│ │
-              │ │metadata  │ │
-              │ │chains    │ │
-              │ │decay     │ │
-              │ └──────────┘ │
               └──────────────┘
 ```
+
+### Services
+
+| Service | Port | Purpose |
+|---------|------|---------|
+| **api** | 8000 | FastAPI — memory CRUD, search, chat, health |
+| **bridge** | 8001 | WebSocket ↔ NATS bridge for real-time agent coordination |
+| **postgres** | 5432 | pgvector storage — memories, embeddings, event ledger |
+| **nats** | 4222 | Pub/sub messaging for Swarm OS coordination |
 
 ---
 
@@ -213,15 +214,13 @@ curl -X POST http://localhost:8000/chat \
 
 ## Memory Decay & Reinforcement
 
-memU doesn't treat all memories equally. Recent, frequently-accessed memories score higher.
-
 ```
-score = similarity × (1 - decay_rate)^days_since_created × (1 + log(access_count + 1)) × temporal_weight
+score = similarity × (1 - decay_rate)^days × (1 + log(access_count + 1)) × temporal_weight
 ```
 
-- **Accessed memories get reinforced** — every search hit boosts the memory
-- **Old unused memories decay** — configurable decay rate (default: 0.01/day)
-- **Temporal weight** — configurable blend between pure similarity and recency
+- Accessed memories get reinforced on every search hit
+- Old unused memories decay (configurable rate, default 0.01/day)
+- Temporal weight blends pure similarity with recency
 
 ---
 
@@ -230,16 +229,13 @@ score = similarity × (1 - decay_rate)^days_since_created × (1 + log(access_cou
 Link related memories to build knowledge graphs:
 
 ```python
-# A decision was made
-decision = client.add("Switched from REST to GraphQL for the mobile API", 
+decision = client.add("Switched from REST to GraphQL for mobile API",
                        memory_type="decision")
 
-# Later, we learned the outcome
 outcome = client.add("GraphQL reduced mobile API calls by 60%",
-                      memory_type="fact", 
+                      memory_type="fact",
                       parent_id=decision.id)
 
-# And distilled a lesson
 lesson = client.add("GraphQL works well for mobile clients with variable data needs",
                      memory_type="lesson",
                      parent_id=decision.id)
@@ -247,65 +243,112 @@ lesson = client.add("GraphQL works well for mobile clients with variable data ne
 
 ---
 
-## Configuration
+## Swarm OS
 
-```yaml
-# memu.yaml
-database:
-  url: postgresql://user:pass@localhost:5432/memu
-  
-embedding:
-  model: text-embedding-3-small  # or any OpenAI-compatible endpoint
-  dimensions: 1536
-  
-decay:
-  rate: 0.01          # per day
-  min_score: 0.1      # floor — memories never fully disappear
-  
-deduplication:
-  enabled: true
-  threshold: 0.95     # cosine similarity threshold for duplicate detection
-  
-search:
-  default_limit: 10
-  temporal_weight: 0.3  # 0 = pure similarity, 1 = pure recency
+memU includes a coordination layer for multi-agent teams, built on NATS messaging.
+
+### Components
+
+| Module | Purpose |
+|--------|---------|
+| `lane_lock.py` | Exclusive task ownership — one agent per lane, no conflicts |
+| `warden.py` / `warden_runtime.py` | Heartbeat watchdog — detects stale agents and triggers respawn |
+| `bridge_ledger.py` | Append-only event ledger with DAG, trajectory, and stats endpoints |
+| `ws_bridge.py` | WebSocket ↔ NATS bridge for cross-network agent communication |
+| `cluster.py` | Cluster membership and peer discovery |
+| `boot.py` | Bootstrap sequence — connects NATS, registers agent, starts warden |
+| `hardening.py` | 10 failure-mode mitigations (network partition, stale locks, etc.) |
+
+### NATS Subjects
+
+- `memu.heartbeat` — agent liveness pings
+- `memu.lane.*` — lane claim/release events
+- `memu.events` — general coordination events
+- `memu.bridge.*` — cross-bridge message relay
+
+### How it works
+
+1. Agents boot via `boot.py`, connect to NATS, register with the cluster
+2. The warden watches heartbeats — if an agent goes silent, it triggers respawn
+3. Lane-lock ensures exclusive task ownership (no two agents work the same task)
+4. The bridge ledger records all events as an append-only log with DAG structure
+5. The WS bridge allows agents on different networks to communicate via WebSocket relay
+
+---
+
+## Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DATABASE_URL` | `postgresql://memu:memu@localhost:5432/memu` | Postgres connection |
+| `MEMU_API_KEY` | `memu-dev-key` | API key for auth (X-API-Key header) |
+| `OPENAI_API_KEY` | — | For embeddings (if using OpenAI) |
+| `EMBEDDING_BASE_URL` | `http://localhost:11434` | Embedding endpoint |
+| `EMBEDDING_MODEL` | `qwen3-embedding` | Model name |
+| `EMBEDDING_DIMS` | `4096` | Vector dimensions |
+| `DEDUP_THRESHOLD` | `0.95` | Similarity threshold for dedup |
+| `DECAY_RATE` | `0.01` | Daily decay rate |
+| `NATS_LOCAL_URL` | `nats://nats:4222` | Local NATS server |
+| `NATS_RAILWAY_URL` | — | Remote NATS for cross-network bridge |
+
+---
+
+## Deployment
+
+### Railway
+
+memU deploys to Railway with the included `Dockerfile`. Set env vars in your Railway project:
+
+- `DATABASE_URL` (Railway Postgres addon or external)
+- `MEMU_API_KEY` (any string — this is your auth key)
+- `OPENAI_API_KEY` (for embeddings)
+
+### Self-hosted
+
+```bash
+docker compose up -d
 ```
 
----
-
-## Roadmap
-
-- [x] Core API (add, search, delete)
-- [x] Multi-agent namespacing
-- [x] Memory types & chains
-- [x] Decay & reinforcement
-- [x] Deduplication
-- [ ] Web dashboard
-- [ ] Webhook integrations (Slack, Discord)
-- [ ] LangChain / LlamaIndex integration
-- [ ] Memory compression (summarize old memories to save space)
-- [ ] Multi-tenant mode (multiple orgs on one instance)
-- [ ] Kubernetes Helm chart
+Production: set `MEMU_API_KEY` to a strong random value and configure a real Postgres instance.
 
 ---
 
-## Contributing
+## Project Structure
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). We welcome PRs — especially for integrations, new memory types, and dashboard work.
+```
+memu-oss/
+├── memu/
+│   ├── api.py              # FastAPI app — all REST endpoints
+│   ├── models.py           # Pydantic models
+│   ├── client.py           # Python client SDK
+│   ├── decay.py            # Decay/reinforcement/dedup logic
+│   ├── boot.py             # Agent bootstrap sequence
+│   ├── cluster.py          # Cluster membership
+│   ├── lane_lock.py        # Exclusive task ownership
+│   ├── warden.py           # Heartbeat watchdog
+│   ├── warden_runtime.py   # Warden runtime loop
+│   ├── bridge_ledger.py    # Append-only event DAG
+│   ├── ws_bridge.py        # WebSocket ↔ NATS bridge
+│   ├── hardening.py        # Failure-mode mitigations
+│   ├── projection.py       # Event projections
+│   └── swarm_models.py     # Swarm data models
+├── infra/
+│   └── local-nats/         # NATS server config
+├── docker-compose.yml
+├── Dockerfile
+├── pyproject.toml
+├── CONTRIBUTING.md
+├── SECURITY.md
+└── README.md
+```
 
 ---
 
 ## License
 
-MIT — do whatever you want with it.
+[MIT](LICENSE)
 
 ---
 
-<div align="center">
-
-**Built by [Protelynx](https://protelynx.ai)** — we build multi-agent AI systems.
-
-Need help building agent infrastructure for your team? **[protelynx.ai](https://protelynx.ai)**
-
-</div>
+<p align="center">Built by <a href="https://protelynx.ai">Protelynx</a></p>
 ]]>

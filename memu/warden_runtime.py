@@ -168,13 +168,16 @@ class WardenRuntime:
             container = cli.containers.run(
                 image=self.gateway_image,
                 detach=True,
-                name=f"ward-standby-{dead_gateway_id}-{int(datetime.now().timestamp())}",
+                name=f"ward-respawn-{dead_gateway_id}-{int(datetime.now().timestamp())}",
+                network_mode="host",
                 environment={
                     "GATEWAY_ROLE": "gateway",
                     "TASK_ID": task_id or self.fallback_task_container,
                     "TARGET_GATEWAY_ID": dead_gateway_id,
                     "WARDEN_MODE": "respawn",
                     "GATEWAY_ID": f"{dead_gateway_id}-respawn",
+                    "NATS_LOCAL_URL": os.environ.get("NATS_LOCAL_URL", "nats://127.0.0.1:4222"),
+                    "NATS_RAILWAY_URL": os.environ.get("NATS_RAILWAY_URL", "nats://127.0.0.1:4222"),
                 },
                 remove=True,
             )
