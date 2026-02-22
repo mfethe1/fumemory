@@ -1,0 +1,19 @@
+{
+  "tasks": [
+    {
+      "id": "T1",
+      "parent_id": null,
+      "status": "OPEN",
+      "owner": "Lenny",
+      "title": "Migrate BACKLOG.md to Event-Driven DAG",
+      "next_action": "Define JSONL schema and bootstrap the first event",
+      "lease_holder": "lenny-linux",
+      "lease_expires_at": "2026-02-22T15:00:00Z",
+      "depends_on": [],
+      "resource_lanes": ["file:/Volumes/Edrive/Projects/agent-coordination/BACKLOG.md"],
+      "fencing_token": 1,
+      "rollback_instruction": "Delete BACKLOG_EVENTS.jsonl and revert BACKLOG_DAG.json",
+      "checkpoint_state": "Initialized migration scripts and event ledger"
+    }
+  ]
+}
