@@ -132,6 +132,46 @@ CREATE TABLE IF NOT EXISTS checkpoints (
 
 CREATE INDEX IF NOT EXISTS idx_checkpoints_task ON checkpoints (task_id, checkpoint_seq DESC);
 
+-- Epistemic Blackboard — shared knowledge across all gateways
+CREATE TABLE IF NOT EXISTS blackboard (
+    entry_id        UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    key             VARCHAR(256) NOT NULL,
+    value           TEXT NOT NULL,
+    category        VARCHAR(20) NOT NULL DEFAULT 'fact'
+                    CHECK (category IN ('fact', 'rule', 'warning', 'capability')),
+    source_gateway  VARCHAR(64) NOT NULL,
+    confidence      FLOAT NOT NULL DEFAULT 1.0 CHECK (confidence >= 0 AND confidence <= 1),
+    supersedes      UUID REFERENCES blackboard(entry_id),
+    valid_from      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    valid_until     TIMESTAMPTZ,
+    access_count    INTEGER NOT NULL DEFAULT 0,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_blackboard_key ON blackboard (key);
+CREATE INDEX IF NOT EXISTS idx_blackboard_category ON blackboard (category);
+CREATE INDEX IF NOT EXISTS idx_blackboard_active ON blackboard (valid_from DESC)
+    WHERE valid_until IS NULL OR valid_until > NOW();
+
+-- Container registry — Warden tracks all containers
+CREATE TABLE IF NOT EXISTS container_registry (
+    container_id    VARCHAR(128) PRIMARY KEY,
+    gateway_id      VARCHAR(64) NOT NULL,
+    role            VARCHAR(20) NOT NULL
+                    CHECK (role IN ('gateway', 'sandbox', 'warm_standby')),
+    state           VARCHAR(20) NOT NULL DEFAULT 'booting'
+                    CHECK (state IN ('booting', 'hydrating', 'active', 'idle', 'draining', 'dead')),
+    task_id         UUID,
+    fencing_token   INTEGER,
+    started_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_heartbeat  TIMESTAMPTZ,
+    crash_count     INTEGER NOT NULL DEFAULT 0,
+    metadata        JSONB DEFAULT '{}'
+);
+
+CREATE INDEX IF NOT EXISTS idx_containers_state ON container_registry (state);
+CREATE INDEX IF NOT EXISTS idx_containers_gateway ON container_registry (gateway_id);
+
 -- Lease expiry function: auto-revoke expired leases
 CREATE OR REPLACE FUNCTION revoke_expired_leases()
 RETURNS INTEGER AS $$

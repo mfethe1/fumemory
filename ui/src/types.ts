@@ -137,7 +137,66 @@ export interface DLQEntryInfo {
 
 export interface WsMessage {
   type: 'event' | 'dag_snapshot' | 'budget_update' | 'gateway_update'
-    | 'halt_ack' | 'lanes_update' | 'dlq_update';
+    | 'halt_ack' | 'lanes_update' | 'dlq_update'
+    | 'warden_status' | 'blackboard_update';
   data: SwarmEvent | TaskNode[] | ComputeBudget | GatewayInfo
-    | { halted: boolean } | LaneLockInfo[] | DLQEntryInfo[];
+    | { halted: boolean } | LaneLockInfo[] | DLQEntryInfo[]
+    | WardenStatusInfo | BlackboardEntryInfo[];
 }
+
+// --- Warden / Container Lifecycle ---
+
+export type ContainerRole = 'gateway' | 'sandbox' | 'warm_standby';
+export type ContainerState = 'booting' | 'hydrating' | 'active' | 'idle' | 'draining' | 'dead';
+
+export interface ContainerInfo {
+  container_id: string;
+  gateway_id: string;
+  role: ContainerRole;
+  state: ContainerState;
+  task_id?: string | null;
+  started_at: string;
+  last_heartbeat?: string | null;
+  crash_count: number;
+  fencing_token?: number | null;
+  memory_mb: number;
+  cpu_pct: number;
+}
+
+export interface WardenStatusInfo {
+  active_containers: ContainerInfo[];
+  warm_pool: {
+    target_size: number;
+    current_size: number;
+    pending_tasks: number;
+    active_gateways: number;
+    scaling_action?: string | null;
+  };
+  total_containers: number;
+  max_containers: number;
+  crash_loops: Array<{ task_id: string; count: number; last_error: string }>;
+  uptime_s: number;
+  last_respawn?: string | null;
+}
+
+// --- Epistemic Blackboard ---
+
+export interface BlackboardEntryInfo {
+  entry_id: string;
+  key: string;
+  value: string;
+  category: 'fact' | 'rule' | 'warning' | 'capability';
+  source_gateway: string;
+  confidence: number;
+  valid_from: string;
+  access_count: number;
+}
+
+export const CONTAINER_STATE_COLORS: Record<ContainerState, string> = {
+  booting:   '#facc15', // yellow
+  hydrating: '#06b6d4', // cyan
+  active:    '#22c55e', // green
+  idle:      '#94a3b8', // slate (warm pool)
+  draining:  '#f97316', // orange
+  dead:      '#ef4444', // red
+} as const;

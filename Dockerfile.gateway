@@ -1,0 +1,32 @@
+# Universal Stateless Gateway Container
+#
+# This image contains ZERO local state. All context comes from memU on boot.
+# The Warden spawns these containers with GATEWAY_ROLE and TASK_ID env vars.
+#
+# Build: docker build -t fumemory-gateway:latest .
+# Run:   docker run -e GATEWAY_ROLE=winnie -e NATS_LOCAL_URL=nats://host:4222 fumemory-gateway
+
+FROM python:3.11-slim
+
+# System deps
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# App
+WORKDIR /app
+COPY pyproject.toml .
+COPY memu/ memu/
+
+# Install dependencies
+RUN pip install --no-cache-dir . && \
+    pip install --no-cache-dir nats-py httpx
+
+# Health check via NATS heartbeat (the Warden monitors this)
+HEALTHCHECK --interval=10s --timeout=3s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8222/healthz')" || exit 1
+
+# No host volumes. No secrets baked in. Everything comes from env vars.
+# The container is disposable — kill it, spawn a new one, hydrate from memU.
+
+ENTRYPOINT ["python", "-m", "memu.boot"]
