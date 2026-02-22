@@ -83,27 +83,50 @@ class WardenRuntime:
         # Watchdog and maintenance
         await asyncio.gather(
             self._heartbeat_watchdog(),
-            self._main_wait(),
+            self._heartbeat_receiver(),
+            self._respawn_receiver(),
         )
 
     async def _subscribe(self):
         assert self.cluster is not None
         nc = self.cluster.active_connection
+        logger.info("Warden NATS connection: connected=%s, client_id=%s", nc.is_connected, nc.client_id)
 
-        # Dedicated warden command/heartbeat subjects
-        await nc.subscribe("swarm.warden.heartbeat", cb=self._on_heartbeat)
-        await nc.subscribe("swarm.warden.respawn", cb=self._on_respawn)
-        logger.info("Warden subscribed to swarm.warden.heartbeat and swarm.warden.respawn")
+        # Use poll-based subscriptions (nats-py callback subs don't fire reliably
+        # when mixed with asyncio.gather event loops).
+        self._hb_sub = await nc.subscribe("swarm.warden.heartbeat")
+        self._respawn_sub = await nc.subscribe("swarm.warden.respawn")
+        self._event_hb_sub = await nc.subscribe("swarm.events.heartbeat")
 
-        # Also observe canonical heartbeat if any gateway publishes it there
-        await nc.subscribe("swarm.events.heartbeat", cb=self._on_event_heartbeat)
+        logger.info("Warden subscribed (poll mode) to heartbeat + respawn + events.heartbeat")
 
-        logger.info("Warden event loop running")
-
-    async def _main_wait(self):
-        """Idle loop to keep process alive."""
+    async def _heartbeat_receiver(self):
+        """Poll-based heartbeat receiver loop."""
         while True:
-            await asyncio.sleep(3600)
+            try:
+                msg = await self._hb_sub.next_msg(timeout=5)
+                await self._on_heartbeat(msg)
+            except asyncio.TimeoutError:
+                pass
+            except Exception as e:
+                logger.warning("Heartbeat receiver error: %s", e)
+            # Also drain event heartbeat sub
+            try:
+                msg = await self._event_hb_sub.next_msg(timeout=0.1)
+                await self._on_event_heartbeat(msg)
+            except Exception:
+                pass
+
+    async def _respawn_receiver(self):
+        """Poll-based respawn receiver loop."""
+        while True:
+            try:
+                msg = await self._respawn_sub.next_msg(timeout=5)
+                await self._on_respawn(msg)
+            except asyncio.TimeoutError:
+                pass
+            except Exception as e:
+                logger.warning("Respawn receiver error: %s", e)
 
     async def _heartbeat_watchdog(self):
         while True:
@@ -202,8 +225,8 @@ class WardenRuntime:
         try:
             payload = _decode_msg(msg.data)
             data = HeartbeatPing(**payload)
-        except ValidationError:
-            logger.warning("Invalid heartbeat payload on %s", msg.subject)
+        except (ValidationError, Exception) as e:
+            logger.warning("Invalid heartbeat payload on %s: %s — raw: %s", msg.subject, e, msg.data[:200])
             return
 
         state = self.liveness.get(data.gateway_id)
