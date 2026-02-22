@@ -13,11 +13,18 @@ export type EventType =
   | 'bid_submitted' | 'lease_granted' | 'lease_expired'
   | 'audit_proposed' | 'audit_accepted' | 'audit_rejected'
   | 'circuit_breaker' | 'system_halt' | 'system_override'
-  | 'heartbeat';
+  | 'heartbeat'
+  // Lane locking & fault tolerance
+  | 'lane_acquired' | 'lane_released' | 'lane_contested'
+  | 'task_orphaned' | 'task_hydrated' | 'checkpoint_saved'
+  | 'rollback_executed'
+  | 'dlq_enqueued' | 'dlq_diagnosed' | 'dlq_healed'
+  | 'rpc_request' | 'rpc_response';
 
 export type TaskStatus =
   | 'pending' | 'bidding' | 'claimed' | 'executing'
-  | 'audit_pending' | 'completed' | 'failed' | 'cancelled';
+  | 'audit_pending' | 'completed' | 'failed' | 'cancelled'
+  | 'orphaned' | 'hydrating' | 'yielding' | 'dlq' | 'rolling_back';
 
 export type GatewayStatus = 'online' | 'offline' | 'degraded';
 
@@ -51,6 +58,16 @@ export interface TaskNode {
   events: string[];
   created_at?: string | null;
   completed_at?: string | null;
+  // Lane locking
+  resource_lanes: string[];
+  fencing_token?: number | null;
+  // Fault tolerance
+  rollback_instruction?: string | null;
+  checkpoint_state?: string | null;
+  checkpoint_timestamp?: string | null;
+  failure_count: number;
+  last_error?: string | null;
+  required_capabilities: string[];
 }
 
 // --- Compute Budget ---
@@ -92,11 +109,35 @@ export const STATUS_COLORS: Record<TaskStatus, string> = {
   completed:     '#22c55e', // green
   failed:        '#ef4444', // red
   cancelled:     '#6b7280', // gray
+  orphaned:      '#a855f7', // purple — gateway died
+  hydrating:     '#06b6d4', // cyan — recovering from checkpoint
+  yielding:      '#eab308', // amber — waiting for lane lock
+  dlq:           '#dc2626', // deep red — poison pill
+  rolling_back:  '#f59e0b', // dark amber — saga rollback
 } as const;
 
 // --- WebSocket message types from Coordinator ---
 
+export interface LaneLockInfo {
+  lane_id: string;
+  gateway_id: string;
+  task_id: string;
+  fencing_token: number;
+  expires_at: string;
+}
+
+export interface DLQEntryInfo {
+  task_id: string;
+  failure_count: number;
+  last_error?: string;
+  root_cause_diagnosis?: string | null;
+  proposed_amendment?: Record<string, unknown> | null;
+  dlq_entered_at: string;
+}
+
 export interface WsMessage {
-  type: 'event' | 'dag_snapshot' | 'budget_update' | 'gateway_update' | 'halt_ack';
-  data: SwarmEvent | TaskNode[] | ComputeBudget | GatewayInfo | { halted: boolean };
+  type: 'event' | 'dag_snapshot' | 'budget_update' | 'gateway_update'
+    | 'halt_ack' | 'lanes_update' | 'dlq_update';
+  data: SwarmEvent | TaskNode[] | ComputeBudget | GatewayInfo
+    | { halted: boolean } | LaneLockInfo[] | DLQEntryInfo[];
 }

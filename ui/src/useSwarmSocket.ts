@@ -6,12 +6,14 @@
  */
 
 import { useEffect, useRef, useCallback, useState } from 'react';
-import type { SwarmEvent, TaskNode, ComputeBudget, WsMessage } from './types';
+import type { SwarmEvent, TaskNode, ComputeBudget, WsMessage, LaneLockInfo, DLQEntryInfo } from './types';
 
 interface SwarmState {
   events: SwarmEvent[];
   dag: Map<string, TaskNode>;
   budget: ComputeBudget | null;
+  lanes: LaneLockInfo[];
+  dlq: DLQEntryInfo[];
   connected: boolean;
   error: string | null;
 }
@@ -24,6 +26,8 @@ export function useSwarmSocket(wsUrl: string) {
     events: [],
     dag: new Map(),
     budget: null,
+    lanes: [],
+    dlq: [],
     connected: false,
     error: null,
   });
@@ -49,6 +53,11 @@ export function useSwarmSocket(wsUrl: string) {
         audit_rejected: 'pending',
         lease_expired: 'pending',
         circuit_breaker: 'failed',
+        task_orphaned: 'orphaned',
+        task_hydrated: 'hydrating',
+        lane_contested: 'yielding',
+        dlq_enqueued: 'dlq',
+        rollback_executed: 'rolling_back',
       };
 
       const newStatus = statusMap[event.event_type];
@@ -151,6 +160,20 @@ export function useSwarmSocket(wsUrl: string) {
               budget: parsed.data as ComputeBudget,
             }));
             break;
+
+          case 'lanes_update':
+            setState(prev => ({
+              ...prev,
+              lanes: parsed.data as LaneLockInfo[],
+            }));
+            break;
+
+          case 'dlq_update':
+            setState(prev => ({
+              ...prev,
+              dlq: parsed.data as DLQEntryInfo[],
+            }));
+            break;
         }
       } catch {
         // Ignore malformed messages
@@ -190,5 +213,7 @@ export function useSwarmSocket(wsUrl: string) {
     dagArray: Array.from(state.dag.values()),
     sendHalt,
     sendAmend,
+    lanes: state.lanes,
+    dlq: state.dlq,
   };
 }

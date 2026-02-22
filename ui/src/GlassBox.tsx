@@ -21,6 +21,7 @@ import dagre from 'dagre';
 
 import { useSwarmSocket } from './useSwarmSocket';
 import { STATUS_COLORS, type TaskNode, type TaskStatus } from './types';
+import type { LaneLockInfo, DLQEntryInfo } from './types';
 
 const WS_URL = import.meta.env.VITE_WS_URL || 'ws://localhost:8000/ws/swarm';
 
@@ -126,10 +127,52 @@ function EventLog({ events }: { events: Array<{ event_id: string; timestamp: str
   );
 }
 
+function LaneLockPanel({ lanes }: { lanes: LaneLockInfo[] }) {
+  if (!lanes.length) return null;
+  return (
+    <div style={{ background: '#1e293b', padding: 12, borderRadius: 8, fontSize: 12, fontFamily: 'monospace', minWidth: 260, marginTop: 8 }}>
+      <div style={{ color: '#eab308', marginBottom: 8, fontWeight: 600 }}>🔒 ACTIVE LANE LOCKS ({lanes.length})</div>
+      {lanes.map(l => (
+        <div key={l.lane_id} style={{ color: '#cbd5e1', borderBottom: '1px solid #334155', padding: '4px 0' }}>
+          <div style={{ color: '#facc15', fontWeight: 600 }}>{l.lane_id}</div>
+          <div style={{ color: '#64748b' }}>
+            {l.gateway_id} · token #{l.fencing_token} · expires {new Date(l.expires_at).toLocaleTimeString()}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function DLQPanel({ dlq }: { dlq: DLQEntryInfo[] }) {
+  if (!dlq.length) return null;
+  return (
+    <div style={{ background: '#1c0a0a', border: '1px solid #dc2626', padding: 12, borderRadius: 8, fontSize: 12, fontFamily: 'monospace', minWidth: 340, marginTop: 8 }}>
+      <div style={{ color: '#dc2626', marginBottom: 8, fontWeight: 600 }}>☠ DEAD LETTER QUEUE ({dlq.length} poison pills)</div>
+      {dlq.map(d => (
+        <div key={d.task_id} style={{ color: '#fca5a5', borderBottom: '1px solid #450a0a', padding: '6px 0' }}>
+          <div style={{ fontWeight: 600 }}>Task {d.task_id.slice(0, 8)}… — {d.failure_count} failures</div>
+          {d.last_error && <div style={{ color: '#f87171', fontSize: 11 }}>Error: {d.last_error.slice(0, 120)}</div>}
+          {d.root_cause_diagnosis && (
+            <div style={{ color: '#86efac', fontSize: 11, marginTop: 2 }}>
+              🩺 Diagnosis: {d.root_cause_diagnosis}
+            </div>
+          )}
+          {d.proposed_amendment && (
+            <div style={{ color: '#93c5fd', fontSize: 11, marginTop: 2 }}>
+              💉 Amendment proposed — awaiting approval
+            </div>
+          )}
+        </div>
+      ))}
+    </div>
+  );
+}
+
 // --- Main App ---
 
 export default function GlassBox() {
-  const { dagArray, events, budget, connected, sendHalt, sendAmend } = useSwarmSocket(WS_URL);
+  const { dagArray, events, budget, connected, sendHalt, sendAmend, lanes, dlq } = useSwarmSocket(WS_URL);
   const [haltReason, setHaltReason] = useState('');
   const [selectedNode, setSelectedNode] = useState<string | null>(null);
   const [correction, setCorrection] = useState('');
@@ -178,13 +221,16 @@ export default function GlassBox() {
             }} />
             <span style={{ color: '#94a3b8', fontSize: 13 }}>
               {connected ? 'LIVE' : 'DISCONNECTED'} — {dagArray.length} tasks
+              {lanes.length > 0 && ` · ${lanes.length} locks`}
+              {dlq.length > 0 && ` · ${dlq.length} ☠`}
             </span>
           </div>
         </Panel>
 
-        {/* Budget meter */}
+        {/* Budget meter + lane locks */}
         <Panel position="top-right">
           <BudgetMeter budget={budget} />
+          <LaneLockPanel lanes={lanes} />
         </Panel>
 
         {/* God Mode */}
@@ -228,9 +274,10 @@ export default function GlassBox() {
           </div>
         </Panel>
 
-        {/* Event log */}
+        {/* Event log + DLQ */}
         <Panel position="bottom-right">
           <EventLog events={events} />
+          <DLQPanel dlq={dlq} />
         </Panel>
       </ReactFlow>
     </div>

@@ -36,6 +36,19 @@ class EventType(str, enum.Enum):
     SYSTEM_HALT = "system_halt"
     SYSTEM_OVERRIDE = "system_override"
     HEARTBEAT = "heartbeat"
+    # Lane locking & fault tolerance
+    LANE_ACQUIRED = "lane_acquired"
+    LANE_RELEASED = "lane_released"
+    LANE_CONTESTED = "lane_contested"
+    TASK_ORPHANED = "task_orphaned"
+    TASK_HYDRATED = "task_hydrated"
+    CHECKPOINT_SAVED = "checkpoint_saved"
+    ROLLBACK_EXECUTED = "rollback_executed"
+    DLQ_ENQUEUED = "dlq_enqueued"
+    DLQ_DIAGNOSED = "dlq_diagnosed"
+    DLQ_HEALED = "dlq_healed"
+    RPC_REQUEST = "rpc_request"
+    RPC_RESPONSE = "rpc_response"
 
 
 class TaskStatus(str, enum.Enum):
@@ -48,6 +61,11 @@ class TaskStatus(str, enum.Enum):
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
+    ORPHANED = "orphaned"       # Gateway died mid-execution
+    HYDRATING = "hydrating"     # New gateway recovering from checkpoint
+    YIELDING = "yielding"       # Waiting for lane lock
+    DLQ = "dlq"                 # Poison pill — in dead letter queue
+    ROLLING_BACK = "rolling_back"  # Executing rollback instruction
 
 
 class GatewayStatus(str, enum.Enum):
@@ -209,7 +227,11 @@ class ComputeBudget(BaseModel):
 # --- DAG Projection ---
 
 class TaskNode(BaseModel):
-    """A task as a node in the DAG — reconstructed from event projection."""
+    """A task as a node in the DAG — reconstructed from event projection.
+
+    Includes lane locking (blast radius), fencing tokens (split-brain prevention),
+    rollback instructions (saga pattern), and checkpoint state (hydration on failover).
+    """
     task_id: UUID
     root_prompt_id: UUID
     parent_task_id: UUID | None = None
@@ -223,6 +245,36 @@ class TaskNode(BaseModel):
     created_at: datetime | None = None
     completed_at: datetime | None = None
 
+    # --- Lane Locking (Semantic Mutexes) ---
+    resource_lanes: list[str] = Field(
+        default_factory=list,
+        description="Blast radius: resources this task will touch (e.g. 'file:/app/main.py', 'table:users')"
+    )
+    fencing_token: int | None = Field(
+        None,
+        description="Monotonically increasing token to prevent split-brain overwrites"
+    )
+
+    # --- Fault Tolerance ---
+    rollback_instruction: str | None = Field(
+        None,
+        description="Saga pattern: how to undo partial work if this task fails mid-execution"
+    )
+    checkpoint_state: str | None = Field(
+        None,
+        description="Last scratchpad checkpoint for hydration handoff on gateway death"
+    )
+    checkpoint_timestamp: datetime | None = Field(
+        None,
+        description="When the last checkpoint was saved"
+    )
+    failure_count: int = Field(0, ge=0, description="Number of times this task has failed (DLQ at 3)")
+    last_error: str | None = Field(None, description="Stack trace / error from last failure")
+    required_capabilities: list[str] = Field(
+        default_factory=list,
+        description="MCP capabilities needed (e.g. 'WASM:Postgres', 'MCP:GitHub')"
+    )
+
     @property
     def is_leaf(self) -> bool:
         return len(self.children) == 0
@@ -231,3 +283,123 @@ class TaskNode(BaseModel):
     def is_blocked(self) -> bool:
         """A task is blocked if it has incomplete parent dependencies."""
         return self.status == TaskStatus.PENDING and self.parent_task_id is not None
+
+    @property
+    def is_poison_pill(self) -> bool:
+        """A task that has failed 3+ times is a poison pill."""
+        return self.failure_count >= 3
+
+    @property
+    def has_checkpoint(self) -> bool:
+        """Whether this task has recoverable state for hydration."""
+        return self.checkpoint_state is not None
+
+
+# --- Lane Locking ---
+
+class LaneLock(BaseModel):
+    """A semantic mutex on a resource lane, backed by NATS JetStream KV."""
+    lane_id: str = Field(..., description="Resource path (e.g. 'file:/app/main.py', 'table:users')")
+    gateway_id: str = Field(..., max_length=64)
+    task_id: UUID
+    fencing_token: int = Field(..., ge=0, description="Monotonically increasing — prevents split-brain")
+    ttl_seconds: int = Field(10, ge=5, le=60, description="Dead man's switch TTL")
+    acquired_at: datetime = Field(default_factory=lambda: datetime.now())
+    expires_at: datetime
+
+    @property
+    def is_expired(self) -> bool:
+        return datetime.now() > self.expires_at
+
+
+class LaneContested(BaseModel):
+    """Published when a gateway tries to acquire a lane that's already locked."""
+    lane_id: str
+    requesting_gateway: str
+    holding_gateway: str
+    holding_fencing_token: int
+    task_id: UUID
+
+
+# --- Checkpoint & Hydration ---
+
+class CheckpointSaved(BaseModel):
+    """Published when a gateway streams incremental state back to memU."""
+    task_id: UUID
+    gateway_id: str
+    checkpoint_sequence: int = Field(..., ge=0, description="Incrementing checkpoint number")
+    scratchpad: str = Field(..., max_length=100_000, description="Serialized agent reasoning state")
+    progress_pct: float = Field(0.0, ge=0.0, le=100.0)
+    tokens_consumed: int = 0
+
+
+class TaskOrphaned(BaseModel):
+    """Published when a gateway's heartbeat expires and the task needs recovery."""
+    task_id: UUID
+    dead_gateway: str
+    last_checkpoint_seq: int | None = None
+    has_recoverable_state: bool = False
+    time_since_last_heartbeat_ms: int = 0
+
+
+class HydrationHandoff(BaseModel):
+    """Published when a new gateway picks up an orphaned task from checkpoint."""
+    task_id: UUID
+    recovering_gateway: str
+    dead_gateway: str
+    checkpoint_sequence: int
+    hydration_prompt: str = Field(
+        default="You are recovering a task from a failed node. "
+                "Here is their partial reasoning. Validate their logic and complete the task.",
+        description="System prompt injected into the recovering agent"
+    )
+
+
+# --- Dead Letter Queue (DLQ) & Self-Healing ---
+
+class DLQEntry(BaseModel):
+    """A poison pill task that has failed 3+ times."""
+    task_id: UUID
+    failure_count: int = Field(..., ge=3)
+    failures: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description="List of {gateway_id, error, timestamp, stack_trace} for each failure"
+    )
+    root_cause_diagnosis: str | None = Field(None, description="Medic gateway's diagnosis")
+    proposed_amendment: dict[str, Any] | None = Field(None, description="DAG patch to heal the plan")
+    dlq_entered_at: datetime = Field(default_factory=lambda: datetime.now())
+
+
+class RollbackExecuted(BaseModel):
+    """Published when a saga rollback is completed before re-attempting a failed task."""
+    task_id: UUID
+    gateway_id: str
+    rollback_instruction: str
+    success: bool
+    error: str | None = None
+    artifacts_cleaned: list[str] = Field(
+        default_factory=list,
+        description="List of resources that were rolled back (temp tables, files, etc.)"
+    )
+
+
+# --- Mesh RPC (for edge devices without local tooling) ---
+
+class RPCRequest(BaseModel):
+    """Published when a gateway needs remote execution of a capability it lacks."""
+    request_id: UUID = Field(default_factory=uuid4)
+    requesting_gateway: str
+    task_id: UUID
+    capability: str = Field(..., description="MCP capability needed (e.g. 'WASM:Python')")
+    payload: dict[str, Any] = Field(default_factory=dict)
+    timeout_ms: int = Field(30_000, ge=1000, le=300_000)
+
+
+class RPCResponse(BaseModel):
+    """Published in response to an RPCRequest."""
+    request_id: UUID
+    responding_gateway: str
+    success: bool
+    result: dict[str, Any] = Field(default_factory=dict)
+    error: str | None = None
+    execution_ms: int = 0

@@ -14,7 +14,12 @@ CREATE TABLE IF NOT EXISTS events (
                       'bid_submitted', 'lease_granted', 'lease_expired',
                       'audit_proposed', 'audit_accepted', 'audit_rejected',
                       'circuit_breaker', 'system_halt', 'system_override',
-                      'heartbeat'
+                      'heartbeat',
+                      'lane_acquired', 'lane_released', 'lane_contested',
+                      'task_orphaned', 'task_hydrated', 'checkpoint_saved',
+                      'rollback_executed',
+                      'dlq_enqueued', 'dlq_diagnosed', 'dlq_healed',
+                      'rpc_request', 'rpc_response'
                   )),
     payload       JSONB NOT NULL DEFAULT '{}',
     parent_event  UUID REFERENCES events(event_id),
@@ -39,7 +44,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     required_capabilities JSONB DEFAULT '[]',  -- MCP capability tags needed
     status          VARCHAR(20) NOT NULL DEFAULT 'pending'
                     CHECK (status IN ('pending', 'bidding', 'claimed', 'executing',
-                                      'audit_pending', 'completed', 'failed', 'cancelled')),
+                                      'audit_pending', 'completed', 'failed', 'cancelled',
+                                      'orphaned', 'hydrating', 'yielding', 'dlq', 'rolling_back')),
     assigned_gateway VARCHAR(64),
     lease_expires   TIMESTAMPTZ,  -- heartbeat lease TTL
     compute_budget  FLOAT DEFAULT 0.0,  -- max tokens/dollars for this task
@@ -77,6 +83,54 @@ CREATE TABLE IF NOT EXISTS gateway_registry (
 );
 
 CREATE INDEX IF NOT EXISTS idx_gateway_status ON gateway_registry (status);
+
+-- Lane locks table — semantic mutexes with fencing tokens
+CREATE TABLE IF NOT EXISTS lane_locks (
+    lane_id         VARCHAR(256) PRIMARY KEY,
+    gateway_id      VARCHAR(64) NOT NULL,
+    task_id         UUID NOT NULL REFERENCES tasks(task_id),
+    fencing_token   INTEGER NOT NULL,
+    acquired_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at      TIMESTAMPTZ NOT NULL,
+    CONSTRAINT positive_fencing CHECK (fencing_token > 0)
+);
+
+CREATE INDEX IF NOT EXISTS idx_lane_locks_gateway ON lane_locks (gateway_id);
+CREATE INDEX IF NOT EXISTS idx_lane_locks_expires ON lane_locks (expires_at);
+
+-- Fencing token sequence — monotonically increasing per lane
+CREATE TABLE IF NOT EXISTS fencing_tokens (
+    lane_id     VARCHAR(256) PRIMARY KEY,
+    token       INTEGER NOT NULL DEFAULT 0
+);
+
+-- Dead Letter Queue — poison pill tasks
+CREATE TABLE IF NOT EXISTS dead_letter_queue (
+    task_id             UUID PRIMARY KEY REFERENCES tasks(task_id),
+    failure_count       INTEGER NOT NULL CHECK (failure_count >= 3),
+    failures            JSONB NOT NULL DEFAULT '[]',
+    root_cause_diagnosis TEXT,
+    proposed_amendment  JSONB,
+    entered_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    resolved_at         TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_dlq_unresolved ON dead_letter_queue (entered_at) WHERE resolved_at IS NULL;
+
+-- Checkpoints — incremental scratchpad state for hydration
+CREATE TABLE IF NOT EXISTS checkpoints (
+    id                  UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    task_id             UUID NOT NULL REFERENCES tasks(task_id),
+    gateway_id          VARCHAR(64) NOT NULL,
+    checkpoint_seq      INTEGER NOT NULL,
+    scratchpad          TEXT NOT NULL,
+    progress_pct        FLOAT DEFAULT 0.0,
+    tokens_consumed     INTEGER DEFAULT 0,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (task_id, checkpoint_seq)
+);
+
+CREATE INDEX IF NOT EXISTS idx_checkpoints_task ON checkpoints (task_id, checkpoint_seq DESC);
 
 -- Lease expiry function: auto-revoke expired leases
 CREATE OR REPLACE FUNCTION revoke_expired_leases()
