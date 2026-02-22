@@ -47,6 +47,7 @@ from memu.swarm_models import (
     TaskOrphaned,
     TaskStatus,
 )
+from memu.hardening import sanitize_nats_subject
 
 logger = logging.getLogger(__name__)
 

@@ -258,10 +258,13 @@ async def main():
     logger.info(f"  Role: {GATEWAY_ROLE}")
     logger.info(f"  Task: {TASK_ID or 'none (warm standby)'}")
 
-    # Step 1: Hydrate state from memU
-    context = await hydrate_state()
+    # Step 1: Hydrate state from memU (with hard timeout — Failure Mode 4)
+    from memu.hardening import hydrate_with_timeout
+    context = await hydrate_with_timeout(hydrate_state)
     logger.info(f"  Hydration complete: {len(context['blackboard'])} blackboard entries")
-    if context["checkpoint"]:
+    if context.get("hydration_failed"):
+        logger.warning(f"  ⚠ Hydration failed: {context.get('failure_reason')}. Running with empty context.")
+    elif context["checkpoint"]:
         logger.info(f"  Checkpoint recovered — resuming task {TASK_ID}")
 
     # Step 2: Connect to NATS mesh
@@ -277,7 +280,36 @@ async def main():
     if cluster:
         heartbeat_task = asyncio.create_task(start_heartbeat(cluster))
 
-    # Step 4: Run the actual agent logic
+    # Step 4: Install graceful shutdown handlers (Failure Mode: SIGTERM)
+    from memu.hardening import install_signal_handlers, register_shutdown_handler
+
+    async def _graceful_shutdown():
+        logger.info("Graceful shutdown: releasing resources...")
+        if heartbeat_task:
+            heartbeat_task.cancel()
+        if cluster:
+            # Publish draining status before exit
+            try:
+                nc = cluster.active_connection
+                await nc.publish(
+                    "swarm.discovery",
+                    json.dumps({
+                        "gateway_id": GATEWAY_ID,
+                        "status": "offline",
+                        "reason": "graceful_shutdown",
+                    }).encode(),
+                )
+            except Exception:
+                pass
+            await cluster.close()
+
+    register_shutdown_handler(_graceful_shutdown)
+    try:
+        install_signal_handlers(asyncio.get_event_loop())
+    except Exception:
+        pass  # Signal handlers not available on all platforms
+
+    # Step 5: Run the actual agent logic
     # This is where the gateway-specific agent loop goes.
     # For now, just keep alive.
     try:
@@ -287,10 +319,7 @@ async def main():
     except asyncio.CancelledError:
         pass
     finally:
-        if heartbeat_task:
-            heartbeat_task.cancel()
-        if cluster:
-            await cluster.close()
+        await _graceful_shutdown()
         logger.info("Gateway shutdown complete")
 
 

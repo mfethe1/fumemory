@@ -203,3 +203,9 @@ BEGIN
     RETURN revoked_count;
 END;
 $$ LANGUAGE plpgsql;
+
+-- Events archive table — cold storage for completed task history
+-- Used by hardening.archive_old_events() to prevent ledger bloat
+CREATE TABLE IF NOT EXISTS events_archive (LIKE events INCLUDING ALL);
+CREATE INDEX IF NOT EXISTS idx_events_archive_task ON events_archive (task_id);
+CREATE INDEX IF NOT EXISTS idx_events_archive_ts ON events_archive (timestamp DESC);
