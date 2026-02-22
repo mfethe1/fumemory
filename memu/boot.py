@@ -229,10 +229,9 @@ async def start_heartbeat(cluster, interval_s: float = 3.0):
                 "swarm.warden.heartbeat",
                 json.dumps({
                     "gateway_id": GATEWAY_ID,
-                    "role": GATEWAY_ROLE,
                     "task_id": TASK_ID,
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                    "uptime_s": time.time() - _boot_time,
+                    "progress_pct": 0.0,
+                    "status_note": "running",
                 }).encode(),
             )
             await asyncio.sleep(interval_s)
@@ -261,7 +260,7 @@ async def _run_smoke_task(cluster, task_id: str):
         description="Lenny smoke task for Warden/ledger visibility",
         status=TaskStatus.CLAIMED,
         assigned_gateway=GATEWAY_ID,
-        resource_lanes=["lane-smoke-task"],
+        resource_lanes=[f"lane-smoke-{task_id}"],
         rollback_instruction="noop",
         compute_budget=0.0,
     )
@@ -328,9 +327,9 @@ async def main():
         logger.info("Running in standalone mode (no mesh)")
         cluster = None
 
-    # Step 3: Start heartbeat
+    # Step 3: Start heartbeat only for task-bearing runtime
     heartbeat_task = None
-    if cluster:
+    if cluster and TASK_ID:
         heartbeat_task = asyncio.create_task(start_heartbeat(cluster))
 
     # Step 4: Install graceful shutdown handlers (Failure Mode: SIGTERM)
@@ -363,8 +362,8 @@ async def main():
         pass  # Signal handlers not available on all platforms
 
     # Step 5: Run the actual agent logic
-    # If TASK_ID is set, run a deterministic lane-locked smoke task.
-    # Otherwise, keep container available as warm standby.
+    # If TASK_ID is set, run a deterministic lane-locked smoke task and emit heartbeat stream.
+    # Otherwise, keep container available as warm standby (no NATS heartbeat).
     try:
         if TASK_ID:
             logger.info("Starting smoke task execution for %s", TASK_ID)

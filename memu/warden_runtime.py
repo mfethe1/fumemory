@@ -219,17 +219,21 @@ class WardenRuntime:
         else:
             pl = data
 
-        try:
-            hb = HeartbeatPing(**pl)
-        except Exception:
+        if not isinstance(pl, dict):
             return
 
-        state = self.liveness.get(hb.gateway_id)
-        if state is None:
-            state = GatewayLiveness(gateway_id=hb.gateway_id, task_id=str(hb.task_id))
-            self.liveness[hb.gateway_id] = state
+        # Allow heartbeat wrappers that omit strict fields in lane-lock events.
+        task_id = pl.get("task_id")
 
-        state.task_id = str(hb.task_id)
+        if not pl.get("gateway_id") or task_id is None:
+            return
+
+        state = self.liveness.get(pl["gateway_id"])
+        if state is None:
+            state = GatewayLiveness(gateway_id=pl["gateway_id"], task_id=str(task_id))
+            self.liveness[pl["gateway_id"]] = state
+
+        state.task_id = str(task_id)
         state.touched()
 
     async def _on_respawn(self, msg):

@@ -254,6 +254,8 @@ class LaneLockedExecution:
                 await self._publish_event(EventType.HEARTBEAT, {
                     "gateway_id": self.gateway_id,
                     "task_id": str(self.task.task_id),
+                    "progress_pct": 0.0,
+                    "status_note": "lane-lock-heartbeat",
                     "lanes_held": [l.lane_id for l in self.acquired_locks],
                 })
 
