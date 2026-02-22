@@ -173,6 +173,31 @@ async def register_with_mesh():
     )
     await cluster.connect()
 
+    # === SUICIDE SIGNAL LISTENER (Lenny's Split-Brain Fix) ===
+    # High-priority listener: if this gateway's ID appears on the suicide channel,
+    # it means the Warden has revoked our fencing token and spawned a replacement.
+    # We are a "ghost" — exit immediately before corrupting any state.
+    nc = cluster.active_connection
+
+    async def _suicide_handler(msg):
+        """Hard exit on suicide signal — no cleanup, no DB writes, just die."""
+        try:
+            data = json.loads(msg.data.decode())
+            target = data.get("target_gateway_id", "")
+            if target == GATEWAY_ID:
+                logger.critical(
+                    f"☠ SUICIDE SIGNAL received — I am a ghost gateway. "
+                    f"Reason: {data.get('reason', 'unknown')}. Exiting immediately."
+                )
+                sys.exit(0)
+        except Exception:
+            pass
+
+    # Subscribe to both the specific and wildcard suicide channels
+    await nc.subscribe(f"swarm.advisory.suicide.{GATEWAY_ID}", cb=_suicide_handler)
+    await nc.subscribe("swarm.advisory.suicide.*", cb=_suicide_handler)
+    logger.info(f"Suicide signal listener active on swarm.advisory.suicide.{GATEWAY_ID}")
+
     # Announce presence
     announce = GatewayAnnounce(
         gateway_id=GATEWAY_ID,
@@ -185,7 +210,6 @@ async def register_with_mesh():
         },
     )
 
-    nc = cluster.active_connection
     await nc.publish(
         "swarm.discovery",
         announce.model_dump_json().encode(),

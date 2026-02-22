@@ -41,8 +41,9 @@ logger = logging.getLogger(__name__)
 # --- Configuration ---
 
 MAX_CONTAINERS = int(os.environ.get("WARDEN_MAX_CONTAINERS", "10"))
-MIN_WARM_POOL = int(os.environ.get("WARDEN_MIN_WARM_POOL", "1"))
+MIN_WARM_POOL = int(os.environ.get("WARDEN_MIN_WARM_POOL", "0"))  # 0 = cold start mode (Lenny's fix for low-RAM hosts)
 MAX_WARM_POOL = int(os.environ.get("WARDEN_MAX_WARM_POOL", "3"))
+WARM_POOL_MODE = os.environ.get("WARDEN_WARM_POOL_MODE", "cold")  # "cold" | "warm" — cold for <8GB RAM hosts
 HEARTBEAT_TTL_S = int(os.environ.get("WARDEN_HEARTBEAT_TTL", "10"))
 HEARTBEAT_CHECK_INTERVAL_S = float(os.environ.get("WARDEN_CHECK_INTERVAL", "3.0"))
 SANDBOX_TIMEOUT_S = int(os.environ.get("WARDEN_SANDBOX_TIMEOUT", "30"))
@@ -178,6 +179,11 @@ class BlackboardEntry(BaseModel):
 
     When a gateway discovers something systemic (e.g., 'API X requires Bearer auth'),
     it publishes here. All gateways instantly receive it.
+
+    IMPORTANT (Lenny's Refinement): Entries start as UNTRUSTED (is_validated=False).
+    A second independent gateway or the Medic must verify before the swarm trusts it.
+    This prevents "Hallucination Contagion" — one gateway's hallucinated fact
+    infecting the entire swarm.
     """
     entry_id: UUID = Field(default_factory=uuid4)
     key: str = Field(..., max_length=256, description="Namespaced key (e.g. 'api.github.auth_type')")
@@ -190,11 +196,27 @@ class BlackboardEntry(BaseModel):
     valid_until: datetime | None = None
     access_count: int = 0
 
+    # Hallucination Contagion Prevention (Lenny's Validation Gate)
+    is_validated: bool = Field(
+        False,
+        description="UNTRUSTED until a second independent gateway verifies this insight"
+    )
+    validated_by: str | None = Field(
+        None, max_length=64,
+        description="Gateway ID that independently verified this entry"
+    )
+    validated_at: datetime | None = None
+
     @property
     def is_expired(self) -> bool:
         if self.valid_until is None:
             return False
         return datetime.now(timezone.utc) > self.valid_until
+
+    @property
+    def is_trusted(self) -> bool:
+        """An entry is trusted only when validated by a second source and not expired."""
+        return self.is_validated and not self.is_expired
 
 
 class BlackboardSnapshot(BaseModel):
@@ -212,13 +234,26 @@ class BlackboardSnapshot(BaseModel):
             if not e.is_expired and e.entry_id not in superseded_ids
         ]
 
-    def to_context_string(self, max_tokens: int = 4000) -> str:
+    @property
+    def trusted_entries(self) -> list[BlackboardEntry]:
+        """Only validated, non-expired, non-superseded entries.
+        Unvalidated entries are visible but marked as untrusted."""
+        return [e for e in self.active_entries if e.is_trusted]
+
+    def to_context_string(self, max_tokens: int = 4000, include_untrusted: bool = False) -> str:
         """Render active entries as a context string for LLM injection.
 
-        Respects token budget — most recent/highest confidence first.
+        By default, only injects VALIDATED entries. Untrusted entries
+        are excluded from the LLM context to prevent hallucination contagion.
+        Set include_untrusted=True to see (but mark) unverified insights.
         """
-        active = sorted(
-            self.active_entries,
+        if include_untrusted:
+            entries = self.active_entries
+        else:
+            entries = self.trusted_entries
+
+        sorted_entries = sorted(
+            entries,
             key=lambda e: (e.confidence, e.valid_from.timestamp()),
             reverse=True,
         )
@@ -226,10 +261,11 @@ class BlackboardSnapshot(BaseModel):
         lines = ["## Shared Knowledge (Epistemic Blackboard)"]
         char_budget = max_tokens * 4  # rough chars-per-token
 
-        for entry in active:
-            line = f"- [{entry.category}] {entry.key}: {entry.value}"
+        for entry in sorted_entries:
+            trust_tag = "✓" if entry.is_validated else "⚠ UNVERIFIED"
+            line = f"- [{entry.category}] [{trust_tag}] {entry.key}: {entry.value}"
             if len("\n".join(lines)) + len(line) > char_budget:
-                lines.append(f"... ({len(active) - len(lines) + 1} more entries truncated)")
+                lines.append(f"... ({len(sorted_entries) - len(lines) + 1} more entries truncated)")
                 break
             lines.append(line)
 
@@ -261,5 +297,7 @@ WARDEN_SUBJECTS = {
     "status": "swarm.warden.status",
     "blackboard": "swarm.blackboard",
     "blackboard_sync": "swarm.blackboard.sync",
+    "blackboard_validate": "swarm.blackboard.validate",
     "container_event": "swarm.warden.container",
+    "suicide": "swarm.advisory.suicide",  # Lenny's split-brain fix — per-gateway: swarm.advisory.suicide.<gw_id>
 }

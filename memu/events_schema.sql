@@ -145,6 +145,10 @@ CREATE TABLE IF NOT EXISTS blackboard (
     valid_from      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     valid_until     TIMESTAMPTZ,
     access_count    INTEGER NOT NULL DEFAULT 0,
+    -- Hallucination Contagion Prevention (Lenny's Validation Gate)
+    is_validated    BOOLEAN NOT NULL DEFAULT FALSE,
+    validated_by    VARCHAR(64),
+    validated_at    TIMESTAMPTZ,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 

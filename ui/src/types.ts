@@ -19,7 +19,10 @@ export type EventType =
   | 'task_orphaned' | 'task_hydrated' | 'checkpoint_saved'
   | 'rollback_executed'
   | 'dlq_enqueued' | 'dlq_diagnosed' | 'dlq_healed'
-  | 'rpc_request' | 'rpc_response';
+  | 'rpc_request' | 'rpc_response'
+  // Warden / container lifecycle
+  | 'suicide_signal' | 'container_started' | 'container_died'
+  | 'fork_bomb_blocked' | 'blackboard_validated';
 
 export type TaskStatus =
   | 'pending' | 'bidding' | 'claimed' | 'executing'
@@ -190,6 +193,10 @@ export interface BlackboardEntryInfo {
   confidence: number;
   valid_from: string;
   access_count: number;
+  // Hallucination Contagion Prevention (Lenny's Validation Gate)
+  is_validated: boolean;
+  validated_by?: string | null;
+  validated_at?: string | null;
 }
 
 export const CONTAINER_STATE_COLORS: Record<ContainerState, string> = {
