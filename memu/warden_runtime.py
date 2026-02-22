@@ -105,6 +105,7 @@ class WardenRuntime:
         while True:
             try:
                 msg = await self._hb_sub.next_msg(timeout=5)
+                logger.debug("GOT HB: %s", msg.data.decode())
                 await self._on_heartbeat(msg)
             except asyncio.TimeoutError:
                 pass
