@@ -10,10 +10,26 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data
       - ./memu/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql
+      - ./memu/events_schema.sql:/docker-entrypoint-initdb.d/02-events.sql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U memu"]
       interval: 5s
       timeout: 5s
+      retries: 5
+
+  nats:
+    image: nats:2.10-alpine
+    command: ["--config", "/etc/nats/nats-server.conf"]
+    ports:
+      - "4222:4222"   # Client connections
+      - "8222:8222"   # HTTP monitoring
+    volumes:
+      - natsdata:/data
+      - ./infra/local-nats/nats-server.conf:/etc/nats/nats-server.conf
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8222/healthz"]
+      interval: 5s
+      timeout: 3s
       retries: 5
 
   api:
@@ -24,9 +40,26 @@ services:
       DATABASE_URL: postgresql://memu:memu@postgres:5432/memu
       MEMU_API_KEY: ${MEMU_API_KEY:-memu-dev-key}
       OPENAI_API_KEY: ${OPENAI_API_KEY}
+      NATS_LOCAL_URL: nats://nats:4222
+      NATS_RAILWAY_URL: ${NATS_RAILWAY_URL:-nats://nats:4222}
     depends_on:
       postgres:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+
+  bridge:
+    build: .
+    command: ["python", "-m", "memu.ws_bridge"]
+    ports:
+      - "8001:8001"
+    environment:
+      NATS_LOCAL_URL: nats://nats:4222
+      NATS_RAILWAY_URL: ${NATS_RAILWAY_URL:-nats://nats:4222}
+    depends_on:
+      nats:
         condition: service_healthy
 
 volumes:
   pgdata:
+  natsdata:

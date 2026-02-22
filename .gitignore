@@ -8,3 +8,8 @@ build/
 venv/
 node_modules/
 .DS_Store
+infra/local-nats/data/
+infra/local-nats/nats-server
+infra/local-nats/nats-server.exe
+ui/node_modules/
+ui/dist/
