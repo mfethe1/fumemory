@@ -114,13 +114,14 @@ class WardenRuntime:
                     continue
 
                 logger.warning("Heartbeat expired for %s (age=%.1fs)", gateway_id, age)
-                await self._handle_expired_gateway(state)
+                task_id = state.task_id
+                await self._handle_expired_gateway(state, task_id)
                 # remove to prevent repeated respawn loops
                 del self.liveness[gateway_id]
 
             await asyncio.sleep(self.check_interval)
 
-    async def _handle_expired_gateway(self, state: GatewayLiveness):
+    async def _handle_expired_gateway(self, state: GatewayLiveness, task_id: str | None = None):
         assert self.cluster is not None
         nc = self.cluster.active_connection
 
@@ -151,9 +152,9 @@ class WardenRuntime:
             await nc.publish("swarm.warden.respawn", req.model_dump_json().encode())
 
         # Try to spawn replacement container (best effort)
-        await self._spawn_gateway_container(state.gateway_id)
+        await self._spawn_gateway_container(state.gateway_id, task_id or None)
 
-    async def _spawn_gateway_container(self, dead_gateway_id: str):
+    async def _spawn_gateway_container(self, dead_gateway_id: str, task_id: str | None = None):
         if not self._use_docker:
             logger.warning("Docker unavailable; cannot spawn gateway container for %s", dead_gateway_id)
             return
@@ -170,9 +171,10 @@ class WardenRuntime:
                 name=f"ward-standby-{dead_gateway_id}-{int(datetime.now().timestamp())}",
                 environment={
                     "GATEWAY_ROLE": "gateway",
-                    "TASK_ID": self.fallback_task_container,
+                    "TASK_ID": task_id or self.fallback_task_container,
                     "TARGET_GATEWAY_ID": dead_gateway_id,
                     "WARDEN_MODE": "respawn",
+                    "GATEWAY_ID": f"{dead_gateway_id}-respawn",
                 },
                 remove=True,
             )
@@ -241,7 +243,8 @@ class WardenRuntime:
         # For now, only accept explicit requests from known coordinators/selves.
         # Signature validation can be added once signing is standardized.
         target_id = req.dead_gateway_id
-        await self._spawn_gateway_container(target_id)
+        req_task_id = str(req.task_id) if req.task_id else None
+        await self._spawn_gateway_container(target_id, req_task_id)
 
 
 class WardenSubjects:
