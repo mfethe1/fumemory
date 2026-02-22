@@ -24,6 +24,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from pydantic import BaseModel, Field
 
 from memu.cluster import NATSClusterManager
+from memu.bridge_ledger import BridgeLedger
 from memu.swarm_models import (
     EventType,
     SwarmEvent,
@@ -35,6 +36,7 @@ logger = logging.getLogger(__name__)
 # --- Globals ---
 
 cluster: NATSClusterManager | None = None
+ledger: BridgeLedger = BridgeLedger()
 connected_clients: set[WebSocket] = set()
 
 
@@ -177,6 +179,38 @@ async def cluster_status():
     return cluster.status()
 
 
+@app.get("/api/dag")
+async def get_dag(root_prompt_id: str | None = None):
+    """Get the live DAG projection (all tasks or filtered by root prompt)."""
+    return ledger.get_dag(root_prompt_id)
+
+
+@app.get("/api/events")
+async def get_events(limit: int = 100, offset: int = 0):
+    """Get recent events from the in-memory ledger."""
+    events = ledger.get_event_log(limit=limit, offset=offset)
+    return {"events": events, "total": len(ledger.events)}
+
+
+@app.get("/api/trajectory/{task_id}")
+async def get_trajectory(task_id: str):
+    """Get the full event trajectory for a specific task."""
+    result = ledger.get_trajectory(task_id)
+    if "error" in result:
+        raise HTTPException(404, result["error"])
+    return result
+
+
+@app.get("/api/stats")
+async def get_stats():
+    """Aggregate swarm statistics for the Glass Box dashboard."""
+    dag = ledger.get_dag()
+    stats = dag["stats"]
+    stats["cluster"] = cluster.status() if cluster else {"status": "disconnected"}
+    stats["connected_clients"] = len(connected_clients)
+    return stats
+
+
 # --- NATS → WebSocket Bridge ---
 
 async def _nats_to_ws_bridge():
@@ -193,11 +227,15 @@ async def _nats_to_ws_bridge():
             logger.info("NATS → WebSocket bridge active")
 
             async for msg in sub.messages:
-                if not connected_clients:
-                    continue
-
                 try:
                     data = json.loads(msg.data.decode())
+                    
+                    # Always project into in-memory ledger
+                    ledger.process_event(data)
+                    
+                    if not connected_clients:
+                        continue
+
                     ws_msg = {"type": "event", "data": data}
 
                     # Broadcast to all connected Glass Box clients
