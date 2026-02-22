@@ -86,6 +86,14 @@ export function useSwarmSocket(wsUrl: string) {
           events: [event.event_id],
           created_at: event.timestamp,
           completed_at: null,
+          resource_lanes: (payload.resource_lanes as string[]) ?? [],
+          fencing_token: null,
+          rollback_instruction: null,
+          checkpoint_state: null,
+          checkpoint_timestamp: null,
+          failure_count: 0,
+          last_error: null,
+          required_capabilities: (payload.required_capabilities as string[]) ?? [],
         });
 
         // Register as child of parent
