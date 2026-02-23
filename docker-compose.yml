@@ -94,11 +94,15 @@ services:
     restart: unless-stopped
     build: .
     command: ["python", "-m", "memu.ws_bridge"]
-    ports:
-      - "8001:8001"
+
+  event-consumer:
+    restart: unless-stopped
+    build: .
+    command: ["python", "-m", "memu.event_consumer"]
     environment:
       NATS_LOCAL_URL: nats://nats:4222
       NATS_RAILWAY_URL: ${NATS_RAILWAY_URL:-nats://nats:4222}
+      SUMMARY_INTERVAL_SECONDS: "30"
     depends_on:
       nats:
         condition: service_healthy
