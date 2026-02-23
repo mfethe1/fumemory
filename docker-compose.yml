@@ -1,5 +1,6 @@
 services:
   postgres:
+    restart: unless-stopped
     image: pgvector/pgvector:pg16
     environment:
       POSTGRES_DB: memu
@@ -18,6 +19,7 @@ services:
       retries: 5
 
   nats:
+    restart: unless-stopped
     image: nats:2.10-alpine
     command: ["--config", "/etc/nats/nats-server.conf"]
     ports:
@@ -33,6 +35,7 @@ services:
       retries: 5
 
   ollama:
+    restart: unless-stopped
     image: ollama/ollama:latest
     command: ["serve"]
     environment:
@@ -48,6 +51,7 @@ services:
       retries: 5
 
   api:
+    restart: unless-stopped
     build: .
     ports:
       - "8000:8000"
@@ -67,7 +71,27 @@ services:
       ollama:
         condition: service_started
 
+  warden:
+    restart: unless-stopped
+    build: .
+    working_dir: /app
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      NATS_LOCAL_URL: nats://nats:4222
+      NATS_RAILWAY_URL: ${NATS_RAILWAY_URL:-nats://nats:4222}
+      WARDEN_GATEWAY_IMAGE: ${WARDEN_GATEWAY_IMAGE:-fumemory-gateway:latest}
+      WARDEN_HEARTBEAT_TTL: ${WARDEN_HEARTBEAT_TTL:-8}
+      WARDEN_CHECK_INTERVAL: ${WARDEN_CHECK_INTERVAL:-2}
+      WARDEN_RESPAWN_COOLDOWN_S: ${WARDEN_RESPAWN_COOLDOWN_S:-30}
+      WARDEN_LOG_LEVEL: ${WARDEN_LOG_LEVEL:-INFO}
+    command: ["python", "-m", "memu.warden_runtime"]
+    depends_on:
+      nats:
+        condition: service_healthy
+
   bridge:
+    restart: unless-stopped
     build: .
     command: ["python", "-m", "memu.ws_bridge"]
     ports:

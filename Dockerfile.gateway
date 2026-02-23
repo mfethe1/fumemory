@@ -22,9 +22,6 @@ COPY memu/ memu/
 # Install runtime deps without package install (hatch packaging is intentionally decoupled).
 RUN pip install --no-cache-dir fastapi==0.100 uvicorn>=0.20 asyncpg>=0.28 httpx>=0.24 pydantic>=2.0 nats-py>=2.7
 
-# Health check via NATS heartbeat (the Warden monitors this)
-HEALTHCHECK --interval=10s --timeout=3s --retries=3 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8222/healthz')" || exit 1
 
 # No host volumes. No secrets baked in. Everything comes from env vars.
 # The container is disposable — kill it, spawn a new one, hydrate from memU.

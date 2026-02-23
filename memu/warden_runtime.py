@@ -15,10 +15,12 @@ import argparse
 import asyncio
 import logging
 import os
+import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
+from uuid import uuid4
 
 import nats
 from pydantic import ValidationError
@@ -61,6 +63,9 @@ class WardenRuntime:
         self.cluster: NATSClusterManager | None = None
         self.liveness: dict[str, GatewayLiveness] = {}
         self.active_containers: dict[str, str] = {}  # gateway_id -> container_id
+        self._respawn_retry_after: dict[str, float] = {}
+        self._spawn_inflight: set[str] = set()
+        self._respawn_cooldown_s = int(os.environ.get("WARDEN_RESPAWN_COOLDOWN_S", "30"))
 
         # Optional docker integration (non-fatal if missing)
         self._docker = None
@@ -170,21 +175,35 @@ class WardenRuntime:
         # Emit advisory suicide signal to prevent split-brain ghosts
         await nc.publish(f"{WardenSubjects.SUICIDE_BASE}{state.gateway_id}", b"{}")
 
-        # Basic respawn semantics via signed request
+        # Basic respawn semantics via single-path trigger
         if state.task_id:
-            req = self._build_respawn_request("gateway", state.task_id, state.gateway_id)
-            await nc.publish("swarm.warden.respawn", req.model_dump_json().encode())
+            await self._request_respawn(state.gateway_id, task_id=state.task_id, reason="heartbeat_miss")
 
-        # Try to spawn replacement container (best effort)
-        await self._spawn_gateway_container(state.gateway_id, task_id or None)
+        # Try to spawn replacement container (deterministic, single attempt per expiry window)
+        await self._spawn_gateway_container(state.gateway_id, task_id or None, requested_from="heartbeat")
 
-    async def _spawn_gateway_container(self, dead_gateway_id: str, task_id: str | None = None):
+    async def _request_respawn(self, dead_gateway_id: str, task_id: str | None = None, reason: str = "manual"):
+        if not task_id:
+            logger.debug("Skipping respawn event for %s: no task_id", dead_gateway_id)
+            return
+        if not self._can_spawn(dead_gateway_id):
+            return
+
+        assert self.cluster is not None
+        nc = self.cluster.active_connection
+        req = self._build_respawn_request("gateway", task_id, dead_gateway_id, reason=reason)
+        await nc.publish("swarm.warden.respawn", req.model_dump_json().encode())
+
+    async def _spawn_gateway_container(self, dead_gateway_id: str, task_id: str | None = None, requested_from: str = "direct"):
         if not self._use_docker:
             logger.warning("Docker unavailable; cannot spawn gateway container for %s", dead_gateway_id)
             return
 
         if len(self.active_containers) >= self.max_containers:
             logger.error("FORK-BOMB BLOCKER: max containers=%s reached", self.max_containers)
+            return
+
+        if self._respawn_lock(dead_gateway_id, requested_from=requested_from):
             return
 
         try:
@@ -206,18 +225,66 @@ class WardenRuntime:
                 remove=True,
             )
             self.active_containers[dead_gateway_id] = container.id
-            logger.info("Spawned replacement container %s for gateway=%s", container.id, dead_gateway_id)
+            self._spawn_inflight.discard(dead_gateway_id)
+            self._respawn_retry_after.pop(dead_gateway_id, None)
+            logger.info("Spawned replacement container %s for gateway=%s (%s) request=%s", container.id, dead_gateway_id, requested_from, task_id or "<none>")
         except Exception as exc:
+            self._respawn_retry_after[dead_gateway_id] = time.time() + self._respawn_cooldown_s
+            self._spawn_inflight.discard(dead_gateway_id)
             logger.exception("Failed to spawn replacement for %s: %s", dead_gateway_id, exc)
 
-    def _build_respawn_request(self, role: str, task_id: str, dead_gateway_id: str) -> RespawnRequest:
+    def _respawn_lock(self, dead_gateway_id: str, requested_from: str = "direct") -> bool:
+        """Return True when a new spawn must be skipped."""
+        if len(self._spawn_inflight) >= self.max_containers:
+            logger.error("Spawn gate: max in-flight/full containers reached=%s", self.max_containers)
+            return True
+
+        now = time.time()
+        unblock_at = self._respawn_retry_after.get(dead_gateway_id, 0.0)
+        if now < unblock_at:
+            logger.info("Respawn skipped for %s (%s): cooldown %.1fs remaining", dead_gateway_id, requested_from, unblock_at - now)
+            return True
+
+        if dead_gateway_id in self._spawn_inflight:
+            logger.debug("Respawn already in-flight for %s (%s)", dead_gateway_id, requested_from)
+            return True
+
+        # If a prior respawn container is still present, avoid duplicate spawn attempts.
+        if not self._use_docker:
+            return False
+
+        try:
+            cli = self._docker.from_env()
+            existing = [
+                c
+                for c in cli.containers.list(all=True)
+                if c.name.startswith(f"ward-respawn-{dead_gateway_id}-")
+            ]
+            if existing:
+                logger.info("Respawn skipped for %s (%s): existing container(s)=%s", dead_gateway_id, requested_from, [c.name for c in existing])
+                return True
+        except Exception as exc:
+            logger.warning("Unable to scan existing respawn containers for %s: %s", dead_gateway_id, exc)
+
+        self._spawn_inflight.add(dead_gateway_id)
+        return False
+
+    def _can_spawn(self, dead_gateway_id: str) -> bool:
+        now = time.time()
+        if dead_gateway_id in self._spawn_inflight:
+            return False
+        if now < self._respawn_retry_after.get(dead_gateway_id, 0.0):
+            return False
+        return True
+
+    def _build_respawn_request(self, role: str, task_id: str, dead_gateway_id: str, reason: str = "heartbeat_miss") -> RespawnRequest:
         # Signature intentionally optional in minimal loop; keep empty string if not configured.
         # This path is deterministic and safe (no eval).
         return RespawnRequest(
             target_role=role,
             dead_gateway_id=dead_gateway_id,
             task_id=task_id,
-            reason="heartbeat_miss",
+            reason=reason,
             requesting_gateway="warden",
             signature="",
         )
