@@ -68,8 +68,9 @@ async def verify_api_key(key: str | None = Security(api_key_header)) -> str:
 
 # --- Embedding ---
 
-async def get_embedding(text: str) -> list[float]:
-    """Get embedding vector from any OpenAI-compatible API (Ollama, OpenAI, etc.)."""
+async def get_embedding(text: str) -> list[float] | None:
+    """Get embedding vector from any OpenAI-compatible API (Ollama, OpenAI, etc.).
+    Returns None if embedding service is unavailable (graceful degradation)."""
     import httpx
 
     url = f"{EMBEDDING_BASE_URL.rstrip('/')}/v1/embeddings"
@@ -77,14 +78,19 @@ async def get_embedding(text: str) -> list[float]:
     if OPENAI_API_KEY:
         headers["Authorization"] = f"Bearer {OPENAI_API_KEY}"
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        r = await client.post(
-            url,
-            headers=headers,
-            json={"input": text, "model": EMBEDDING_MODEL},
-        )
-        r.raise_for_status()
-        return r.json()["data"][0]["embedding"]
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            r = await client.post(
+                url,
+                headers=headers,
+                json={"input": text, "model": EMBEDDING_MODEL},
+            )
+            r.raise_for_status()
+            return r.json()["data"][0]["embedding"]
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning("Embedding unavailable (%s), storing without vector", e)
+        return None
 
 
 def content_hash(text: str) -> str:
@@ -109,19 +115,25 @@ async def create_memory(req: MemoryCreate, _key: str = Depends(verify_api_key)):
     c_hash = content_hash(req.content)
 
     async with pool.acquire() as conn:
-        # Check for duplicates
-        existing = await conn.fetchrow(
-            """
-            SELECT id, 1 - (embedding <=> $1::vector) AS similarity
-            FROM memories
-            WHERE content_hash = $2 OR (1 - (embedding <=> $1::vector)) > $3
-            ORDER BY similarity DESC
-            LIMIT 1
-            """,
-            str(embedding),
-            c_hash,
-            DEDUP_THRESHOLD,
-        )
+        # Check for duplicates (content hash always works; vector similarity only when embedding available)
+        if embedding is not None:
+            existing = await conn.fetchrow(
+                """
+                SELECT id, 1 - (embedding <=> $1::vector) AS similarity
+                FROM memories
+                WHERE content_hash = $2 OR (1 - (embedding <=> $1::vector)) > $3
+                ORDER BY similarity DESC
+                LIMIT 1
+                """,
+                str(embedding),
+                c_hash,
+                DEDUP_THRESHOLD,
+            )
+        else:
+            existing = await conn.fetchrow(
+                "SELECT id, 1.0::float AS similarity FROM memories WHERE content_hash = $1 LIMIT 1",
+                c_hash,
+            )
 
         if existing and should_deduplicate(existing["similarity"], DEDUP_THRESHOLD):
             # Update existing memory instead of duplicating
@@ -143,11 +155,11 @@ async def create_memory(req: MemoryCreate, _key: str = Depends(verify_api_key)):
             row = await conn.fetchrow(
                 """
                 INSERT INTO memories (content, embedding, memory_type, agent_id, metadata, parent_id, confidence, content_hash)
-                VALUES ($1, $2::vector, $3, $4, $5::jsonb, $6, $7, $8)
+                VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8)
                 RETURNING *
                 """,
                 req.content,
-                str(embedding),
+                str(embedding) if embedding is not None else None,
                 req.memory_type.value,
                 req.agent_id,
                 str(req.metadata) if req.metadata else "{}",
