@@ -192,7 +192,7 @@ class WardenRuntime:
             container = cli.containers.run(
                 image=self.gateway_image,
                 detach=True,
-                name=f"ward-respawn-{dead_gateway_id}-{int(datetime.now().timestamp())}",
+                name=f"ward-respawn-{dead_gateway_id}-{str(uuid4())[:8]}",
                 network_mode="host",
                 environment={
                     "GATEWAY_ROLE": "gateway",
