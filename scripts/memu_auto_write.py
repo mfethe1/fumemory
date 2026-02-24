@@ -14,10 +14,12 @@ Usage:
 Environment:
     MEMU_API_URL  — default http://127.0.0.1:8000
     MEMU_API_KEY  — default memu-dev-key
+    NATS_URL      — default nats://localhost:4222
 """
 
 from __future__ import annotations
 
+import asyncio
 import argparse
 import hashlib
 import json
@@ -26,13 +28,16 @@ import re
 import sys
 from datetime import datetime, timezone
 from typing import Any
+from uuid import UUID, uuid4
 
 import httpx
+import nats
 
 # --- Config ---
 
 MEMU_API_URL = os.environ.get("MEMU_API_URL", "http://127.0.0.1:8000")
 MEMU_API_KEY = os.environ.get("MEMU_API_KEY", "memu-dev-key")
+NATS_URL = os.environ.get("NATS_URL", "nats://localhost:4222")
 
 VALID_TYPES = {"fact", "decision", "lesson", "pattern", "failure"}
 MIN_CONFIDENCE = 0.7
@@ -85,6 +90,29 @@ def validate_memory(content: str, memory_type: str, confidence: float, agent_id:
     }
 
 
+# --- NATS Emitter ---
+
+async def emit_nats_event(event_type: str, task_id: str, payload: dict, agent_id: str):
+    """Emit a SwarmEvent to the NATS mesh."""
+    try:
+        nc = await nats.connect(NATS_URL)
+        
+        event = {
+            "event_id": str(uuid4()),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "source_gateway": agent_id,
+            "event_type": event_type,
+            "task_id": task_id,
+            "payload": payload
+        }
+        
+        await nc.publish("swarm.events", json.dumps(event).encode())
+        await nc.flush()
+        await nc.close()
+    except Exception as e:
+        print(f"Failed to emit NATS event: {e}", file=sys.stderr)
+
+
 # --- API Client ---
 
 def write_memory(content: str, memory_type: str, agent_id: str, confidence: float = 0.9,
@@ -96,11 +124,21 @@ def write_memory(content: str, memory_type: str, agent_id: str, confidence: floa
 
     headers = {"X-API-Key": MEMU_API_KEY, "Content-Type": "application/json"}
 
-    with httpx.Client(timeout=30) as client:
+    with httpx.Client(timeout=120) as client:
         r = client.post(f"{MEMU_API_URL}/memories", headers=headers, json=payload)
 
         if r.status_code == 200:
             data = r.json()
+            
+            # Emit NATS event
+            try:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                loop.run_until_complete(emit_nats_event("memory_written", "00000000-0000-0000-0000-000000000000", data, agent_id))
+                loop.close()
+            except Exception as e:
+                print(f"Warning: NATS event emission skipped ({e})", file=sys.stderr)
+
             action = "deduplicated" if data.get("access_count", 0) > 0 else "created"
             return {"status": "ok", "action": action, "id": data["id"], "access_count": data.get("access_count", 0)}
         else:
@@ -123,37 +161,26 @@ def search_memories(query: str, limit: int = 5) -> list[dict]:
 
 
 def sync_daily_memory(file_path: str, agent_id: str) -> dict:
-    """Parse a daily memory markdown file and extract structured memories.
-    
-    Looks for patterns like:
-    - Lines starting with '- **' (key facts/actions)
-    - Section headers with timestamps
-    - Bullet points with specific outcomes
-    """
+    """Parse a daily memory markdown file and extract structured memories."""
     if not os.path.exists(file_path):
         return {"status": "error", "detail": f"File not found: {file_path}"}
 
     with open(file_path) as f:
         content = f.read()
 
-    # Extract meaningful bullet points
     memories_to_write = []
     current_section = ""
     
     for line in content.splitlines():
         line = line.strip()
         
-        # Track section context
         if line.startswith("## "):
             current_section = line.lstrip("# ").strip()
             continue
         
-        # Extract substantive bullet points
         if line.startswith("- **") and ":" in line:
-            # Remove markdown bold markers
             clean = re.sub(r'\*\*', '', line.lstrip("- ")).strip()
             if len(clean) >= MIN_CONTENT_LENGTH:
-                # Classify based on content
                 memory_type = _classify_content(clean)
                 memories_to_write.append({
                     "content": f"[{current_section}] {clean}" if current_section else clean,

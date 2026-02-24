@@ -86,3 +86,36 @@ class BulkImportResponse(BaseModel):
     """Result of bulk import."""
     imported: int
     duplicates_skipped: int
+
+class TaskStatus(str, enum.Enum):
+    TODO = "todo"
+    IN_PROGRESS = "in-progress"
+    DONE = "done"
+    BLOCKED = "blocked"
+
+class TaskPriority(str, enum.Enum):
+    P0 = "P0"
+    P1 = "P1"
+    P2 = "P2"
+    P3 = "P3"
+
+class TaskCreate(BaseModel):
+    task: str
+    priority: TaskPriority = TaskPriority.P2
+    owner_id: str | None = None
+    lane: str = "general"
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    dependency_id: UUID | None = None
+
+class Task(BaseModel):
+    id: UUID
+    task: str
+    priority: TaskPriority
+    status: TaskStatus
+    owner_id: str | None
+    lane: str
+    metadata: dict[str, Any]
+    evidence: str | None
+    dependency_id: UUID | None
+    created_at: datetime
+    updated_at: datetime

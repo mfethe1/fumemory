@@ -107,6 +107,19 @@ services:
       nats:
         condition: service_healthy
 
+  projector:
+    restart: unless-stopped
+    build: .
+    command: ["python", "-m", "memu.projector"]
+    environment:
+      NATS_URL: nats://nats:4222
+      MEMU_API_URL: http://api:8000
+    depends_on:
+      api:
+        condition: service_started
+      nats:
+        condition: service_healthy
+
 volumes:
   pgdata:
   natsdata:

@@ -5,12 +5,14 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID
 
 import asyncpg
+import httpx
 from fastapi import Depends, FastAPI, HTTPException, Security
 from fastapi.security import APIKeyHeader
 
@@ -24,6 +26,9 @@ from memu.models import (
     MemoryCreate,
     SearchRequest,
     SearchResult,
+    Task,
+    TaskCreate,
+    TaskStatus,
 )
 
 # --- Config ---
@@ -41,6 +46,7 @@ DECAY_RATE = float(os.environ.get("DECAY_RATE", "0.01"))
 
 pool: asyncpg.Pool | None = None
 _fastembed_model: Any = None
+logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
@@ -53,8 +59,7 @@ async def lifespan(app: FastAPI):
         from fastembed import TextEmbedding
         _fastembed_model = TextEmbedding()
     except Exception as e:
-        import logging
-        logging.getLogger(__name__).warning("FastEmbed pre-warm failed: %s", e)
+        logger.warning("FastEmbed pre-warm failed: %s", e)
         
     yield
     if pool:
@@ -82,10 +87,6 @@ async def verify_api_key(key: str | None = Security(api_key_header)) -> str:
 async def get_embedding(text: str) -> list[float] | None:
     """Get embedding vector from any OpenAI-compatible API (Ollama, OpenAI, etc.).
     Falls back to FastEmbed (local) if API fails, then None if both fail."""
-    import httpx
-    import logging
-
-    logger = logging.getLogger(__name__)
 
     # 1. Try OpenAI/Ollama API
     if OPENAI_API_KEY or "ollama" in EMBEDDING_BASE_URL:
@@ -102,7 +103,10 @@ async def get_embedding(text: str) -> list[float] | None:
                     json={"input": text, "model": EMBEDDING_MODEL},
                 )
                 r.raise_for_status()
-                return r.json()["data"][0]["embedding"]
+                emb = r.json()["data"][0]["embedding"]
+                if len(emb) == EMBEDDING_DIMS:
+                    return emb
+                logger.warning("Primary embedding dim mismatch: got %d, expected %d", len(emb), EMBEDDING_DIMS)
         except Exception as e:
             logger.warning("Primary embedding API failed (%s), trying FastEmbed fallback", e)
 
@@ -115,15 +119,58 @@ async def get_embedding(text: str) -> list[float] | None:
         
         # fastembed returns a generator
         embeddings = list(_fastembed_model.embed([text]))
-        return embeddings[0].tolist()
+        emb = embeddings[0].tolist()
+        if len(emb) == EMBEDDING_DIMS:
+            return emb
+        logger.warning("FastEmbed dim mismatch: got %d, expected %d", len(emb), EMBEDDING_DIMS)
     except Exception as e:
         logger.error("FastEmbed fallback failed: %s", e)
-        return None
+    
+    return None
 
 
 def content_hash(text: str) -> str:
     return hashlib.sha256(text.strip().lower().encode()).hexdigest()[:64]
 
+
+# --- Helpers ---
+
+def _row_to_memory(row) -> Memory:
+    metadata = row["metadata"]
+    if isinstance(metadata, str):
+        metadata = json.loads(metadata)
+
+    return Memory(
+        id=row["id"],
+        content=row["content"],
+        memory_type=row["memory_type"],
+        agent_id=row["agent_id"],
+        metadata=metadata,
+        parent_id=row["parent_id"],
+        confidence=row["confidence"],
+        access_count=row["access_count"],
+        decay_score=row["decay_score"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
+
+def _row_to_task(row) -> Task:
+    metadata = row["metadata"]
+    if isinstance(metadata, str):
+        metadata = json.loads(metadata)
+    return Task(
+        id=row["id"],
+        task=row["task"],
+        priority=row["priority"],
+        status=row["status"],
+        owner_id=row["owner_id"],
+        lane=row["lane"],
+        metadata=metadata,
+        evidence=row["evidence"],
+        dependency_id=row["dependency_id"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
 
 # --- Routes ---
 
@@ -230,10 +277,7 @@ async def search_memories(req: SearchRequest, _key: str = Depends(verify_api_key
     embedding = await get_embedding(req.query)
     # Graceful degradation: if embedding service is unavailable, fall back to text search
     if embedding is None:
-        import logging
-        logging.getLogger(__name__).warning(
-            "Embedding service unavailable for /search, falling back to text search"
-        )
+        logger.warning("Embedding service unavailable for /search, falling back to text search")
         # Delegate to text-based search as fallback
         async with pool.acquire() as conn:
             filters = ["content ILIKE $1"]
@@ -278,6 +322,7 @@ async def search_memories(req: SearchRequest, _key: str = Depends(verify_api_key
             )
         results.sort(key=lambda r: r.final_score, reverse=True)
         return results[: req.limit]
+    
     filters = []
     params: list[Any] = [str(embedding)]
     idx = 2
@@ -379,8 +424,6 @@ async def search_text(
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest, _key: str = Depends(verify_api_key)):
     """RAG chat — retrieves relevant memories and generates an answer."""
-    import httpx
-
     # Search for relevant context
     search_req = SearchRequest(query=req.question, limit=req.context_limit, agent_id=req.agent_id)
     search_results = await search_memories(search_req, _key="internal")
@@ -425,11 +468,6 @@ async def bulk_import(req: BulkImportRequest, _key: str = Depends(verify_api_key
 
     for chunk in chunks:
         try:
-            mem_req = MemoryCreate(
-                content=chunk,
-                memory_type=req.memory_type,
-                agent_id=req.agent_id,
-            )
             embedding = await get_embedding(chunk)
             c_hash = content_hash(chunk)
 
@@ -444,10 +482,10 @@ async def bulk_import(req: BulkImportRequest, _key: str = Depends(verify_api_key
                 await conn.execute(
                     """
                     INSERT INTO memories (content, embedding, memory_type, agent_id, content_hash)
-                    VALUES ($1, $2::vector, $3, $4, $5)
+                    VALUES ($1, $2, $3, $4, $5)
                     """,
                     chunk,
-                    str(embedding),
+                    str(embedding) if embedding else None,
                     req.memory_type.value,
                     req.agent_id,
                     c_hash,
@@ -459,28 +497,43 @@ async def bulk_import(req: BulkImportRequest, _key: str = Depends(verify_api_key
     return BulkImportResponse(imported=imported, duplicates_skipped=dupes)
 
 
-# --- Helpers ---
+@app.post("/tasks", response_model=Task)
+async def create_task(req: TaskCreate, _key: str = Depends(verify_api_key)):
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            INSERT INTO backlog (task, priority, owner_id, lane, metadata, dependency_id)
+            VALUES ($1, $2, $3, $4, $5::jsonb, $6)
+            RETURNING *
+            """,
+            req.task,
+            req.priority.value,
+            req.owner_id,
+            req.lane,
+            json.dumps(req.metadata) if req.metadata else "{}",
+            req.dependency_id,
+        )
+    return _row_to_task(row)
 
-def _row_to_memory(row) -> Memory:
-    import json
 
-    metadata = row["metadata"]
-    if isinstance(metadata, str):
-        metadata = json.loads(metadata)
-
-    return Memory(
-        id=row["id"],
-        content=row["content"],
-        memory_type=row["memory_type"],
-        agent_id=row["agent_id"],
-        metadata=metadata,
-        parent_id=row["parent_id"],
-        confidence=row["confidence"],
-        access_count=row["access_count"],
-        decay_score=row["decay_score"],
-        created_at=row["created_at"],
-        updated_at=row["updated_at"],
-    )
+@app.get("/tasks", response_model=list[Task])
+async def list_tasks(status: TaskStatus | None = None, owner: str | None = None, _key: str = Depends(verify_api_key)):
+    filters = []
+    params = []
+    idx = 1
+    if status:
+        filters.append(f"status = ${idx}")
+        params.append(status.value)
+        idx += 1
+    if owner:
+        filters.append(f"owner_id = ${idx}")
+        params.append(owner)
+        idx += 1
+    
+    where = (" WHERE " + " AND ".join(filters)) if filters else ""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(f"SELECT * FROM backlog{where} ORDER BY priority ASC, created_at DESC", *params)
+    return [_row_to_task(row) for row in rows]
 
 
 if __name__ == "__main__":
