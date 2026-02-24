@@ -249,8 +249,8 @@ async def _run_smoke_task(cluster, task_id: str):
     """Run a minimal lane-locked task loop so Glass Box sees lane claim + heartbeats."""
     from uuid import UUID
 
-    from memu.lane_lock import LaneLockedExecution
-    from memu.swarm_models import SwarmEvent, EventType, TaskNode, TaskStatus
+    from memu.lane_lock import DuplicateClaimError, LaneLockedExecution, LaneContestedError
+    from memu.swarm_models import EventType, TaskNode, TaskStatus
 
     task_uuid = UUID(task_id)
     task = TaskNode(
@@ -268,29 +268,28 @@ async def _run_smoke_task(cluster, task_id: str):
     nc = cluster.active_connection
     js = cluster.jetstream
 
-    # Ledger touch #1: explicit TASK_CLAIMED event
-    claimed = SwarmEvent(
-        source_gateway=GATEWAY_ID,
-        event_type=EventType.TASK_CLAIMED,
-        task_id=task_uuid,
-        payload={
-            "gateway_id": GATEWAY_ID,
-            "role": GATEWAY_ROLE,
-            "task_type": "smoke",
-        },
-    )
-    await nc.publish("swarm.events", claimed.model_dump_json().encode())
-
     while True:
         try:
             async with LaneLockedExecution(js, task, GATEWAY_ID, nc) as executor:
+                # Claim is only emitted after lock is held to avoid split-brain duplicates.
+                await executor.publish_event(EventType.TASK_CLAIMED, {
+                    "gateway_id": GATEWAY_ID,
+                    "role": GATEWAY_ROLE,
+                    "task_type": "smoke",
+                })
+
                 # Keep lane lock alive so Warden can see heartbeat windows and lane contention.
                 while True:
                     await asyncio.sleep(2)
-        except Exception as e:
-            # If lane is contested or transient, retry after backoff and keep container alive.
+        except (LaneContestedError, DuplicateClaimError) as e:
+            # If lane is contested or duplicate, retry after backoff and keep container alive.
             logger.warning(
-                "Lane lock or execution error while entering smoke task (%s), retrying", e
+                "Lane lock contention while entering smoke task (%s), retrying", e
+            )
+            await asyncio.sleep(2)
+        except Exception as e:
+            logger.warning(
+                "Execution error while running smoke task (%s), retrying", e
             )
             await asyncio.sleep(2)
 
