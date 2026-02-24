@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -39,12 +40,22 @@ DECAY_RATE = float(os.environ.get("DECAY_RATE", "0.01"))
 # --- Globals ---
 
 pool: asyncpg.Pool | None = None
+_fastembed_model: Any = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global pool
+    global pool, _fastembed_model
     pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=10)
+    
+    # Pre-warm fastembed model
+    try:
+        from fastembed import TextEmbedding
+        _fastembed_model = TextEmbedding()
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning("FastEmbed pre-warm failed: %s", e)
+        
     yield
     if pool:
         await pool.close()
@@ -70,26 +81,43 @@ async def verify_api_key(key: str | None = Security(api_key_header)) -> str:
 
 async def get_embedding(text: str) -> list[float] | None:
     """Get embedding vector from any OpenAI-compatible API (Ollama, OpenAI, etc.).
-    Returns None if embedding service is unavailable (graceful degradation)."""
+    Falls back to FastEmbed (local) if API fails, then None if both fail."""
     import httpx
+    import logging
 
-    url = f"{EMBEDDING_BASE_URL.rstrip('/')}/v1/embeddings"
-    headers = {"Content-Type": "application/json"}
-    if OPENAI_API_KEY:
-        headers["Authorization"] = f"Bearer {OPENAI_API_KEY}"
+    logger = logging.getLogger(__name__)
 
+    # 1. Try OpenAI/Ollama API
+    if OPENAI_API_KEY or "ollama" in EMBEDDING_BASE_URL:
+        url = f"{EMBEDDING_BASE_URL.rstrip('/')}/v1/embeddings"
+        headers = {"Content-Type": "application/json"}
+        if OPENAI_API_KEY:
+            headers["Authorization"] = f"Bearer {OPENAI_API_KEY}"
+
+        try:
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                r = await client.post(
+                    url,
+                    headers=headers,
+                    json={"input": text, "model": EMBEDDING_MODEL},
+                )
+                r.raise_for_status()
+                return r.json()["data"][0]["embedding"]
+        except Exception as e:
+            logger.warning("Primary embedding API failed (%s), trying FastEmbed fallback", e)
+
+    # 2. Try FastEmbed (Local fallback)
+    global _fastembed_model
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            r = await client.post(
-                url,
-                headers=headers,
-                json={"input": text, "model": EMBEDDING_MODEL},
-            )
-            r.raise_for_status()
-            return r.json()["data"][0]["embedding"]
+        if _fastembed_model is None:
+            from fastembed import TextEmbedding
+            _fastembed_model = TextEmbedding()
+        
+        # fastembed returns a generator
+        embeddings = list(_fastembed_model.embed([text]))
+        return embeddings[0].tolist()
     except Exception as e:
-        import logging
-        logging.getLogger(__name__).warning("Embedding unavailable (%s), storing without vector", e)
+        logger.error("FastEmbed fallback failed: %s", e)
         return None
 
 
@@ -149,7 +177,7 @@ async def create_memory(req: MemoryCreate, _key: str = Depends(verify_api_key)):
                 """,
                 existing["id"],
                 req.confidence,
-                str(req.metadata) if req.metadata else "{}",
+                json.dumps(req.metadata) if req.metadata else "{}",
             )
         else:
             row = await conn.fetchrow(
@@ -162,7 +190,7 @@ async def create_memory(req: MemoryCreate, _key: str = Depends(verify_api_key)):
                 str(embedding) if embedding is not None else None,
                 req.memory_type.value,
                 req.agent_id,
-                str(req.metadata) if req.metadata else "{}",
+                json.dumps(req.metadata) if req.metadata else "{}",
                 req.parent_id,
                 req.confidence,
                 c_hash,
@@ -200,7 +228,56 @@ async def delete_memory(memory_id: UUID, _key: str = Depends(verify_api_key)):
 @app.post("/search", response_model=list[SearchResult])
 async def search_memories(req: SearchRequest, _key: str = Depends(verify_api_key)):
     embedding = await get_embedding(req.query)
+    # Graceful degradation: if embedding service is unavailable, fall back to text search
+    if embedding is None:
+        import logging
+        logging.getLogger(__name__).warning(
+            "Embedding service unavailable for /search, falling back to text search"
+        )
+        # Delegate to text-based search as fallback
+        async with pool.acquire() as conn:
+            filters = ["content ILIKE $1"]
+            params: list[Any] = [f"%{req.query}%"]
+            idx = 2
 
+            if req.agent_id:
+                filters.append(f"agent_id = ${idx}")
+                params.append(req.agent_id)
+                idx += 1
+            if req.memory_type:
+                filters.append(f"memory_type = ${idx}")
+                params.append(req.memory_type.value)
+                idx += 1
+
+            where = " AND ".join(filters)
+            rows = await conn.fetch(
+                f"""
+                SELECT *, 0.0::float8 AS similarity
+                FROM memories
+                WHERE {where}
+                ORDER BY updated_at DESC
+                LIMIT {req.limit}
+                """,
+                *params,
+            )
+        results = []
+        for row in rows:
+            score = compute_final_score(
+                similarity=0.5,  # neutral score for text matches
+                created_at=row["created_at"],
+                access_count=row["access_count"],
+                decay_rate=DECAY_RATE,
+                temporal_weight=req.temporal_weight,
+            )
+            results.append(
+                SearchResult(
+                    memory=_row_to_memory(row),
+                    similarity=0.0,
+                    final_score=score,
+                )
+            )
+        results.sort(key=lambda r: r.final_score, reverse=True)
+        return results[: req.limit]
     filters = []
     params: list[Any] = [str(embedding)]
     idx = 2
@@ -219,7 +296,6 @@ async def search_memories(req: SearchRequest, _key: str = Depends(verify_api_key
         idx += 1
 
     where = (" AND " + " AND ".join(filters)) if filters else ""
-
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             f"""
@@ -231,7 +307,6 @@ async def search_memories(req: SearchRequest, _key: str = Depends(verify_api_key
             """,
             *params,
         )
-
         # Increment access counts for returned results
         if rows:
             ids = [r["id"] for r in rows]
@@ -239,7 +314,6 @@ async def search_memories(req: SearchRequest, _key: str = Depends(verify_api_key
                 "UPDATE memories SET access_count = access_count + 1 WHERE id = ANY($1)",
                 ids,
             )
-
     # Apply decay scoring and re-rank
     results = []
     for row in rows:
@@ -257,7 +331,6 @@ async def search_memories(req: SearchRequest, _key: str = Depends(verify_api_key
                 final_score=score,
             )
         )
-
     results.sort(key=lambda r: r.final_score, reverse=True)
     return results[: req.limit]
 

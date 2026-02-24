@@ -29,7 +29,7 @@ container = client.containers.run(
         "NATS_LOCAL_URL": "nats://host.docker.internal:4222",
         "NATS_RAILWAY_URL": "nats://gondola.proxy.rlwy.net:22393",
         "MEMU_API_URL": "https://api-production-86f5.up.railway.app",
-        "MEMU_API_KEY": "memu_YTwYX33NfIWYU33B1ixyOGA_JajxPohd3ftPWH4pcCc",
+        "MEMU_API_KEY": "${MEMU_API_KEY}",  # Set via environment variable, never hardcode
         "MAX_HYDRATION_TOKENS": "8000",
         "WARDEN_WARM_POOL_MODE": "cold",
     },

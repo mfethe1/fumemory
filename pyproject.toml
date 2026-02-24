@@ -26,6 +26,7 @@ dependencies = [
     "pydantic>=2.0",
     "nats-py>=2.7",
     "docker>=7",
+    "fastembed>=0.5",
 ]
 
 [project.optional-dependencies]
