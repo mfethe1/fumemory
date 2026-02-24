@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any
@@ -14,6 +15,7 @@ from fastapi import Depends, FastAPI, HTTPException, Security
 from fastapi.security import APIKeyHeader
 
 from memu.decay import compute_final_score, should_deduplicate
+from memu.agent_events_consumer import AgentEventsConsumer
 from memu.models import (
     BulkImportRequest,
     BulkImportResponse,
@@ -36,18 +38,37 @@ EMBEDDING_DIMS = int(os.environ.get("EMBEDDING_DIMS", "4096"))
 DEDUP_THRESHOLD = float(os.environ.get("DEDUP_THRESHOLD", "0.95"))
 DECAY_RATE = float(os.environ.get("DECAY_RATE", "0.01"))
 
+logger = logging.getLogger(__name__)
+
 # --- Globals ---
 
 pool: asyncpg.Pool | None = None
+agent_events_consumer: AgentEventsConsumer | None = None
+ENABLE_AGENT_EVENTS_CONSUMER = os.environ.get("ENABLE_AGENT_EVENTS_CONSUMER", "true").lower() == "true"
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global pool
+    global agent_events_consumer
+
     pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=10)
-    yield
-    if pool:
-        await pool.close()
+
+    if ENABLE_AGENT_EVENTS_CONSUMER:
+        try:
+            agent_events_consumer = AgentEventsConsumer()
+            await agent_events_consumer.start()
+        except Exception as e:
+            logger.warning("AGENT_EVENTS durable consumer startup failed: %s", e)
+            agent_events_consumer = None
+
+    try:
+        yield
+    finally:
+        if agent_events_consumer:
+            await agent_events_consumer.stop()
+        if pool:
+            await pool.close()
 
 
 app = FastAPI(
@@ -98,9 +119,46 @@ async def health():
     try:
         async with pool.acquire() as conn:
             await conn.fetchval("SELECT 1")
-        return {"status": "healthy", "version": "0.1.0"}
     except Exception as e:
         raise HTTPException(status_code=503, detail=str(e))
+
+    report = {"status": "healthy", "version": "0.1.0"}
+    if agent_events_consumer:
+        report["agent_events"] = await _agent_events_report()
+    return report
+
+
+@app.get("/health/report")
+async def health_report():
+    """Health artifact for durable AGENT_EVENTS consumer metrics."""
+    try:
+        async with pool.acquire() as conn:
+            await conn.fetchval("SELECT 1")
+        status = "healthy"
+    except Exception:
+        status = "degraded"
+
+    return {
+        "artifact": "agent_events",
+        "status": status,
+        "version": "0.1.0",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "agent_events": await _agent_events_report(),
+    }
+
+
+async def _agent_events_report() -> dict[str, Any]:
+    if not agent_events_consumer:
+        return {
+            "enabled": False,
+            "status": "disabled",
+        }
+
+    artifact = await agent_events_consumer.health_artifact()
+    return {
+        "enabled": True,
+        **artifact,
+    }
 
 
 @app.post("/memories", response_model=Memory)
