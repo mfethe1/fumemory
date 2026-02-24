@@ -152,6 +152,19 @@ CREATE TABLE IF NOT EXISTS blackboard (
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+CREATE TABLE IF NOT EXISTS state_events (
+    event_id       UUID PRIMARY KEY,
+    gateway_id     VARCHAR(64) NOT NULL,
+    agent_id       VARCHAR(64),
+    event_type     VARCHAR(64) NOT NULL,
+    entity_id      VARCHAR(128) NOT NULL,
+    ts             TIMESTAMPTZ NOT NULL,
+    version        BIGINT NOT NULL DEFAULT 0,
+    payload        JSONB NOT NULL DEFAULT '{}'::jsonb,
+    source_subject VARCHAR(128),
+    applied_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 CREATE INDEX IF NOT EXISTS idx_blackboard_key ON blackboard (key);
 CREATE INDEX IF NOT EXISTS idx_blackboard_category ON blackboard (category);
 CREATE INDEX IF NOT EXISTS idx_blackboard_active ON blackboard (valid_from DESC)

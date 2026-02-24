@@ -16,6 +16,7 @@ from fastapi.security import APIKeyHeader
 
 from memu.decay import compute_final_score, should_deduplicate
 from memu.agent_events_consumer import AgentEventsConsumer
+from memu.state_projector import StateProjectorConsumer
 from memu.models import (
     BulkImportRequest,
     BulkImportResponse,
@@ -44,13 +45,16 @@ logger = logging.getLogger(__name__)
 
 pool: asyncpg.Pool | None = None
 agent_events_consumer: AgentEventsConsumer | None = None
+state_projector_consumer: StateProjectorConsumer | None = None
 ENABLE_AGENT_EVENTS_CONSUMER = os.environ.get("ENABLE_AGENT_EVENTS_CONSUMER", "true").lower() == "true"
+ENABLE_STATE_PROJECTOR = os.environ.get("ENABLE_STATE_PROJECTOR", "true").lower() == "true"
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global pool
     global agent_events_consumer
+    global state_projector_consumer
 
     pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=10)
 
@@ -62,11 +66,21 @@ async def lifespan(app: FastAPI):
             logger.warning("AGENT_EVENTS durable consumer startup failed: %s", e)
             agent_events_consumer = None
 
+    if ENABLE_STATE_PROJECTOR:
+        try:
+            state_projector_consumer = StateProjectorConsumer(pool=pool)
+            await state_projector_consumer.start()
+        except Exception as e:
+            logger.warning("STATE_PROJECTOR durable consumer startup failed: %s", e)
+            state_projector_consumer = None
+
     try:
         yield
     finally:
         if agent_events_consumer:
             await agent_events_consumer.stop()
+        if state_projector_consumer:
+            await state_projector_consumer.stop()
         if pool:
             await pool.close()
 
@@ -125,6 +139,8 @@ async def health():
     report = {"status": "healthy", "version": "0.1.0"}
     if agent_events_consumer:
         report["agent_events"] = await _agent_events_report()
+    if state_projector_consumer:
+        report["state_projector"] = await _state_projector_report()
     return report
 
 
@@ -144,6 +160,7 @@ async def health_report():
         "version": "0.1.0",
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "agent_events": await _agent_events_report(),
+        "state_projector": await _state_projector_report(),
     }
 
 
@@ -157,6 +174,21 @@ async def _agent_events_report() -> dict[str, Any]:
     artifact = await agent_events_consumer.health_artifact()
     return {
         "enabled": True,
+        **artifact,
+    }
+
+
+async def _state_projector_report() -> dict[str, Any]:
+    if not state_projector_consumer:
+        return {
+            "enabled": False,
+            "status": "disabled",
+        }
+
+    artifact = await state_projector_consumer.health_artifact()
+    return {
+        "enabled": True,
+        "status": "healthy",
         **artifact,
     }
 
