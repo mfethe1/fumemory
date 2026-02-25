@@ -193,8 +193,20 @@ async def _state_projector_report() -> dict[str, Any]:
     }
 
 
+def _warn_if_missing_quality_tags(req: MemoryCreate) -> None:
+    quality = req.metadata.get("quality") if isinstance(req.metadata, dict) else None
+    if not isinstance(quality, dict):
+        logger.warning("memory.create missing metadata.quality tags (confidence/supersedes/expires)")
+        return
+
+    missing = [k for k in ("confidence", "supersedes", "expires") if k not in quality]
+    if missing:
+        logger.warning("memory.create missing metadata.quality keys: %s", ", ".join(missing))
+
+
 @app.post("/memories", response_model=Memory)
 async def create_memory(req: MemoryCreate, _key: str = Depends(verify_api_key)):
+    _warn_if_missing_quality_tags(req)
     embedding = await get_embedding(req.content)
     c_hash = content_hash(req.content)
 
