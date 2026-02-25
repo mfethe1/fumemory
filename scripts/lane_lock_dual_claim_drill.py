@@ -38,7 +38,17 @@ async def _run_drill() -> dict[str, Any]:
     from memu.lane_lock import LaneContestedError, LaneLockedExecution, ensure_kv_buckets
     from memu.swarm_models import TaskNode, TaskStatus
 
-    NATS_URL = os.getenv("NATS_URL", "nats://127.0.0.1:4222")
+    # Railway-first binding (no implicit localhost fallback).
+    # Resolution order: explicit NATS_URL, then RAILWAY_NATS_URL.
+    NATS_URL = os.getenv("NATS_URL") or os.getenv("RAILWAY_NATS_URL")
+    if not NATS_URL:
+        return {
+            "ok": False,
+            "phase": "config-missing",
+            "reason": "NATS_URL/RAILWAY_NATS_URL not set (localhost fallback disabled)",
+            "passes": {},
+            "failures": ["missing broker endpoint env"],
+        }
     lane_uuid = uuid4()
 
     passes = {}
