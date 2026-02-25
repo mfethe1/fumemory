@@ -1,0 +1,35 @@
+{
+  "timestamp": "2026-02-25T04:35:00Z",
+  "report_type": "lane-lock-dual-claim-contested-artifact",
+  "scenario": "real_multi_gateway_claim_flow",
+  "objectives": [
+    "enforce single-winner multi-gateway claim for same lane",
+    "validate stale-lock recovery path",
+    "validate TTL heartbeat renewal does not allow takeover"
+  ],
+  "results": {
+    "dual_claim_contention": {
+      "command": "cd fumemory && /opt/homebrew/bin/pytest -q tests/test_lane_lock_claim_integration.py::test_lane_lock_real_task_claim_contention -q",
+      "returncode": 0,
+      "status": "skipped",
+      "stdout": "s                                                                        [100%]",
+      "stderr": ""
+    },
+    "stale_and_ttl": {
+      "command": "cd fumemory && /opt/homebrew/bin/pytest -q tests/test_lane_lock_claim_integration.py::test_lane_lock_contention_and_stale_recovery tests/test_lane_lock_claim_integration.py::test_lane_lock_ttl_heartbeat_keeps_lock_alive",
+      "returncode": 0,
+      "status": "skipped",
+      "stdout": "ss                                                                       [100%]\n2 skipped in 0.05s",
+      "stderr": ""
+    }
+  },
+  "notes": [
+    "Tests are skipped in this environment because no local NATS KV/JetStream broker was reachable.",
+    "Connectivity check: nats://127.0.0.1:4222 unavailable at run time.",
+    "A dedicated drill script exists: scripts/lane_lock_dual_claim_drill.py (writes .state artifacts for dual-claim/stale/recovery proof when NATS available)."
+  ],
+  "pass_fail": {
+    "overall": "fail",
+    "reason": "infrastructure_dependency_missing"
+  }
+}
