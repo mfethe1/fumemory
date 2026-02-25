@@ -62,21 +62,49 @@ def test_search_text_auth_no_auth_and_invalid_key_matrix():
     with _client() as client:
         no_auth = client.post("/search-text", params={"query": "health", "limit": 1})
         assert no_auth.status_code == 401
+        assert no_auth.json()["detail"] == "Missing authentication credentials"
 
         bad_auth = client.post(
             "/search-text",
             params={"query": "health", "limit": 1},
-            headers={"X-API-Key": "wrong-key"},
+            headers={"X-MemU-Key": "wrong-key"},
         )
         assert bad_auth.status_code == 401
+        assert bad_auth.json()["detail"] == "Invalid X-MemU-Key"
 
-        ok = client.post(
+        ok_primary = client.post(
+            "/search-text",
+            params={"query": "health", "limit": 1},
+            headers={"X-MemU-Key": "test-key"},
+        )
+        assert ok_primary.status_code == 200
+        assert len(ok_primary.json()) == 1
+
+        ok_compat = client.post(
             "/search-text",
             params={"query": "health", "limit": 1},
             headers={"X-API-Key": "test-key"},
         )
-        assert ok.status_code == 200
-        assert len(ok.json()) == 1
+        assert ok_compat.status_code == 200
+        assert len(ok_compat.json()) == 1
+
+
+def test_search_text_prefers_x_memu_key_when_both_headers_present():
+    with _client() as client:
+        bad_primary_wins = client.post(
+            "/search-text",
+            params={"query": "health", "limit": 1},
+            headers={"X-MemU-Key": "wrong-key", "X-API-Key": "test-key"},
+        )
+        assert bad_primary_wins.status_code == 401
+        assert bad_primary_wins.json()["detail"] == "Invalid X-MemU-Key"
+
+        good_primary_wins = client.post(
+            "/search-text",
+            params={"query": "health", "limit": 1},
+            headers={"X-MemU-Key": "test-key", "X-API-Key": "wrong-key"},
+        )
+        assert good_primary_wins.status_code == 200
 
 
 def test_search_text_valid_and_invalid_payload_matrix():
@@ -84,13 +112,13 @@ def test_search_text_valid_and_invalid_payload_matrix():
         valid = client.post(
             "/search-text",
             params={"query": "health", "limit": 1},
-            headers={"X-API-Key": "test-key"},
+            headers={"X-MemU-Key": "test-key"},
         )
         assert valid.status_code == 200
 
         invalid_payload = client.post(
             "/search-text",
             json={"query": "health", "limit": 1},
-            headers={"X-API-Key": "test-key"},
+            headers={"X-MemU-Key": "test-key"},
         )
         assert invalid_payload.status_code == 422

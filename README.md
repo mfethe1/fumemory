@@ -33,10 +33,17 @@ memU is used in two modes:
   - `POST /api/v1/memu/search-text`
   - `POST /api/v1/memu/add`
   - `GET /api/v1/memu/health`
+- Canonical auth header policy:
+  - Primary: `X-MemU-Key`
+  - Compatibility (legacy): `X-API-Key`
+  - If both are present, `X-MemU-Key` is authoritative.
+  - Missing auth returns `401 Missing authentication credentials`.
+  - Invalid auth returns `401 Invalid X-MemU-Key`.
 - `add` payload expects `content` (not legacy `text`)
 - Integration checks typically run through:
   - `scripts/memu_contract_check.sh`
   - `scripts/lenny_cron_guard.sh`
+  - `tools/memu_auth_diagnostics.py`
 
 ---
 
@@ -93,6 +100,8 @@ curl -s -X POST http://localhost:8000/search \
 The repo also includes coordination/runtime modules used in multi-agent setups:
 
 - `lane_lock.py` — lane ownership + contention control
+- `session_hook.py` — idempotent session memory write/read hook
+- `temporal_workflow.py` — durable health/repair workflow with persisted state
 - `warden_runtime.py` — watchdog runtime loop
 - `bridge_ledger.py` — append-only event ledger
 - `ws_bridge.py` — websocket/NATS bridge path

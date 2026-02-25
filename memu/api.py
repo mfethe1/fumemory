@@ -93,12 +93,19 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+memu_key_header = APIKeyHeader(name="X-MemU-Key", auto_error=False)
+legacy_api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 
-async def verify_api_key(key: str | None = Security(api_key_header)) -> str:
-    if not key or key != MEMU_API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid API key")
+async def verify_api_key(
+    memu_key: str | None = Security(memu_key_header),
+    legacy_key: str | None = Security(legacy_api_key_header),
+) -> str:
+    key = memu_key or legacy_key
+    if not key:
+        raise HTTPException(status_code=401, detail="Missing authentication credentials")
+    if key != MEMU_API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid X-MemU-Key")
     return key
 
 
