@@ -10,6 +10,10 @@ import pytest
 NATS_URL = os.getenv("NATS_URL", "nats://127.0.0.1:4222")
 
 
+async def _connect_nats():
+    return await asyncio.wait_for(nats.connect(NATS_URL, connect_timeout=1.0), timeout=2.0)
+
+
 def _load_lane_modules():
     from memu.lane_lock import (
         DuplicateClaimError,
@@ -69,7 +73,7 @@ async def _test_lane_lock_contention_and_stale_recovery():
 
     try:
         try:
-            nc = await nats.connect(NATS_URL)
+            nc = await _connect_nats()
         except Exception:
             pytest.skip(f"NATS unavailable at {NATS_URL}")
 
@@ -175,7 +179,7 @@ async def _test_lane_lock_real_task_claim_contention():
     lane: str | None = None
     try:
         try:
-            nc = await nats.connect(NATS_URL)
+            nc = await _connect_nats()
         except Exception:
             pytest.skip(f"NATS unavailable at {NATS_URL}")
 
@@ -266,7 +270,7 @@ async def _test_lane_lock_ttl_heartbeat_keeps_lock_alive():
     lane: str | None = None
     try:
         try:
-            nc = await nats.connect(NATS_URL)
+            nc = await _connect_nats()
         except Exception:
             pytest.skip(f"NATS unavailable at {NATS_URL}")
 

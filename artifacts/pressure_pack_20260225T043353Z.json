@@ -1,0 +1,28 @@
+{
+  "timestamp": "2026-02-25T04:33:53.625453+00:00",
+  "scenario_count": 3,
+  "overall_ok": true,
+  "scenarios": {
+    "replay-after-crash": {
+      "ok": true,
+      "command": "/opt/homebrew/bin/pytest -q tests/test_temporal_runtime_integration.py::test_temporal_runtime_crash_resume_flow",
+      "returncode": 0,
+      "stdout": ".                                                                        [100%]\n1 passed in 0.03s",
+      "stderr": ""
+    },
+    "dual-claim": {
+      "ok": true,
+      "command": "/opt/homebrew/bin/pytest -q tests/test_lane_lock_claim_integration.py::test_lane_lock_real_task_claim_contention",
+      "returncode": 0,
+      "stdout": "s                                                                        [100%]\n1 skipped in 0.05s",
+      "stderr": ""
+    },
+    "429/degraded": {
+      "ok": true,
+      "command": "/opt/homebrew/bin/pytest -q tests/test_session_hook_temporal.py::test_session_hook_retry_429_then_recover_with_deterministic_injector tests/test_session_hook_temporal.py::test_session_hook_falls_back_to_degraded_error_after_429_exhausted",
+      "returncode": 0,
+      "stdout": "..                                                                       [100%]\n2 passed in 2.05s",
+      "stderr": ""
+    }
+  }
+}
