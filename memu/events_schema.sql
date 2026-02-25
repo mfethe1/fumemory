@@ -165,6 +165,61 @@ CREATE TABLE IF NOT EXISTS state_events (
     applied_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- Canonical backlog projection in memU (lane-lock state)
+CREATE TABLE IF NOT EXISTS backlog_items (
+    task_id         VARCHAR(128) PRIMARY KEY,
+    owner           VARCHAR(64),
+    lane            VARCHAR(64),
+    status          VARCHAR(32) NOT NULL,
+    next_action     TEXT,
+    blocker         TEXT,
+    source_file     TEXT NOT NULL DEFAULT 'BACKLOG.md',
+    idempotency_key VARCHAR(128) NOT NULL,
+    metadata        JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT backlog_items_status_ck CHECK (
+        status IN ('pending', 'in_progress', 'active', 'blocked', 'done', 'complete', 'cancelled')
+    )
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_backlog_items_idempotency_key
+    ON backlog_items (idempotency_key);
+CREATE INDEX IF NOT EXISTS idx_backlog_items_lane_status
+    ON backlog_items (lane, status);
+CREATE INDEX IF NOT EXISTS idx_backlog_items_owner
+    ON backlog_items (owner);
+CREATE INDEX IF NOT EXISTS idx_backlog_items_updated
+    ON backlog_items (updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS backlog_events (
+    event_id         UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    task_id          VARCHAR(128) NOT NULL REFERENCES backlog_items(task_id) ON DELETE CASCADE,
+    event_type       VARCHAR(48) NOT NULL,
+    actor            VARCHAR(64),
+    previous_status  VARCHAR(32),
+    status           VARCHAR(32),
+    next_action      TEXT,
+    blocker          TEXT,
+    source_file      TEXT NOT NULL DEFAULT 'BACKLOG.md',
+    idempotency_key  VARCHAR(128) NOT NULL,
+    payload          JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT backlog_events_type_ck CHECK (
+        event_type IN ('created', 'updated', 'claimed', 'status_changed', 'next_action_changed', 'blocked', 'unblocked', 'synced', 'closed')
+    )
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_backlog_events_idempotency_key
+    ON backlog_events (idempotency_key);
+CREATE INDEX IF NOT EXISTS idx_backlog_events_task_created
+    ON backlog_events (task_id, created_at DESC);
+
+CREATE OR REPLACE TRIGGER backlog_items_updated_at
+    BEFORE UPDATE ON backlog_items
+    FOR EACH ROW
+    EXECUTE FUNCTION update_updated_at();
+
 CREATE INDEX IF NOT EXISTS idx_blackboard_key ON blackboard (key);
 CREATE INDEX IF NOT EXISTS idx_blackboard_category ON blackboard (category);
 CREATE INDEX IF NOT EXISTS idx_blackboard_active ON blackboard (valid_from DESC)
