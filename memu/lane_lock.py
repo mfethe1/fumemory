@@ -22,7 +22,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+from collections import deque
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 from typing import Any, Callable, Coroutine
 from uuid import UUID
 
@@ -60,10 +63,23 @@ SUBJECT_CHECKPOINT = "swarm.checkpoint.{task_id}"
 KV_LANES = "RESOURCE_LANES"
 KV_FENCING = "FENCING_TOKENS"
 
+# State-event stream controls
+STATE_EVENTS_ENABLED = os.environ.get("STATE_EVENTS_ENABLED", "true").lower() == "true"
+STATE_EVENTS_STREAM = os.environ.get("STATE_EVENTS_STREAM", "STATE_EVENTS")
+STATE_EVENTS_SUBJECT = os.environ.get("STATE_EVENTS_SUBJECT", "state.task.{entity_id}")
+STATE_EVENTS_VERSION_BASELINE = int(os.environ.get("STATE_EVENTS_VERSION_BASELINE", "1"))
+STATE_EVENTS_EVIDENCE_PATH = os.environ.get(
+    "STATE_EVENTS_EVIDENCE_PATH", "artifacts/state-events/live-emits.jsonl"
+)
+STATE_EVENTS_EVIDENCE_LIMIT = int(os.environ.get("STATE_EVENTS_EVIDENCE_LIMIT", "200"))
+
 # Config
 HEARTBEAT_INTERVAL_S = 3
 LANE_TTL_S = 10
 MAX_FAILURES = 3
+
+# Runtime evidence cache for this process
+_STATE_EVENT_EMITS: deque[dict[str, Any]] = deque(maxlen=STATE_EVENTS_EVIDENCE_LIMIT)
 
 
 async def ensure_kv_buckets(js: JetStreamContext) -> tuple[KeyValue, KeyValue]:
@@ -86,6 +102,34 @@ async def ensure_kv_buckets(js: JetStreamContext) -> tuple[KeyValue, KeyValue]:
         )
 
     return lanes_kv, fencing_kv
+
+
+def get_state_event_evidence(limit: int = 100) -> list[dict[str, Any]]:
+    """Return recent emitted STATE_EVENTS for runtime evidence and debugging."""
+    return list(_STATE_EVENT_EMITS)[-limit:]
+
+
+def _append_state_event_evidence(record: dict[str, Any]) -> None:
+    """Persist evidence row for local forensic artifacts."""
+    _STATE_EVENT_EMITS.append(record)
+
+    path = Path(STATE_EVENTS_EVIDENCE_PATH)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fp:
+            fp.write(json.dumps(record, sort_keys=True))
+            fp.write("\n")
+    except Exception:
+        # Non-fatal: file artifact is best-effort, stream evidence remains in-memory
+        logger.debug("Unable to write STATE_EVENTS evidence file %s", STATE_EVENTS_EVIDENCE_PATH)
+
+
+def _next_state_event_subject(entity_id: str, event_type: EventType, gateway_id: str) -> str:
+    return STATE_EVENTS_SUBJECT.format(
+        entity_id=sanitize_nats_subject(entity_id),
+        event_type=event_type.value,
+        gateway_id=gateway_id,
+    )
 
 
 class LaneLockedExecution:
@@ -115,6 +159,7 @@ class LaneLockedExecution:
         self.acquired_locks: list[LaneLock] = []
         self._heartbeat_task: asyncio.Task | None = None
         self._checkpoint_seq = 0
+        self._state_event_version = STATE_EVENTS_VERSION_BASELINE
 
     async def __aenter__(self):
         self.lanes_kv, self.fencing_kv = await ensure_kv_buckets(self.js)
@@ -153,9 +198,18 @@ class LaneLockedExecution:
             # Use task-scoped synthetic lane so duplicate claims stay serialized.
             lanes = [f"task:{self.task.task_id}"]
 
-        for lane_id in lanes:
-            lock = await self._acquire_lane(lane_id)
-            self.acquired_locks.append(lock)
+        acquired: list[LaneLock] = []
+        try:
+            for lane_id in lanes:
+                lock = await self._acquire_lane(lane_id)
+                self.acquired_locks.append(lock)
+                acquired.append(lock)
+        except Exception:
+            # Do not leak partial lane state if a multi-lane claim fails.
+            for lock in acquired:
+                self.acquired_locks.remove(lock)
+            await self._release_all_lanes()
+            raise
 
     async def _acquire_lane(self, lane_id: str) -> LaneLock:
         """Atomic-ish acquire of a lane lock with stale lock recovery."""
@@ -170,29 +224,46 @@ class LaneLockedExecution:
             # Duplicate claim prevention: exact same gateway/task pair cannot
             # re-acquire without first yielding lock.
             if holding_gateway == self.gateway_id and holding_task == str(self.task.task_id):
+                await self._publish_event(EventType.LANE_CONTESTED, {
+                    "lane": lane_id,
+                    "lane_id": lane_id,
+                    "requesting_gateway": self.gateway_id,
+                    "task_id": str(self.task.task_id),
+                    "reason": "duplicate-claim",
+                    "holding_gateway": holding_gateway,
+                    "holding_task": holding_task,
+                })
                 raise DuplicateClaimError(
                     f"Duplicate claim attempt for lane {lane_id} by gateway {self.gateway_id} "
                     f"on task {self.task.task_id}"
                 )
 
-            # Stale lock recovery: reclaim if acquired timestamp exceeds TTL.
+            # Stale lock recovery: reclaim if lease expiration is past.
             try:
-                acquired_at = datetime.fromisoformat(holder["acquired_at"])
-                if (now - acquired_at).total_seconds() > LANE_TTL_S:
+                if self._is_lock_stale(holder, now):
                     await self.lanes_kv.delete(lane_id)
                     logger.warning(
-                        "Reclaiming stale lock on %s (age=%ss, holder=%s, task=%s)",
+                        "Reclaiming stale lock on %s held by %s for task %s",
                         lane_id,
-                        int((now - acquired_at).total_seconds()),
                         holding_gateway,
                         holding_task,
                     )
+                    logger.debug("Stale lock payload: %s", holder)
                 else:
                     raise LaneContestedError(
                         f"Cannot acquire lane {lane_id} for task {self.task.task_id}: "
                         f"held by {holding_gateway}"
                     )
             except LaneContestedError:
+                await self._publish_event(EventType.LANE_CONTESTED, {
+                    "lane": lane_id,
+                    "lane_id": lane_id,
+                    "requesting_gateway": self.gateway_id,
+                    "task_id": str(self.task.task_id),
+                    "reason": "held-by-other",
+                    "holding_gateway": holding_gateway,
+                    "holding_task": holding_task,
+                })
                 raise
             except Exception:
                 # If holder data is malformed, treat as stale/corrupt and reclaim.
@@ -255,6 +326,18 @@ class LaneLockedExecution:
             "revision": getattr(entry, "revision", None),
             "entry": entry,
         }
+
+    def _is_lock_stale(self, holder: dict[str, Any], now: datetime) -> bool:
+        """Whether an existing lock holder is older than the configured TTL."""
+        for field in ("expires_at", "acquired_at"):
+            if not holder.get(field):
+                continue
+            try:
+                expires_at = datetime.fromisoformat(holder[field])
+                return now >= expires_at
+            except Exception:
+                continue
+        return True
 
     async def _release_all_lanes(self):
         """Release all held lane locks, never clobbering locks stolen by peers."""
@@ -457,7 +540,7 @@ class LaneLockedExecution:
             logger.error(f"Rollback failed for task {self.task.task_id}: {e}")
 
     async def publish_event(self, event_type: EventType, payload: dict[str, Any]):
-        """Publish a SwarmEvent to the NATS mesh."""
+        """Publish a SwarmEvent to the NATS mesh and optionally a STATE_EVENTS event."""
         event = SwarmEvent(
             source_gateway=self.gateway_id,
             event_type=event_type,
@@ -469,6 +552,66 @@ class LaneLockedExecution:
             await self.nc.publish(
                 SUBJECT_EVENTS,
                 event.model_dump_json().encode(),
+            )
+
+        await self._publish_state_event(event)
+
+    async def _publish_state_event(self, source_event: SwarmEvent) -> None:
+        if not STATE_EVENTS_ENABLED:
+            return
+
+        seq = self._state_event_version
+        state_event = {
+            "event_id": str(source_event.event_id),
+            "gateway_id": self.gateway_id,
+            "agent_id": source_event.payload.get("gateway_id", self.gateway_id),
+            "event_type": source_event.event_type.value,
+            "entity_id": str(source_event.task_id),
+            "ts": source_event.timestamp.isoformat(),
+            "version": seq,
+            "payload": {
+                "source_gateway": source_event.source_gateway,
+                "swarm_event_type": source_event.event_type.value,
+                "payload": source_event.payload,
+            },
+        }
+
+        state_id = str(source_event.task_id)
+        subject = _next_state_event_subject(
+            state_id,
+            source_event.event_type,
+            self.gateway_id,
+        )
+        emitted = False
+        emitted_at = datetime.now(timezone.utc).isoformat()
+
+        try:
+            await self.js.publish(
+                subject,
+                json.dumps(state_event).encode(),
+            )
+            emitted = True
+            self._state_event_version += 1
+        except Exception as exc:
+            logger.warning(
+                "STATE_EVENTS publish failed for task %s: %s",
+                state_id,
+                exc,
+            )
+        finally:
+            _append_state_event_evidence(
+                {
+                    "event_id": str(source_event.event_id),
+                    "task_id": state_id,
+                    "subject": subject,
+                    "stream": STATE_EVENTS_STREAM,
+                    "gateway_id": self.gateway_id,
+                    "agent_id": state_event["agent_id"],
+                    "event_type": source_event.event_type.value,
+                    "version": seq,
+                    "emitted": emitted,
+                    "emitted_at": emitted_at,
+                }
             )
 
     async def _publish_event(self, event_type: EventType, payload: dict[str, Any]):

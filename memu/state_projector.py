@@ -13,6 +13,8 @@ import json
 import logging
 import os
 import time
+from collections import deque
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from typing import Any, Callable, Coroutine
 
@@ -32,6 +34,7 @@ STATE_EVENTS_SUBJECT = os.environ.get("STATE_EVENTS_SUBJECT", "state.>")
 STATE_EVENTS_ACK_WAIT_SECONDS = float(os.environ.get("STATE_EVENTS_ACK_WAIT_SECONDS", "60"))
 STATE_EVENTS_MAX_ACK_PENDING = int(os.environ.get("STATE_EVENTS_MAX_ACK_PENDING", "1000"))
 STATE_EVENTS_TABLE = os.environ.get("STATE_EVENTS_TABLE", "state_events")
+STATE_EVENTS_APPLIED_LIMIT = int(os.environ.get("STATE_EVENTS_APPLIED_LIMIT", "200"))
 
 
 @dataclass
@@ -93,6 +96,7 @@ class StateProjectorConsumer:
         self._projection_ready = False
         self.metrics = StateProjectorMetrics()
         self._sink = sink
+        self._applied_events: deque[dict[str, Any]] = deque(maxlen=STATE_EVENTS_APPLIED_LIMIT)
 
     async def start(self) -> None:
         if self._running:
@@ -204,6 +208,7 @@ class StateProjectorConsumer:
             payload = json.loads(msg.data.decode())
             await self._persist_state_event(payload)
             await self._ack(msg)
+            self._record_projection(payload)
             self.metrics.acked_count += 1
             self.metrics.last_processed_ts = time.time()
         except Exception as exc:
@@ -211,6 +216,21 @@ class StateProjectorConsumer:
             self.metrics.last_error = str(exc)
             self.metrics.last_error_ts = time.time()
             await self._nak(msg)
+
+    def _record_projection(self, payload: dict[str, Any]) -> None:
+        self._applied_events.append(
+            {
+                "event_id": payload.get("event_id"),
+                "gateway_id": payload.get("gateway_id"),
+                "agent_id": payload.get("agent_id"),
+                "event_type": payload.get("event_type"),
+                "entity_id": payload.get("entity_id"),
+                "version": payload.get("version"),
+                "applied_seq": len(self._applied_events) + 1,
+                "applied_at": datetime.now(timezone.utc).isoformat(),
+                "source_subject": self.subject,
+            }
+        )
 
     async def _persist_state_event(self, payload: dict[str, Any]) -> None:
         required = (
@@ -315,6 +335,9 @@ class StateProjectorConsumer:
         except (TypeError, ValueError):
             return 0
 
+    def applied_event_trace(self, limit: int = 50) -> list[dict[str, Any]]:
+        return list(self._applied_events)[-limit:]
+
     async def health_artifact(self) -> dict[str, Any]:
         artifact: dict[str, Any] = {
             "source": "STATE_EVENTS",
@@ -323,6 +346,7 @@ class StateProjectorConsumer:
             "durable_active": self._running,
             "lag": await self._current_lag(),
             "metrics": self.metrics.as_dict(),
+            "applied_events": list(self._applied_events),
         }
 
         try:

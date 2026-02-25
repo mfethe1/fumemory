@@ -16,6 +16,7 @@ from fastapi.security import APIKeyHeader
 
 from memu.decay import compute_final_score, should_deduplicate
 from memu.agent_events_consumer import AgentEventsConsumer
+from memu.lane_lock import STATE_EVENTS_ENABLED, get_state_event_evidence
 from memu.state_projector import StateProjectorConsumer
 from memu.models import (
     BulkImportRequest,
@@ -161,6 +162,59 @@ async def health_report():
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "agent_events": await _agent_events_report(),
         "state_projector": await _state_projector_report(),
+    }
+
+
+@app.get("/state-events/evidence")
+async def state_events_evidence():
+    """Runtime artifact showing emitted STATE_EVENTS sequence and projector-applied sequence."""
+    emitter_tail = get_state_event_evidence(limit=50)
+
+    projector_tail = []
+    table_tail = []
+    status = "disabled"
+
+    if state_projector_consumer:
+        status = "enabled"
+        projector_tail = state_projector_consumer.applied_event_trace()
+
+        if pool:
+            async with pool.acquire() as conn:
+                rows = await conn.fetch(
+                    """
+                    SELECT event_id, gateway_id, agent_id, event_type, entity_id,
+                           version, applied_at
+                    FROM state_events
+                    ORDER BY applied_at DESC, version DESC
+                    LIMIT 50
+                    """
+                )
+                table_tail = [
+                    {
+                        "event_id": str(row["event_id"]),
+                        "gateway_id": row["gateway_id"],
+                        "agent_id": row["agent_id"],
+                        "event_type": row["event_type"],
+                        "entity_id": row["entity_id"],
+                        "version": row["version"],
+                        "applied_at": row["applied_at"].isoformat(),
+                    }
+                    for row in rows
+                ]
+
+    return {
+        "artifact": "state_events_runtime",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "state_events_enabled": STATE_EVENTS_ENABLED,
+        "emitter": {
+            "recent": emitter_tail,
+            "count": len(emitter_tail),
+        },
+        "state_projector": {
+            "status": status,
+            "recent_applied": projector_tail,
+            "table_recent": table_tail,
+        },
     }
 
 
