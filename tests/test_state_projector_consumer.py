@@ -87,6 +87,14 @@ class _FakePool:
         return _FakeConn()
 
 
+class _RecordingConn:
+    def __init__(self):
+        self.calls: list[tuple[str, tuple[Any, ...]]] = []
+
+    async def execute(self, query: str, *args):
+        self.calls.append((query, args))
+
+
 class _FakeMsg:
     def __init__(self, payload: dict, num_delivered: int = 1, fail_ack: bool = False):
         import json
@@ -236,3 +244,34 @@ async def test_state_projector_validates_state_event_payload():
     assert consumer.metrics.consumed_count == 1
     assert consumer.metrics.failure_count == 1
     assert consumer.metrics.acked_count == 0
+
+
+@pytest.mark.asyncio
+async def test_state_projector_projects_backlog_events_into_backlog_tables():
+    consumer = StateProjectorConsumer(cluster_manager=_FakeManager(), sink=_ReplayTrackingSink())
+    conn = _RecordingConn()
+
+    payload = {
+        "event_id": "22222222-2222-4222-8222-222222222222",
+        "gateway_id": "gw-a",
+        "agent_id": "agent-main",
+        "event_type": "backlog.task.synced",
+        "entity_id": "oauth-auth-reliability",
+        "ts": "2026-02-24T00:00:00Z",
+        "version": 2,
+        "payload": {
+            "task_id": "oauth-auth-reliability",
+            "owner": "Macklemore",
+            "status": "in_progress",
+            "next_action": "run live Google OAuth smoke matrix",
+            "blocker": "needs OAuth creds",
+            "source_file": "BACKLOG.md",
+        },
+    }
+
+    await consumer._ensure_backlog_projection_tables(conn)
+    await consumer._project_backlog_event(conn, payload)
+
+    joined_queries = "\n".join(q for q, _ in conn.calls)
+    assert "INSERT INTO backlog_items" in joined_queries
+    assert "INSERT INTO backlog_events" in joined_queries

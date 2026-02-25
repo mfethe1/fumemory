@@ -21,6 +21,7 @@ from typing import Any, Callable, Coroutine
 import asyncpg
 
 from nats.js import JetStreamContext
+from memu.backlog_projection import infer_lane
 from memu.cluster import NATSClusterManager
 
 logger = logging.getLogger(__name__)
@@ -94,6 +95,7 @@ class StateProjectorConsumer:
         self._task: asyncio.Task | None = None
         self._running = False
         self._projection_ready = False
+        self._backlog_projection_ready = False
         self.metrics = StateProjectorMetrics()
         self._sink = sink
         self._applied_events: deque[dict[str, Any]] = deque(maxlen=STATE_EVENTS_APPLIED_LIMIT)
@@ -274,6 +276,9 @@ class StateProjectorConsumer:
                 self.subject,
             )
 
+            await self._ensure_backlog_projection_tables(conn)
+            await self._project_backlog_event(conn, payload)
+
     async def _ensure_projection_table(self) -> None:
         if self._projection_ready or not self._pool:
             return
@@ -295,7 +300,117 @@ class StateProjectorConsumer:
                 )
                 """
             )
+            await self._ensure_backlog_projection_tables(conn)
         self._projection_ready = True
+
+    async def _ensure_backlog_projection_tables(self, conn: Any) -> None:
+        if self._backlog_projection_ready:
+            return
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS backlog_items (
+                task_id VARCHAR(128) PRIMARY KEY,
+                owner VARCHAR(64),
+                lane VARCHAR(64),
+                status VARCHAR(32) NOT NULL,
+                next_action TEXT,
+                blocker TEXT,
+                source_file TEXT NOT NULL DEFAULT 'BACKLOG.md',
+                idempotency_key VARCHAR(128) NOT NULL,
+                metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            """
+        )
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS backlog_events (
+                event_id UUID PRIMARY KEY,
+                task_id VARCHAR(128) NOT NULL REFERENCES backlog_items(task_id) ON DELETE CASCADE,
+                event_type VARCHAR(48) NOT NULL,
+                actor VARCHAR(64),
+                previous_status VARCHAR(32),
+                status VARCHAR(32),
+                next_action TEXT,
+                blocker TEXT,
+                source_file TEXT NOT NULL DEFAULT 'BACKLOG.md',
+                idempotency_key VARCHAR(128) NOT NULL,
+                payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            """
+        )
+        self._backlog_projection_ready = True
+
+    async def _project_backlog_event(self, conn: Any, payload: dict[str, Any]) -> None:
+        event_type = str(payload.get("event_type") or "")
+        body = payload.get("payload") or {}
+        if not isinstance(body, dict):
+            return
+
+        if not (event_type.startswith("backlog.") or body.get("source_file") == "BACKLOG.md"):
+            return
+
+        task_id = str(body.get("task_id") or payload.get("entity_id") or "").strip()
+        if not task_id:
+            return
+
+        status = str(body.get("status") or "pending").strip().lower().replace("-", "_")
+        owner = body.get("owner")
+        lane = body.get("lane") or infer_lane(owner or "")
+        next_action = body.get("next_action")
+        blocker = body.get("blocker")
+        source_file = body.get("source_file") or "BACKLOG.md"
+        idempotency_key = str(body.get("idempotency_key") or payload.get("event_id"))
+
+        await conn.execute(
+            """
+            INSERT INTO backlog_items (
+                task_id, owner, lane, status, next_action, blocker, source_file, idempotency_key, metadata
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb)
+            ON CONFLICT (task_id) DO UPDATE SET
+                owner = EXCLUDED.owner,
+                lane = EXCLUDED.lane,
+                status = EXCLUDED.status,
+                next_action = EXCLUDED.next_action,
+                blocker = EXCLUDED.blocker,
+                source_file = EXCLUDED.source_file,
+                idempotency_key = EXCLUDED.idempotency_key,
+                metadata = EXCLUDED.metadata,
+                updated_at = NOW()
+            """,
+            task_id,
+            owner,
+            lane,
+            status,
+            next_action,
+            blocker,
+            source_file,
+            idempotency_key,
+            json.dumps(body),
+        )
+
+        await conn.execute(
+            """
+            INSERT INTO backlog_events (
+                event_id, task_id, event_type, actor, previous_status, status,
+                next_action, blocker, source_file, idempotency_key, payload
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb)
+            ON CONFLICT (event_id) DO NOTHING
+            """,
+            payload.get("event_id"),
+            task_id,
+            str(body.get("backlog_event_type") or "synced"),
+            payload.get("agent_id"),
+            body.get("previous_status"),
+            status,
+            next_action,
+            blocker,
+            source_file,
+            idempotency_key,
+            json.dumps(body),
+        )
 
     async def _ack(self, msg: Any) -> None:
         try:
