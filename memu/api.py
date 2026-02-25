@@ -7,7 +7,7 @@ import os
 import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Iterable
 from uuid import UUID
 
 import asyncpg
@@ -341,6 +341,64 @@ async def delete_memory(memory_id: UUID, _key: str = Depends(verify_api_key)):
     return {"deleted": True}
 
 
+def _quality_tags_from_metadata(metadata: Any) -> dict[str, Any]:
+    if not isinstance(metadata, dict):
+        return {}
+    quality = metadata.get("quality")
+    return quality if isinstance(quality, dict) else {}
+
+
+def _parse_quality_expiry(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _quality_confidence_penalty(metadata: Any) -> float:
+    quality = _quality_tags_from_metadata(metadata)
+    if quality.get("confidence") == "low":
+        return 0.65
+    return 1.0
+
+
+def _apply_retrieval_safety_policy(rows: Iterable[Any], *, now: datetime | None = None) -> list[Any]:
+    now = now or datetime.now(timezone.utc)
+    candidate_rows = [dict(row) for row in rows]
+
+    superseded_ids: set[str] = set()
+    for row in candidate_rows:
+        quality = _quality_tags_from_metadata(row.get("metadata"))
+        superseded = quality.get("supersedes")
+        if isinstance(superseded, str) and superseded:
+            superseded_ids.add(superseded)
+
+    filtered: list[Any] = []
+    for row in candidate_rows:
+        metadata = row.get("metadata")
+        quality = _quality_tags_from_metadata(metadata)
+
+        if isinstance(metadata, dict) and metadata.get("source") == "untrusted":
+            continue
+
+        expires_at = _parse_quality_expiry(quality.get("expires"))
+        if expires_at is not None and expires_at <= now:
+            continue
+
+        row_id = str(row.get("id"))
+        if row_id in superseded_ids:
+            continue
+
+        filtered.append(row)
+
+    return filtered
+
+
 @app.post("/search", response_model=list[SearchResult])
 async def search_memories(req: SearchRequest, _key: str = Depends(verify_api_key)):
     embedding = await get_embedding(req.query)
@@ -384,9 +442,11 @@ async def search_memories(req: SearchRequest, _key: str = Depends(verify_api_key
                 ids,
             )
 
+    policy_rows = _apply_retrieval_safety_policy(rows)
+
     # Apply decay scoring and re-rank
     results = []
-    for row in rows:
+    for row in policy_rows:
         score = compute_final_score(
             similarity=row["similarity"],
             created_at=row["created_at"],
@@ -394,6 +454,7 @@ async def search_memories(req: SearchRequest, _key: str = Depends(verify_api_key
             decay_rate=DECAY_RATE,
             temporal_weight=req.temporal_weight,
         )
+        score *= _quality_confidence_penalty(row.get("metadata"))
         results.append(
             SearchResult(
                 memory=_row_to_memory(row),
@@ -439,12 +500,17 @@ async def search_text(
             SELECT * FROM memories
             WHERE {where}
             ORDER BY updated_at DESC
-            LIMIT {limit}
+            LIMIT {limit * 3}
             """,
             *params,
         )
 
-    return [_row_to_memory(row) for row in rows]
+    policy_rows = _apply_retrieval_safety_policy(rows)
+    policy_rows.sort(
+        key=lambda row: (row["updated_at"], row["confidence"] * _quality_confidence_penalty(row.get("metadata"))),
+        reverse=True,
+    )
+    return [_row_to_memory(row) for row in policy_rows[:limit]]
 
 
 @app.post("/chat", response_model=ChatResponse)
