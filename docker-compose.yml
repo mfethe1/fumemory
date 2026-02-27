@@ -1,5 +1,6 @@
 services:
   postgres:
+    restart: unless-stopped
     image: pgvector/pgvector:pg16
     environment:
       POSTGRES_DB: memu
@@ -18,6 +19,7 @@ services:
       retries: 5
 
   nats:
+    restart: unless-stopped
     image: nats:2.10-alpine
     command: ["--config", "/etc/nats/nats-server.conf"]
     ports:
@@ -32,7 +34,24 @@ services:
       timeout: 3s
       retries: 5
 
+  ollama:
+    restart: unless-stopped
+    image: ollama/ollama:latest
+    command: ["serve"]
+    environment:
+      - OLLAMA_HOST=0.0.0.0
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollamadata:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+
   api:
+    restart: unless-stopped
     build: .
     ports:
       - "8000:8000"
@@ -40,6 +59,8 @@ services:
       DATABASE_URL: postgresql://memu:memu@postgres:5432/memu
       MEMU_API_KEY: ${MEMU_API_KEY:-memu-dev-key}
       OPENAI_API_KEY: ${OPENAI_API_KEY}
+      EMBEDDING_BASE_URL: http://ollama:11434
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-qwen3-embedding}
       NATS_LOCAL_URL: nats://nats:4222
       NATS_RAILWAY_URL: ${NATS_RAILWAY_URL:-nats://nats:4222}
     depends_on:
@@ -47,19 +68,59 @@ services:
         condition: service_healthy
       nats:
         condition: service_healthy
+      ollama:
+        condition: service_started
 
-  bridge:
+  warden:
+    restart: unless-stopped
     build: .
-    command: ["python", "-m", "memu.ws_bridge"]
-    ports:
-      - "8001:8001"
+    working_dir: /app
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
     environment:
       NATS_LOCAL_URL: nats://nats:4222
       NATS_RAILWAY_URL: ${NATS_RAILWAY_URL:-nats://nats:4222}
+      WARDEN_GATEWAY_IMAGE: ${WARDEN_GATEWAY_IMAGE:-fumemory-gateway:latest}
+      WARDEN_HEARTBEAT_TTL: ${WARDEN_HEARTBEAT_TTL:-8}
+      WARDEN_CHECK_INTERVAL: ${WARDEN_CHECK_INTERVAL:-2}
+      WARDEN_RESPAWN_COOLDOWN_S: ${WARDEN_RESPAWN_COOLDOWN_S:-30}
+      WARDEN_LOG_LEVEL: ${WARDEN_LOG_LEVEL:-INFO}
+    command: ["python", "-m", "memu.warden_runtime"]
     depends_on:
+      nats:
+        condition: service_healthy
+
+  bridge:
+    restart: unless-stopped
+    build: .
+    command: ["python", "-m", "memu.ws_bridge"]
+
+  event-consumer:
+    restart: unless-stopped
+    build: .
+    command: ["python", "-m", "memu.event_consumer"]
+    environment:
+      NATS_LOCAL_URL: nats://nats:4222
+      NATS_RAILWAY_URL: ${NATS_RAILWAY_URL:-nats://nats:4222}
+      SUMMARY_INTERVAL_SECONDS: "30"
+    depends_on:
+      nats:
+        condition: service_healthy
+
+  projector:
+    restart: unless-stopped
+    build: .
+    command: ["python", "-m", "memu.projector"]
+    environment:
+      NATS_URL: nats://nats:4222
+      MEMU_API_URL: http://api:8000
+    depends_on:
+      api:
+        condition: service_started
       nats:
         condition: service_healthy
 
 volumes:
   pgdata:
   natsdata:
+  ollamadata:

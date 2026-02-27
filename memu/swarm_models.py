@@ -36,6 +36,9 @@ class EventType(str, enum.Enum):
     SYSTEM_HALT = "system_halt"
     SYSTEM_OVERRIDE = "system_override"
     HEARTBEAT = "heartbeat"
+    MEMORY_WRITTEN = "memory_written"
+    DECISION_MADE = "decision_made"
+    HEALTH_CHECK = "health_check"
     # Lane locking & fault tolerance
     LANE_ACQUIRED = "lane_acquired"
     LANE_RELEASED = "lane_released"
@@ -403,3 +406,33 @@ class RPCResponse(BaseModel):
     result: dict[str, Any] = Field(default_factory=dict)
     error: str | None = None
     execution_ms: int = 0
+
+
+# --- New Event Models for Blended Solution ---
+
+class MemoryWritten(BaseModel):
+    """Published when an agent writes a memory to memU."""
+    memory_id: UUID
+    content: str
+    memory_type: str
+    agent_id: str
+    confidence: float
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class DecisionMade(BaseModel):
+    """Published when an agent makes a significant decision."""
+    decision: str
+    context: str
+    rationale: str
+    options: list[str] = Field(default_factory=list)
+    selected_option: str | None = None
+    agent_id: str
+
+
+class HealthCheck(BaseModel):
+    """Published by the watchdog or agents to report health."""
+    gateway_id: str
+    status: GatewayStatus
+    results: dict[str, Any] = Field(default_factory=dict)
+    timestamp: datetime = Field(default_factory=lambda: datetime.now())
