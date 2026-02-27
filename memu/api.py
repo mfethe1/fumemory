@@ -536,6 +536,156 @@ async def list_tasks(status: TaskStatus | None = None, owner: str | None = None,
     return [_row_to_task(row) for row in rows]
 
 
+# --- A-MEM Link Layer ---
+
+class LinkCreate(BaseModel):
+    source_id: UUID
+    target_id: UUID
+    relationship: str = "similar"
+    strength: float = 0.5
+
+
+@app.post("/api/v1/memu/links")
+async def create_link(req: LinkCreate, _key: str = Depends(verify_api_key)):
+    async with pool.acquire() as conn:
+        try:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO memory_links (source_id, target_id, relationship, strength)
+                VALUES ($1, $2, $3, $4)
+                ON CONFLICT (source_id, target_id, relationship)
+                DO UPDATE SET strength = LEAST(1.0, memory_links.strength + 0.1), last_accessed = NOW()
+                RETURNING id, source_id, target_id, relationship, strength
+                """,
+                req.source_id, req.target_id, req.relationship, req.strength,
+            )
+            return {"ok": True, "link": dict(row)}
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/api/v1/memu/links/{memory_id}")
+async def get_links(memory_id: UUID, _key: str = Depends(verify_api_key)):
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT ml.*, m.content AS linked_content, m.memory_type, m.agent_id
+            FROM memory_links ml
+            JOIN memories m ON (m.id = CASE WHEN ml.source_id = $1 THEN ml.target_id ELSE ml.source_id END)
+            WHERE ml.source_id = $1 OR ml.target_id = $1
+            ORDER BY ml.strength DESC
+            """,
+            memory_id,
+        )
+        return {"ok": True, "links": [dict(r) for r in rows], "count": len(rows)}
+
+
+# --- Temporal Queries ---
+
+@app.get("/api/v1/memu/temporal")
+async def temporal_search_endpoint(
+    q: str,
+    agent: str = None,
+    hours: float = None,
+    limit: int = 10,
+    _key: str = Depends(verify_api_key),
+):
+    """Time-weighted memory search. Recent memories rank higher."""
+    embedding = await get_embedding(q)
+
+    filters = ["valid_to IS NULL"]  # only current memories
+    params: list[Any] = [str(embedding)]
+    idx = 2
+
+    if agent:
+        filters.append(f"agent_id = ${idx}")
+        params.append(agent)
+        idx += 1
+    if hours:
+        filters.append(f"created_at >= NOW() - INTERVAL '{hours} hours'")
+
+    where = " AND ".join(filters)
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            f"""
+            SELECT *,
+                1 - (embedding <=> $1::vector) AS similarity,
+                EXTRACT(EPOCH FROM (NOW() - created_at)) / 86400.0 AS age_days
+            FROM memories
+            WHERE embedding IS NOT NULL AND {where}
+            ORDER BY embedding <=> $1::vector
+            LIMIT {limit * 3}
+            """,
+            *params,
+        )
+
+    # Apply time decay reranking (7-day half-life)
+    import math
+    results = []
+    for row in rows:
+        age_days = float(row["age_days"])
+        base_sim = float(row["similarity"])
+        decay = math.exp(-0.693 * age_days / 7.0)
+        temporal_score = base_sim * decay
+        results.append({
+            "id": str(row["id"]),
+            "content": row["content"],
+            "agent_id": row["agent_id"],
+            "memory_type": row["memory_type"],
+            "similarity": base_sim,
+            "temporal_score": temporal_score,
+            "age_days": round(age_days, 1),
+            "created_at": str(row["created_at"]),
+        })
+
+    results.sort(key=lambda r: r["temporal_score"], reverse=True)
+    return {"ok": True, "results": results[:limit]}
+
+
+# --- Point-in-Time Query ---
+
+@app.get("/api/v1/memu/at")
+async def point_in_time_query(
+    timestamp: str,
+    agent: str = None,
+    limit: int = 20,
+    _key: str = Depends(verify_api_key),
+):
+    """Query memories as they existed at a specific point in time."""
+    from datetime import datetime as dt
+
+    try:
+        point = dt.fromisoformat(timestamp)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid timestamp format. Use ISO-8601.")
+
+    filters = ["valid_from <= $1", "(valid_to IS NULL OR valid_to > $1)"]
+    params: list[Any] = [point]
+    idx = 2
+
+    if agent:
+        filters.append(f"agent_id = ${idx}")
+        params.append(agent)
+        idx += 1
+
+    where = " AND ".join(filters)
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            f"""
+            SELECT id, content, memory_type, agent_id, confidence, created_at, valid_from, valid_to
+            FROM memories
+            WHERE {where}
+            ORDER BY created_at DESC
+            LIMIT {limit}
+            """,
+            *params,
+        )
+
+    return {"ok": True, "point_in_time": timestamp, "memories": [dict(r) for r in rows], "count": len(rows)}
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)

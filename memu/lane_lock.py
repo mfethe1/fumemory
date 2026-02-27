@@ -22,11 +22,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import time
-from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
 from typing import Any, Callable, Coroutine
-from uuid import UUID, uuid4
+from uuid import UUID
 
 import nats
 from nats.js import JetStreamContext
@@ -37,7 +35,6 @@ from memu.swarm_models import (
     DLQEntry,
     EventType,
     HydrationHandoff,
-    LaneContested,
     LaneLock,
     RPCRequest,
     RPCResponse,
@@ -145,90 +142,141 @@ class LaneLockedExecution:
         return False
 
     async def _acquire_all_lanes(self):
-        """Acquire semantic mutex on all resource lanes with fencing tokens."""
-        for lane_id in self.task.resource_lanes:
+        """Acquire semantic mutex on all resource lanes with fencing tokens.
+
+        Duplicate claim prevention is enforced by rejecting lock attempts where
+        this gateway already owns the exact same lane lock.
+        """
+        lanes = list(self.task.resource_lanes)
+        if not lanes:
+            # Guardrail: every task claim must have a lock surface.
+            # Use task-scoped synthetic lane so duplicate claims stay serialized.
+            lanes = [f"task:{self.task.task_id}"]
+
+        for lane_id in lanes:
             lock = await self._acquire_lane(lane_id)
-            if lock:
-                self.acquired_locks.append(lock)
-            else:
-                # Failed to acquire — release what we have and yield
-                await self._release_all_lanes()
-                raise LaneContestedError(
-                    f"Cannot acquire lane {lane_id} for task {self.task.task_id}"
+            self.acquired_locks.append(lock)
+
+    async def _acquire_lane(self, lane_id: str) -> LaneLock:
+        """Atomic-ish acquire of a lane lock with stale lock recovery."""
+        lane_id = sanitize_nats_subject(lane_id)
+        now = datetime.now(timezone.utc)
+        existing = await self._get_lock_state(lane_id)
+
+        if existing:
+            holder = existing["payload"]
+            holding_gateway = holder.get("gateway_id")
+            holding_task = holder.get("task_id")
+            # Duplicate claim prevention: exact same gateway/task pair cannot
+            # re-acquire without first yielding lock.
+            if holding_gateway == self.gateway_id and holding_task == str(self.task.task_id):
+                raise DuplicateClaimError(
+                    f"Duplicate claim attempt for lane {lane_id} by gateway {self.gateway_id} "
+                    f"on task {self.task.task_id}"
                 )
 
-    async def _acquire_lane(self, lane_id: str) -> LaneLock | None:
-        """Atomic compare-and-swap to acquire a lane lock."""
-        try:
-            # Get or create fencing token
+            # Stale lock recovery: reclaim if acquired timestamp exceeds TTL.
             try:
-                entry = await self.fencing_kv.get(lane_id)
-                current_token = int(entry.value.decode())
-                new_token = current_token + 1
+                acquired_at = datetime.fromisoformat(holder["acquired_at"])
+                if (now - acquired_at).total_seconds() > LANE_TTL_S:
+                    await self.lanes_kv.delete(lane_id)
+                    logger.warning(
+                        "Reclaiming stale lock on %s (age=%ss, holder=%s, task=%s)",
+                        lane_id,
+                        int((now - acquired_at).total_seconds()),
+                        holding_gateway,
+                        holding_task,
+                    )
+                else:
+                    raise LaneContestedError(
+                        f"Cannot acquire lane {lane_id} for task {self.task.task_id}: "
+                        f"held by {holding_gateway}"
+                    )
+            except LaneContestedError:
+                raise
             except Exception:
-                new_token = 1
+                # If holder data is malformed, treat as stale/corrupt and reclaim.
+                await self.lanes_kv.delete(lane_id)
 
-            # Atomic create — fails if key exists (lane is locked)
-            now = datetime.now(timezone.utc)
-            lock_data = {
-                "gateway_id": self.gateway_id,
-                "task_id": str(self.task.task_id),
-                "fencing_token": new_token,
-                "acquired_at": now.isoformat(),
-            }
+        # Get or increment fencing token
+        try:
+            entry = await self.fencing_kv.get(lane_id)
+            current_token = int(entry.value.decode())
+            new_token = current_token + 1
+        except Exception:
+            new_token = 1
 
+        lock_data = {
+            "gateway_id": self.gateway_id,
+            "task_id": str(self.task.task_id),
+            "fencing_token": new_token,
+            "acquired_at": now.isoformat(),
+            "expires_at": (now + timedelta(seconds=LANE_TTL_S)).isoformat(),
+            "lane_id": lane_id,
+        }
+
+        try:
             await self.lanes_kv.create(lane_id, json.dumps(lock_data).encode())
-            await self.fencing_kv.put(lane_id, str(new_token).encode())
-
-            lock = LaneLock(
-                lane_id=lane_id,
-                gateway_id=self.gateway_id,
-                task_id=self.task.task_id,
-                fencing_token=new_token,
-                acquired_at=now,
-                expires_at=now + timedelta(seconds=LANE_TTL_S),
+        except Exception:
+            # Another contender won between stale cleanup and create.
+            raise LaneContestedError(
+                f"Cannot acquire lane {lane_id} for task {self.task.task_id}: race with contender"
             )
 
-            # Publish lane acquired event
-            await self._publish_event(EventType.LANE_ACQUIRED, {
-                "lane_id": lane_id,
-                "fencing_token": new_token,
-            })
+        await self.fencing_kv.put(lane_id, str(new_token).encode())
 
-            logger.info(f"Acquired lane {lane_id} with fencing token {new_token}")
-            return lock
+        lock = LaneLock(
+            lane_id=lane_id,
+            gateway_id=self.gateway_id,
+            task_id=self.task.task_id,
+            fencing_token=new_token,
+            acquired_at=now,
+            expires_at=now + timedelta(seconds=LANE_TTL_S),
+        )
 
-        except Exception as e:
-            # Lane is locked by another gateway
-            logger.warning(f"Lane {lane_id} contested: {e}")
+        await self._publish_event(EventType.LANE_ACQUIRED, {
+            "lane": lane_id,
+            "lane_id": lane_id,
+            "fencing_token": new_token,
+        })
 
-            # Try to read who holds it for diagnostics
-            try:
-                entry = await self.lanes_kv.get(lane_id)
-                holder = json.loads(entry.value.decode())
-                contested = LaneContested(
-                    lane_id=lane_id,
-                    requesting_gateway=self.gateway_id,
-                    holding_gateway=holder["gateway_id"],
-                    holding_fencing_token=holder["fencing_token"],
-                    task_id=self.task.task_id,
-                )
-                await self._publish_event(EventType.LANE_CONTESTED, contested.model_dump())
-            except Exception:
-                pass
+        logger.info(f"Acquired lane {lane_id} with fencing token {new_token}")
+        return lock
 
+    async def _get_lock_state(self, lane_id: str) -> dict[str, Any] | None:
+        """Read lock state if present."""
+        entry = await self.lanes_kv.get(lane_id)
+        if not entry:
             return None
 
+        payload = json.loads(entry.value.decode())
+        return {
+            "payload": payload,
+            "revision": getattr(entry, "revision", None),
+            "entry": entry,
+        }
+
     async def _release_all_lanes(self):
-        """Release all held lane locks."""
+        """Release all held lane locks, never clobbering locks stolen by peers."""
         for lock in self.acquired_locks:
             try:
-                await self.lanes_kv.delete(lock.lane_id)
-                await self._publish_event(EventType.LANE_RELEASED, {
-                    "lane_id": lock.lane_id,
-                    "fencing_token": lock.fencing_token,
-                })
-                logger.info(f"Released lane {lock.lane_id}")
+                current = await self._get_lock_state(lock.lane_id)
+                if not current:
+                    continue
+
+                holder = current["payload"]
+                if (
+                    holder.get("gateway_id") == self.gateway_id
+                    and holder.get("task_id") == str(self.task.task_id)
+                    and int(holder.get("fencing_token", -1)) == lock.fencing_token
+                ):
+                    await self.lanes_kv.delete(lock.lane_id)
+                    await self._publish_event(EventType.LANE_RELEASED, {
+                        "lane": lock.lane_id,
+                        "lane_id": lock.lane_id,
+                        "fencing_token": lock.fencing_token,
+                    })
+                    logger.info(f"Released lane {lock.lane_id}")
             except Exception as e:
                 logger.error(f"Failed to release lane {lock.lane_id}: {e}")
 
@@ -241,13 +289,9 @@ class LaneLockedExecution:
                 await asyncio.sleep(HEARTBEAT_INTERVAL_S)
 
                 for lock in self.acquired_locks:
-                    lock_data = {
-                        "gateway_id": self.gateway_id,
-                        "task_id": str(self.task.task_id),
-                        "fencing_token": lock.fencing_token,
-                        "acquired_at": lock.acquired_at.isoformat(),
-                    }
-                    await self.lanes_kv.put(lock.lane_id, json.dumps(lock_data).encode())
+                    await self._renew_lane_lock(lock)
+
+                for lock in self.acquired_locks:
                     lock.expires_at = datetime.now(timezone.utc) + timedelta(seconds=LANE_TTL_S)
 
                 # Publish heartbeat
@@ -263,6 +307,32 @@ class LaneLockedExecution:
                 break
             except Exception as e:
                 logger.error(f"Heartbeat error: {e}")
+
+    async def _renew_lane_lock(self, lock: LaneLock):
+        """Renew a single lock and reject stale ownership transitions."""
+        current = await self._get_lock_state(lock.lane_id)
+        if not current:
+            raise FencingTokenError(
+                f"Lost lock {lock.lane_id} for task {self.task.task_id}"
+            )
+
+        payload = current["payload"]
+        if int(payload.get("fencing_token", -1)) != lock.fencing_token:
+            raise FencingTokenError(
+                f"Fencing token mismatch for lane {lock.lane_id}: expected "
+                f"{lock.fencing_token} got {payload.get('fencing_token')}"
+            )
+
+        now = datetime.now(timezone.utc)
+        payload.update({
+            "gateway_id": self.gateway_id,
+            "task_id": str(self.task.task_id),
+            "fencing_token": lock.fencing_token,
+            "acquired_at": now.isoformat(),
+            "expires_at": (now + timedelta(seconds=LANE_TTL_S)).isoformat(),
+        })
+
+        await self.lanes_kv.put(lock.lane_id, json.dumps(payload).encode())
 
     async def save_checkpoint(self, scratchpad: str, progress_pct: float = 0.0, tokens: int = 0):
         """Stream incremental checkpoint state back to memU for hydration."""
@@ -386,7 +456,7 @@ class LaneLockedExecution:
             await self._publish_event(EventType.ROLLBACK_EXECUTED, rollback.model_dump())
             logger.error(f"Rollback failed for task {self.task.task_id}: {e}")
 
-    async def _publish_event(self, event_type: EventType, payload: dict[str, Any]):
+    async def publish_event(self, event_type: EventType, payload: dict[str, Any]):
         """Publish a SwarmEvent to the NATS mesh."""
         event = SwarmEvent(
             source_gateway=self.gateway_id,
@@ -400,6 +470,10 @@ class LaneLockedExecution:
                 SUBJECT_EVENTS,
                 event.model_dump_json().encode(),
             )
+
+    async def _publish_event(self, event_type: EventType, payload: dict[str, Any]):
+        """Backward-compatible private wrapper for internal callsites."""
+        await self.publish_event(event_type, payload)
 
     async def request_rpc(
         self,
@@ -476,9 +550,10 @@ async def orphan_detector_loop(
                     lock_data = json.loads(entry.value.decode())
                     acquired_at = datetime.fromisoformat(lock_data["acquired_at"])
 
-                    # Check if lock has expired (TTL exceeded without heartbeat renewal)
+                    # Check if lock appears stale based on payload TTL semantics.
+                    # If heartbeat is stale beyond TTL, we can safely reclaim.
                     age_s = (now - acquired_at).total_seconds()
-                    if age_s > LANE_TTL_S * 2:
+                    if age_s > LANE_TTL_S:
                         orphaned = TaskOrphaned(
                             task_id=UUID(lock_data["task_id"]),
                             dead_gateway=lock_data["gateway_id"],
@@ -515,6 +590,11 @@ async def orphan_detector_loop(
 
 class LaneContestedError(Exception):
     """Raised when a lane lock cannot be acquired."""
+    pass
+
+
+class DuplicateClaimError(LaneContestedError):
+    """Raised when the same gateway/task tries to claim the same lane twice."""
     pass
 
 
