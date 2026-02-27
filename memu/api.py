@@ -7,7 +7,6 @@ import json
 import os
 import logging
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID
 
@@ -15,6 +14,7 @@ import asyncpg
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Security
 from fastapi.security import APIKeyHeader
+from pydantic import BaseModel
 
 from memu.decay import compute_final_score, should_deduplicate
 from memu.models import (
@@ -30,6 +30,8 @@ from memu.models import (
     TaskCreate,
     TaskStatus,
 )
+
+from memu.notion_bridge import create_bridge_from_env, NotionBridge
 
 # --- Config ---
 
@@ -684,6 +686,86 @@ async def point_in_time_query(
         )
 
     return {"ok": True, "point_in_time": timestamp, "memories": [dict(r) for r in rows], "count": len(rows)}
+
+
+
+
+# --- Notion Integration ---
+
+
+class NotionClaimRequest(BaseModel):
+    task_id: str
+    agent_id: str
+
+
+class NotionCompleteRequest(BaseModel):
+    task_id: str
+    agent_id: str
+    notes: str
+    memory_type: str = "lesson"
+
+
+class NotionCreateRequest(BaseModel):
+    title: str
+    priority: str = "P2"
+    project: str = ""
+    assigned_agent: str = "Any"
+
+
+async def get_notion_bridge() -> NotionBridge:
+    return await create_bridge_from_env()
+
+
+@app.get("/notion/queue")
+async def notion_queue(agent_id: str | None = None, _key: str = Depends(verify_api_key)):
+    bridge = await get_notion_bridge()
+    try:
+        return await bridge.poll_tasks(agent_id=agent_id)
+    finally:
+        await bridge.close()
+
+
+@app.post("/notion/claim")
+async def notion_claim(req: NotionClaimRequest, _key: str = Depends(verify_api_key)):
+    bridge = await get_notion_bridge()
+    try:
+        return await bridge.claim_task(req.task_id, req.agent_id)
+    finally:
+        await bridge.close()
+
+
+@app.post("/notion/complete")
+async def notion_complete(req: NotionCompleteRequest, _key: str = Depends(verify_api_key)):
+    bridge = await get_notion_bridge()
+    try:
+        return await bridge.complete_task(req.task_id, req.agent_id, req.notes, req.memory_type)
+    finally:
+        await bridge.close()
+
+
+@app.post("/notion/create")
+async def notion_create(req: NotionCreateRequest, _key: str = Depends(verify_api_key)):
+    bridge = await get_notion_bridge()
+    try:
+        task_id = await bridge.create_task(
+            title=req.title,
+            priority=req.priority,
+            project=req.project,
+            assigned_agent=req.assigned_agent,
+        )
+        return {"task_id": task_id}
+    finally:
+        await bridge.close()
+
+
+@app.get("/notion/health")
+async def notion_health(_key: str = Depends(verify_api_key)):
+    bridge = await get_notion_bridge()
+    try:
+        return await bridge.health_check()
+    finally:
+        await bridge.close()
+
 
 
 if __name__ == "__main__":

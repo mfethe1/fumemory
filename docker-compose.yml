@@ -107,6 +107,21 @@ services:
       nats:
         condition: service_healthy
 
+
+  notion_poller:
+    restart: unless-stopped
+    build: .
+    command: python -m memu.notion_poller
+    environment:
+      - NOTION_API_KEY=${NOTION_API_KEY}
+      - MEMU_BASE_URL=http://api:8000
+      - MEMU_API_KEY=${MEMU_API_KEY}
+      - AGENT_ID=${AGENT_ID:-any}
+      - POLL_INTERVAL=${POLL_INTERVAL:-60}
+    depends_on:
+      - api
+    restart: unless-stopped
+
   projector:
     restart: unless-stopped
     build: .
