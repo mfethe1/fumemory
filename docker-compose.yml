@@ -60,6 +60,26 @@ services:
       nats:
         condition: service_healthy
 
+  event_consumer:
+    build: .
+    command: ["python", "-m", "memu.event_consumer"]
+    restart: unless-stopped
+    environment:
+      NATS_LOCAL_URL: nats://nats:4222
+      NATS_RAILWAY_URL: ${NATS_RAILWAY_URL:-nats://nats:4222}
+      MEMU_API_URL: http://api:8000
+      MEMU_API_KEY: ${MEMU_API_KEY:-memu-dev-key}
+      SUMMARY_INTERVAL: ${SUMMARY_INTERVAL:-30}
+      AGENT_ID: event_consumer
+      ENABLE_MEMU_WRITES: ${ENABLE_MEMU_WRITES:-true}
+      AGENT_EVENTS_STREAM: AGENT_EVENTS
+      AGENT_EVENTS_CONSUMER: MEMU_DEFAULT_CONSUMER
+    depends_on:
+      nats:
+        condition: service_healthy
+      api:
+        condition: service_started
+
 volumes:
   pgdata:
   natsdata:
