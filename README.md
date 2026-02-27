@@ -136,6 +136,33 @@ See also:
 
 ---
 
+## Retrieval Safety
+
+memU enforces a **retrieval safety policy** on all search results:
+
+- **`source=untrusted`** — rows with `metadata.source = "untrusted"` are excluded from all
+  results, preventing adversarial or unverified content from influencing agent reasoning.
+- **`metadata.quality.expires`** — rows whose expiry timestamp has passed are excluded.
+- **`metadata.quality.supersedes`** — when a newer memory supersedes an older one, the older
+  row is excluded from the result set.
+- **`metadata.quality.confidence = "low"`** — low-confidence rows receive a 0.65× score
+  penalty (not excluded, but ranked lower).
+
+**Before / After (200-row sample):**
+
+| | Before policy | After policy |
+|---|---|---|
+| Stale/unsafe rows returned | 38 (19%) | 0 (<1%) |
+| — `source=untrusted` excluded | 0 | 11 |
+| — expired excluded | 0 | 14 |
+| — superseded excluded | 0 | 13 |
+| Low-confidence downranked | 0 | 22 |
+
+See [`docs/RETRIEVAL_SAFETY.md`](docs/RETRIEVAL_SAFETY.md) for full semantics and examples.
+See [`artifacts/stale_hit_rate_sample_2026-02-26.json`](artifacts/stale_hit_rate_sample_2026-02-26.json) for raw sample data.
+
+---
+
 ## License
 
 MIT

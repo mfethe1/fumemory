@@ -1,0 +1,20 @@
+{
+  "generated_at": "2026-02-27T03:20:39.544820+00:00",
+  "sample_size": 200,
+  "before_policy": {
+    "rows_returned": 200,
+    "stale_unsafe_estimate": 38,
+    "stale_hit_rate_pct": 19.0
+  },
+  "after_policy": {
+    "rows_returned": 162,
+    "rows_filtered": 38,
+    "breakdown": {
+      "source_untrusted_excluded": 11,
+      "expired_excluded": 14,
+      "superseded_excluded": 13
+    },
+    "low_confidence_downranked": 22,
+    "stale_hit_rate_pct": 0.0
+  }
+}
