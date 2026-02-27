@@ -87,7 +87,7 @@ class NotionBridge:
             raise RuntimeError("NOTION_TASK_BOARD_ID is required to poll tasks")
 
         filters: list[dict[str, Any]] = [
-            {"property": "Status", "status": {"equals": "Backlog"}},
+            {"property": "Status", "select": {"equals": "Backlog"}},
         ]
         if agent_id:
             normalized_agent_id = self._normalize_agent_name(agent_id)
