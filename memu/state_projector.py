@@ -104,7 +104,13 @@ class StateProjectorConsumer:
         if self._running:
             return
 
-        await self._manager.connect()
+        try:
+            await self._manager.connect()
+        except (ConnectionError, OSError) as exc:
+            logger.warning("NATS unavailable — projector entering degraded mode: %s", exc)
+            self.metrics.last_error = f"NATS unavailable: {exc}"
+            self.metrics.last_error_ts = time.time()
+            return  # graceful skip — no crash loop
         self._js = self._manager.jetstream
         await self._ensure_stream()
         await self._ensure_consumer()

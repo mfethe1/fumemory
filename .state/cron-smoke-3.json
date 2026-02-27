@@ -1,0 +1,53 @@
+{
+  "attempt": 1,
+  "events": [
+    {
+      "attempt": 0,
+      "event": "workflow_started",
+      "run_id": "cron-smoke-3",
+      "status": "running",
+      "step": "init",
+      "timestamp": "2026-02-25T03:29:59.322133+00:00",
+      "workflow": "memu_health_and_repair"
+    },
+    {
+      "attempt": 1,
+      "event": "health_check_started",
+      "run_id": "cron-smoke-3",
+      "status": "running",
+      "step": "health_check",
+      "timestamp": "2026-02-25T03:29:59.322304+00:00",
+      "workflow": "memu_health_and_repair"
+    },
+    {
+      "attempt": 1,
+      "event": "health_check_finished",
+      "ok": true,
+      "payload": {
+        "ok": true,
+        "reason": "runtime_smoke"
+      },
+      "run_id": "cron-smoke-3",
+      "status": "running",
+      "step": "health_check",
+      "timestamp": "2026-02-25T03:29:59.322360+00:00",
+      "workflow": "memu_health_and_repair"
+    },
+    {
+      "attempt": 1,
+      "event": "workflow_completed",
+      "outcome": "healthy",
+      "run_id": "cron-smoke-3",
+      "status": "healthy",
+      "step": "complete",
+      "timestamp": "2026-02-25T03:29:59.322457+00:00",
+      "workflow": "memu_health_and_repair"
+    }
+  ],
+  "last_error": null,
+  "repaired": false,
+  "run_id": "cron-smoke-3",
+  "status": "healthy",
+  "step": "complete",
+  "updated_at": "2026-02-25T03:29:59.322462+00:00"
+}

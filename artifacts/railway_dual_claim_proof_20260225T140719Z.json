@@ -1,0 +1,19 @@
+{
+  "ts": "2026-02-25T14:07:20.595716Z",
+  "proof": "railway_dual_claim",
+  "result": {
+    "ok": true,
+    "wins": [
+      "a"
+    ],
+    "errs": [
+      {
+        "name": "b",
+        "err": "KeyWrongLastSequenceError"
+      }
+    ],
+    "stored": "a",
+    "nats": "railway-internal"
+  },
+  "status": "pass"
+}

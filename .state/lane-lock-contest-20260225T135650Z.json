@@ -1,0 +1,9 @@
+{
+  "ok": false,
+  "phase": "config-missing",
+  "reason": "NATS_URL/RAILWAY_NATS_URL not set (localhost fallback disabled)",
+  "passes": {},
+  "failures": [
+    "missing broker endpoint env"
+  ]
+}

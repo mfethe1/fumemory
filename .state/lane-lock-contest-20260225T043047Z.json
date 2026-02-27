@@ -1,0 +1,10 @@
+{
+  "ok": false,
+  "phase": "connect-failed",
+  "reason": "Cannot connect to NATS at nats://127.0.0.1:4222",
+  "details": "Client.connect() got an unexpected keyword argument 'max_reconnect'. Did you mean 'allow_reconnect'?",
+  "passes": {},
+  "failures": [
+    "nats unavailable"
+  ]
+}

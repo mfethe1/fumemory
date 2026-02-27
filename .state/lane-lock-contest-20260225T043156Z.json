@@ -1,0 +1,10 @@
+{
+  "ok": false,
+  "phase": "connect-failed",
+  "reason": "Cannot connect to NATS at nats://127.0.0.1:4222",
+  "details": "",
+  "passes": {},
+  "failures": [
+    "nats unavailable"
+  ]
+}
