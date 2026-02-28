@@ -14,7 +14,7 @@ formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(messag
 handler.setFormatter(formatter)
 logger.addHandler(handler)
 
-MEMU_API_URL = os.environ.get("MEMU_API_URL", "http://localhost:8000")
+MEMU_API_URL = os.environ.get("MEMU_API_URL", "https://fumemory-infra-production-b652.up.railway.app")
 MEMU_API_KEY = os.environ.get("MEMU_API_KEY", "")
 
 async def log_action(agent_id: str, action: str, details: dict):
