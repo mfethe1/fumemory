@@ -1,81 +1,61 @@
 import logging
-from datetime import datetime
 from typing import List, Dict, Optional
 import json
 
-from memu.models import get_embedding, MemoryCreate
 from memu.client import MemUClient
+from memu.models import MemoryCreate
 
 logger = logging.getLogger(__name__)
 
-async def ingest_web_search(pool, query: str, results: List[Dict], agent_id: str):
+async def ingest_web_search(client: MemUClient, query: str, results: List[Dict], agent_id: str):
     """
-    Store web search results into memU (vector Search Vault) and memories.
+    Store web search results into memU via API (Search Vault + Memories).
+    Uses the client to ensure proper embedding, audit logging, and NATS events.
     """
     
-    # 1. Compute embedding for the query
+    # 1. Log the search event (Search Vault)
     try:
-        embedding = await get_embedding(query)
-    except Exception as e:
-        logger.error(f"Failed to compute embedding for search query: {e}")
-        embedding = None
-        
-    # 2. Insert into search_history (Search Vault)
-    # Using asyncpg execute
-    search_id = None
-    try:
-        async with pool.acquire() as conn:
-            # Check if this exact search query exists recently? (Optional dedup logic)
-            # For now, just insert.
-            
-            row = await conn.fetchrow(
-                """
-                INSERT INTO search_history (query, agent_id, results_count, search_type, metadata, embedding)
-                VALUES ($1, $2, $3, 'vector', $4, $5)
-                RETURNING id
-                """,
-                query,
-                agent_id,
-                len(results),
-                json.dumps({"provider": "brave", "timestamp": str(datetime.now())}),
-                embedding
-            )
-            if row:
-                search_id = row['id']
-                logger.info(f"Stored search query in Vault: {search_id}")
+        # Client handles embedding computation if configured, or API does it.
+        # Here we assume API does it for log_search.
+        await client.log_search(
+            query=query,
+            summary=f"Found {len(results)} results",
+            url="", # Source is aggregator
+            agent_id=agent_id
+        )
+        logger.info(f"Logged search query in Vault: {query}")
                 
     except Exception as e:
-        logger.error(f"Failed to store search history: {e}")
+        logger.error(f"Failed to log search history: {e}")
         
-    # 3. Store individual results as Memories (for Recall)
-    # Keep Macklemore's logic but ensure it's safe
-    async with pool.acquire() as conn:
-        for res in results:
-            title = res.get("title", "No Title")
-            snippet = res.get("description", "")
-            url = res.get("url", "")
-            
-            if not snippet: continue
-            
-            mem_content = f"[{title}]({url}): {snippet}"
-            mem_meta = {
-                "source": "web_search_result",
-                "query": query,
-                "url": url,
-                "search_id": str(search_id) if search_id else None
-            }
-            
-            try:
-                # Use raw SQL for speed or call internal API
-                await conn.execute(
-                    """
-                    INSERT INTO memories (content, agent_id, memory_type, metadata)
-                    VALUES ($1, $2, 'external', $3)
-                    ON CONFLICT DO NOTHING
-                    """,
-                    mem_content, agent_id, json.dumps(mem_meta)
-                )
-            except Exception as e:
-                logger.warning(f"Failed to store memory result: {e}")
+    # 2. Store individual results as Memories (for Recall)
+    # Filter high-quality results only
+    stored_count = 0
+    for res in results:
+        title = res.get("title", "No Title")
+        snippet = res.get("description", "")
+        url = res.get("url", "")
+        
+        if not snippet: continue
+        
+        mem_content = f"[{title}]({url}): {snippet}"
+        mem_meta = {
+            "source": "web_search_result",
+            "query": query,
+            "url": url
+        }
+        
+        try:
+            # Use client to add memory (triggers embedding + NATS + Audit)
+            await client.add_memory(
+                content=mem_content,
+                agent_id=agent_id,
+                memory_type="observation", # New schema compliance
+                metadata=mem_meta
+            )
+            stored_count += 1
+        except Exception as e:
+            logger.warning(f"Failed to store memory result: {e}")
 
+    logger.info(f"Ingested {stored_count} search results as memories.")
     return True
