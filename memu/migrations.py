@@ -40,5 +40,5 @@ async def run_migrations(pool: asyncpg.Pool):
                 logger.info(f"Migration {version} applied successfully.")
             except Exception as e:
                 logger.error(f"Migration {version} failed: {e}")
-                # Don't break startup, but log critical error
-                raise e
+                logger.warning(f"Migration startup failed: {e}")
+                # Continue to next migration instead of breaking startup

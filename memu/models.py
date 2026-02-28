@@ -5,6 +5,11 @@ from datetime import datetime
 from enum import Enum
 
 class MemoryType(str, Enum):
+    # Original types (backwards compatibility)
+    fact = "fact"
+    pattern = "pattern"
+    failure = "failure"
+    # A-MEM types
     observation = "observation"
     reflection = "reflection"
     plan = "plan"
