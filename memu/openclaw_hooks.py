@@ -1,123 +1,96 @@
-"""OpenClaw Memory Hooks — strict mandate logging for all agent actions.
-
-Every agent action (search, edit, exec, decision) gets logged to memU
-with full audit trail: who, what, when, why, and outcome.
-
-Usage from OpenClaw cron/agent:
-    python -m memu.openclaw_hooks log-action \\
-        --agent lenny \\
-        --type web_search \\
-        --description "Searched for Notion API version compatibility" \\
-        --outcome "Found 2022-06-28 vs 2025-09-03 breaking change" \\
-        --task-id "optional-notion-task-id"
-"""
-
-from __future__ import annotations
-
-import argparse
-import asyncio
+# memu/openclaw_hooks.py
+import sys
+import os
 import json
 import logging
-import os
-from datetime import datetime, timezone
-
+import asyncio
 import httpx
 
-# Use client if available for proper logging, else fallback to direct API
-try:
-    from memu.client import MemUClient
-    HAS_CLIENT = True
-except ImportError:
-    HAS_CLIENT = False
+# Setup standard logger
+logger = logging.getLogger("memu.hooks")
+logger.setLevel(logging.INFO)
+handler = logging.StreamHandler(sys.stdout)
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+handler.setFormatter(formatter)
+logger.addHandler(handler)
 
-logger = logging.getLogger(__name__)
+MEMU_API_URL = os.environ.get("MEMU_API_URL", "http://localhost:8000")
+MEMU_API_KEY = os.environ.get("MEMU_API_KEY", "")
 
-MEMU_BASE_URL = os.environ.get("MEMU_BASE_URL", "http://localhost:8000")
-MEMU_API_KEY = os.environ.get("MEMU_API_KEY", "memu-dev-key")
-
-
-async def log_action(
-    agent_id: str,
-    action_type: str,
-    description: str,
-    outcome: str = "success",
-    task_id: str | None = None,
-    metadata: dict | None = None,
-) -> dict:
-    """Log an agent action to memU as an audit memory."""
-    
-    if HAS_CLIENT:
-        # Use the new client method for strict audit logging
-        client = MemUClient(MEMU_BASE_URL, MEMU_API_KEY)
-        try:
-            await client.log_action(
-                agent_id=agent_id,
-                tool=action_type,
-                input=description,
-                output=outcome,
-                session_id=task_id or "unknown"
-            )
-            return {"status": "logged_via_client"}
-        except Exception as e:
-            logger.warning(f"Client logging failed, falling back to legacy hook: {e}")
-
-    # Fallback / Legacy Hook logic (stores as memory)
-    content = (
-        f"[ACTION] {action_type} by {agent_id}\n"
-        f"Description: {description}\n"
-        f"Outcome: {outcome}\n"
-        f"Timestamp: {datetime.now(timezone.utc).isoformat()}"
-    )
-    if task_id:
-        content += f"\nTask: {task_id}"
-
+async def log_action(agent_id: str, action: str, details: dict):
+    """Log an agent action to memU."""
     payload = {
-        "content": content,
-        "memory_type": "observation",  # Updated to new schema
+        "content": f"Action: {action}",
         "agent_id": agent_id,
+        "memory_type": "user_action",
         "metadata": {
-            "action_type": action_type,
-            "outcome": outcome,
-            "task_id": task_id,
-            "logged_at": datetime.now(timezone.utc).isoformat(),
-            "hook": "openclaw_action_log",
-            **(metadata or {}),
-        },
+            "action_type": action,
+            "details": details,
+            "source": "openclaw_hook"
+        }
     }
+    
+    headers = {"X-API-Key": MEMU_API_KEY}
+    
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.post(
+                f"{MEMU_API_URL}/memories/async", 
+                json=payload, 
+                headers=headers
+            )
+            logger.info(f"Logged action {action} for {agent_id} (status: {resp.status_code})")
+    except Exception as e:
+        logger.error(f"Failed to log action: {e}")
 
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        r = await client.post(
-            f"{MEMU_BASE_URL}/memories",
-            json=payload,
-            headers={"X-API-Key": MEMU_API_KEY, "Content-Type": "application/json"},
-        )
-        r.raise_for_status()
-        return r.json()
+async def log_search(agent_id: str, query: str, results_summary: str):
+    """Log a web search to memU."""
+    payload = {
+        "content": f"Search: {query}\nResult Summary: {results_summary[:500]}...",
+        "agent_id": agent_id,
+        "memory_type": "external",
+        "metadata": {
+            "query": query,
+            "type": "web_search",
+            "source": "openclaw_hook"
+        }
+    }
+    
+    headers = {"X-API-Key": MEMU_API_KEY}
+    
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+             await client.post(
+                f"{MEMU_API_URL}/memories/async", 
+                json=payload, 
+                headers=headers
+            )
+    except Exception as e:
+        logger.error(f"Failed to log search: {e}")
 
-# ... (rest of the file remains similar or simplified for brevity in this overwrite)
-
-def main():
-    parser = argparse.ArgumentParser(description="OpenClaw Memory Hooks")
-    sub = parser.add_subparsers(dest="command")
-
-    act = sub.add_parser("log-action")
-    act.add_argument("--agent", required=True)
-    act.add_argument("--type", required=True)
-    act.add_argument("--description", required=True)
-    act.add_argument("--outcome", default="success")
-    act.add_argument("--task-id", default=None)
-
-    args = parser.parse_args()
-
-    if args.command == "log-action":
-        result = asyncio.run(log_action(
-            agent_id=args.agent,
-            action_type=args.type,
-            description=args.description,
-            outcome=args.outcome,
-            task_id=args.task_id,
-        ))
-        print(json.dumps(result, indent=2, default=str))
+async def recall(query: str, agent_id: str):
+    """Check if we already know this."""
+    headers = {"X-API-Key": MEMU_API_KEY}
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(
+                f"{MEMU_API_URL}/search",
+                json={"query": query, "agent_id": agent_id, "limit": 3},
+                headers=headers
+            )
+            if resp.status_code == 200:
+                results = resp.json()
+                if results and results[0]['final_score'] > 0.8:
+                    return results[0]['memory']['content']
+    except Exception:
+        pass
+    return None
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 2:
+        cmd = sys.argv[1]
+        if cmd == "log-action":
+            asyncio.run(log_action("cli", "test_action", {"test": True}))
+        elif cmd == "recall":
+            res = asyncio.run(recall(sys.argv[2], "cli"))
+            print(res if res else "No recall match.")

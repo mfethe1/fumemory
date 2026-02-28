@@ -45,7 +45,7 @@ MEMU_API_KEY = os.environ.get("MEMU_API_KEY", "memu-dev-key")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 EMBEDDING_BASE_URL = os.environ.get("EMBEDDING_BASE_URL", "http://localhost:11434")
 EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "qwen3-embedding")
-EMBEDDING_DIMS = int(os.environ.get("EMBEDDING_DIMS", "4096"))
+EMBEDDING_DIMS = int(os.environ.get("EMBEDDING_DIMS", "1536"))
 DEDUP_THRESHOLD = float(os.environ.get("DEDUP_THRESHOLD", "0.95"))
 DECAY_RATE = float(os.environ.get("DECAY_RATE", "0.01"))
 
@@ -130,7 +130,7 @@ async def get_embedding(text: str) -> list[float] | None:
                 r = await client.post(
                     url,
                     headers=headers,
-                    json={"input": text, "model": EMBEDDING_MODEL},
+                    json={"input": text, "model": EMBEDDING_MODEL, "dimensions": EMBEDDING_DIMS},
                 )
                 r.raise_for_status()
                 emb = r.json()["data"][0]["embedding"]
