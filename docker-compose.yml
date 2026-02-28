@@ -149,7 +149,6 @@ services:
       - POLL_INTERVAL=${POLL_INTERVAL:-60}
     depends_on:
       - api
-    restart: unless-stopped
 
   projector:
     restart: unless-stopped
