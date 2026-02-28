@@ -17,6 +17,8 @@ from fastapi.security import APIKeyHeader
 from pydantic import BaseModel
 
 from memu.decay import compute_final_score, should_deduplicate
+from memu.cluster import NATSClusterManager
+from memu.nats_publisher import NATSEventPublisher
 from memu.models import (
     BulkImportRequest,
     BulkImportResponse,
@@ -50,12 +52,14 @@ DECAY_RATE = float(os.environ.get("DECAY_RATE", "0.01"))
 
 pool: asyncpg.Pool | None = None
 _fastembed_model: Any = None
+_nats_cluster: NATSClusterManager | None = None
+_nats_publisher: NATSEventPublisher | None = None
 logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global pool, _fastembed_model
+    global pool, _fastembed_model, _nats_cluster, _nats_publisher
     pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=10)
     
     # Run DB migrations
@@ -70,8 +74,21 @@ async def lifespan(app: FastAPI):
         _fastembed_model = TextEmbedding()
     except Exception as e:
         logger.warning("FastEmbed pre-warm failed: %s", e)
-        
+
+    # Connect NATS cluster (non-blocking — API works without NATS)
+    try:
+        _nats_cluster = NATSClusterManager()
+        await _nats_cluster.connect()
+        _nats_publisher = NATSEventPublisher(_nats_cluster, gateway_id="memu-api")
+        logger.info("NATS event publisher connected")
+    except Exception as e:
+        logger.warning("NATS connection failed (API will work without events): %s", e)
+        _nats_cluster = None
+        _nats_publisher = None
+
     yield
+    if _nats_cluster:
+        await _nats_cluster.close()
     if pool:
         await pool.close()
 
@@ -255,7 +272,22 @@ async def create_memory(req: MemoryCreate, _key: str = Depends(verify_api_key)):
                 c_hash,
             )
 
-    return _row_to_memory(row)
+    memory = _row_to_memory(row)
+
+    # Publish NATS event for every memory write
+    if _nats_publisher:
+        try:
+            await _nats_publisher.publish_memory_written(
+                agent_id=req.agent_id or "unknown",
+                memory_id=str(memory.id),
+                content=req.content,
+                memory_type=req.memory_type.value,
+                metadata=req.metadata,
+            )
+        except Exception as e:
+            logger.warning("NATS publish failed for memory write: %s", e)
+
+    return memory
 
 
 @app.get("/memories/{memory_id}", response_model=Memory)
@@ -389,7 +421,8 @@ async def search_memories(req: SearchRequest, _key: str = Depends(verify_api_key
             )
         )
     results.sort(key=lambda r: r.final_score, reverse=True)
-    
+    final = results[: req.limit]
+
     # Audit Trail: Log Search History
     try:
         async with pool.acquire() as conn:
@@ -400,14 +433,26 @@ async def search_memories(req: SearchRequest, _key: str = Depends(verify_api_key
                 """,
                 req.query,
                 req.agent_id or "system",
-                len(results),
+                len(final),
                 "vector",
                 json.dumps({"temporal_weight": req.temporal_weight, "limit": req.limit})
             )
     except Exception as e:
         logger.error(f"Failed to log search history: {e}")
 
-    return results[: req.limit]
+    # Publish search event to NATS
+    if _nats_publisher:
+        try:
+            await _nats_publisher.publish_search_logged(
+                agent_id=req.agent_id or "unknown",
+                query=req.query,
+                source="memu_search",
+                result_count=len(final),
+            )
+        except Exception as e:
+            logger.warning("NATS publish failed for search: %s", e)
+
+    return final
 
 
 @app.post("/search-text")
