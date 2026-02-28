@@ -71,6 +71,35 @@ services:
       ollama:
         condition: service_started
 
+  temporal:
+    image: temporalio/auto-setup:latest
+    ports:
+      - "7233:7233"
+      - "8233:8233"
+    environment:
+      - DB=postgresql
+      - DB_PORT=5432
+      - POSTGRES_USER=memu
+      - POSTGRES_PWD=memu
+      - POSTGRES_DB=temporal
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - default
+
+  temporal-worker:
+    build: .
+    command: ["python", "-m", "memu.temporal_worker.worker"]
+    environment:
+      TEMPORAL_HOST: temporal:7233
+      DATABASE_URL: postgresql://memu:memu@postgres:5432/memu
+    depends_on:
+      temporal:
+        condition: service_started
+      api:
+        condition: service_started
+
   warden:
     restart: unless-stopped
     build: .

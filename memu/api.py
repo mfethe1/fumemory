@@ -32,6 +32,8 @@ from memu.models import (
 )
 
 from memu.notion_bridge import create_bridge_from_env, NotionBridge
+from memu.migrations import run_migrations
+from memu.temporal_routes import router as temporal_router
 
 # --- Config ---
 
@@ -56,6 +58,12 @@ async def lifespan(app: FastAPI):
     global pool, _fastembed_model
     pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=10)
     
+    # Run DB migrations
+    try:
+        await run_migrations(pool)
+    except Exception as e:
+        logger.error(f"Migration startup failed: {e}")
+    
     # Pre-warm fastembed model
     try:
         from fastembed import TextEmbedding
@@ -74,6 +82,8 @@ app = FastAPI(
     version="0.1.0",
     lifespan=lifespan,
 )
+
+app.include_router(temporal_router, tags=["Async Workflows"])
 
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
@@ -379,6 +389,24 @@ async def search_memories(req: SearchRequest, _key: str = Depends(verify_api_key
             )
         )
     results.sort(key=lambda r: r.final_score, reverse=True)
+    
+    # Audit Trail: Log Search History
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO search_history (query, agent_id, results_count, search_type, metadata)
+                VALUES ($1, $2, $3, $4, $5::jsonb)
+                """,
+                req.query,
+                req.agent_id or "system",
+                len(results),
+                "vector",
+                json.dumps({"temporal_weight": req.temporal_weight, "limit": req.limit})
+            )
+    except Exception as e:
+        logger.error(f"Failed to log search history: {e}")
+
     return results[: req.limit]
 
 
