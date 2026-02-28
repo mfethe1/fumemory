@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from memu.web_search_ingest import ingest_web_search
 import os
 import logging
 from contextlib import asynccontextmanager
@@ -849,3 +850,40 @@ async def notion_health(_key: str = Depends(verify_api_key)):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
+# --- Search Vault / Recall Endpoints ---
+
+@app.get("/search/recall")
+async def recall_search(
+    query: str, 
+    limit: int = 5,
+    agent_id: Optional[str] = None,
+    api_key: str = Security(get_api_key)
+):
+    """
+    Search the Vault (search_history) for similar past searches.
+    Returns: List of {query, timestamp, agent_id, similarity}
+    """
+    try:
+        embedding = await get_embedding(query)
+    except Exception as e:
+        logger.error(f"Failed to embed query: {e}")
+        raise HTTPException(status_code=500, detail="Embedding failure")
+
+    async with app.state.pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT query, agent_id, created_at, results_count, 
+                   1 - (embedding <=> $1) as similarity
+            FROM search_history
+            WHERE embedding IS NOT NULL
+            ORDER BY embedding <=> $1
+            LIMIT $2
+            """,
+            embedding, limit
+        )
+        
+    return [dict(r) for r in rows]
+
+# Note: /search endpoint logic must be updated to use ingest_web_search (vector version)
+# This assumes ingest_web_search is imported and used in the search route handler.
