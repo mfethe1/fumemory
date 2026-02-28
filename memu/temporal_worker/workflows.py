@@ -1,3 +1,4 @@
+# memu/temporal_worker/workflows.py
 from datetime import timedelta
 from temporalio import workflow
 
@@ -7,24 +8,32 @@ with workflow.unsafe.imports_passed_through():
         StoreMemoryActivity,
         SearchMemoryActivity,
         LogAuditActivity,
+        GenerateEmbeddingActivity
     )
 
 @workflow.defn
 class MemoryIngestionWorkflow:
     @workflow.run
     async def run(self, content: str, agent_id: str, metadata: dict) -> str:
-        # 1. Store the raw memory
-        memory_id = await workflow.execute_activity(
-            StoreMemoryActivity,
-            args=[content, agent_id, metadata],
-            start_to_close_timeout=timedelta(seconds=10),
+        # 0. Generate embedding (durable)
+        embedding = await workflow.execute_activity(
+            GenerateEmbeddingActivity,
+            args=[content],
+            start_to_close_timeout=timedelta(seconds=60),
         )
 
-        # 2. Log audit trail (Policy: Log Everything)
+        # 1. Store memory
+        memory_id = await workflow.execute_activity(
+            StoreMemoryActivity,
+            args=[content, agent_id, metadata, embedding],
+            start_to_close_timeout=timedelta(seconds=120),
+        )
+
+        # 2. Log audit
         await workflow.execute_activity(
             LogAuditActivity,
             args=["MEMORY_STORED", agent_id, {"memory_id": memory_id}],
-            start_to_close_timeout=timedelta(seconds=5),
+            start_to_close_timeout=timedelta(seconds=30),
         )
 
         return memory_id
@@ -33,25 +42,31 @@ class MemoryIngestionWorkflow:
 class MemorySearchWorkflow:
     @workflow.run
     async def run(self, query: str, agent_id: str) -> list[dict]:
-        # 1. Log search intent (Audit)
+        # 0. Generate embedding
+        embedding = await workflow.execute_activity(
+            GenerateEmbeddingActivity,
+            args=[query],
+            start_to_close_timeout=timedelta(seconds=60),
+        )
+
+        # 1. Log intent
         await workflow.execute_activity(
             LogAuditActivity,
             args=["SEARCH_INTENT", agent_id, {"query": query}],
-            start_to_close_timeout=timedelta(seconds=5),
+            start_to_close_timeout=timedelta(seconds=30),
         )
 
         # 2. Execute search
         results = await workflow.execute_activity(
             SearchMemoryActivity,
-            args=[query, agent_id],
-            start_to_close_timeout=timedelta(seconds=10),
+            args=[query, agent_id, embedding],
+            start_to_close_timeout=timedelta(seconds=60),
         )
 
-        # 3. Log search outcome (Audit)
+        # 3. Log outcome
         await workflow.execute_activity(
             LogAuditActivity,
             args=["SEARCH_COMPLETE", agent_id, {"count": len(results)}],
-            start_to_close_timeout=timedelta(seconds=5),
+            start_to_close_timeout=timedelta(seconds=30),
         )
-
         return results

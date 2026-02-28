@@ -425,17 +425,22 @@ async def search_memories(req: SearchRequest, _key: str = Depends(verify_api_key
 
     # Audit Trail: Log Search History
     try:
+        # Get embedding for query if available
+        emb = await get_embedding(req.query)
+        emb_str = str(emb) if emb else None
+        
         async with pool.acquire() as conn:
             await conn.execute(
                 """
-                INSERT INTO search_history (query, agent_id, results_count, search_type, metadata)
-                VALUES ($1, $2, $3, $4, $5::jsonb)
+                INSERT INTO search_history (query, agent_id, results_count, search_type, metadata, embedding)
+                VALUES ($1, $2, $3, $4, $5::jsonb, $6::vector)
                 """,
                 req.query,
                 req.agent_id or "system",
                 len(final),
                 "vector",
-                json.dumps({"temporal_weight": req.temporal_weight, "limit": req.limit})
+                json.dumps({"temporal_weight": req.temporal_weight, "limit": req.limit}),
+                emb_str
             )
     except Exception as e:
         logger.error(f"Failed to log search history: {e}")
