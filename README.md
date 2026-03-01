@@ -332,6 +332,18 @@ EMBEDDING_DIMS=4096
 DECAY_RATE=0.01
 DEDUP_THRESHOLD=0.95
 
+# Embedding provider for production (do NOT point to local laptop from Railway)
+# Option A: OpenAI-compatible API
+# OPENAI_API_KEY=sk-...
+# EMBEDDING_BASE_URL=https://api.openai.com/v1  # or compatible endpoint
+# EMBEDDING_MODEL=text-embedding-3-small
+# EMBEDDING_DIMS=1536
+
+# Option B: hosted Ollama service on Railway (recommended for self-hosted path)
+EMBEDDING_BASE_URL=http://<railway-ollama-service>.railway.internal:11434
+EMBEDDING_MODEL=qwen3-embedding
+EMBEDDING_DIMS=4096
+
 # NATS clustering
 NATS_LOCAL_URL=nats://localhost:4222
 NATS_RAILWAY_URL=nats://gondola.proxy.rlwy.net:22393

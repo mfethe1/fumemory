@@ -1,34 +1,100 @@
 # memu/temporal_worker/activities.py
-import asyncio
-import os
-import asyncpg
 import json
+import os
+from typing import Any
+
+import asyncpg
 from temporalio import activity
 import httpx
 
-# Helper to get DB connection
+# Local cache for FastEmbed fallback (kept module-private for worker determinism)
+_fastembed_model: Any | None = None
+
+
 def get_db_url():
     return os.environ.get("DATABASE_URL")
 
-@activity.defn
+
+# --- Embedding helpers (OpenAI-compatible + local fallback) ---
+
+EMBEDDING_BASE_URL = os.environ.get("EMBEDDING_BASE_URL", "http://localhost:11434")
+EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "qwen3-embedding")
+EMBEDDING_DIMS = int(os.environ.get("EMBEDDING_DIMS", "1536"))
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+
+
+async def _embedding_from_http(text: str) -> list[float] | None:
+    """Try OpenAI-compatible endpoint (/v1/embeddings), including Ollama."""
+    # Only attempt remote embedding call for explicit providers.
+    if not OPENAI_API_KEY and "ollama" not in EMBEDDING_BASE_URL:
+        return None
+
+    url = f"{EMBEDDING_BASE_URL.rstrip('/')}/v1/embeddings"
+    headers = {"Content-Type": "application/json"}
+    if OPENAI_API_KEY:
+        headers["Authorization"] = f"Bearer {OPENAI_API_KEY}"
+
+    try:
+        async with httpx.AsyncClient(timeout=90.0) as client:
+            resp = await client.post(
+                url,
+                headers=headers,
+                json={
+                    "input": text,
+                    "model": EMBEDDING_MODEL,
+                    "dimensions": EMBEDDING_DIMS,
+                },
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            emb = data["data"][0]["embedding"]
+            if len(emb) == EMBEDDING_DIMS:
+                return emb
+            activity.logger.warning(
+                "Embedding dim mismatch from remote provider: got=%d expected=%d",
+                len(emb),
+                EMBEDDING_DIMS,
+            )
+    except Exception as e:
+        activity.logger.warning("Remote embedding request failed: %s", e)
+    return None
+
+
+async def _embedding_from_fastembed(text: str) -> list[float] | None:
+    global _fastembed_model
+
+    if _fastembed_model is None:
+        try:
+            from fastembed import TextEmbedding
+
+            _fastembed_model = TextEmbedding()
+        except Exception as e:
+            activity.logger.warning("FastEmbed unavailable: %s", e)
+            return None
+
+    try:
+        embeddings = list(_fastembed_model.embed([text]))
+        emb = embeddings[0].tolist()
+        if len(emb) == EMBEDDING_DIMS:
+            return emb
+        activity.logger.warning(
+            "FastEmbed dim mismatch: got=%d expected=%d",
+            len(emb),
+            EMBEDDING_DIMS,
+        )
+    except Exception as e:
+        activity.logger.warning("FastEmbed generation failed: %s", e)
+    return None
+
+
 async def generate_embedding(text: str) -> list[float] | None:
     """Generate embedding vector (activity wrapper)."""
-    # This logic should mirror api.py's get_embedding
-    # For now, simplistic call to Ollama or OpenAI
-    base_url = os.environ.get("EMBEDDING_BASE_URL", "http://ollama:11434")
-    model = os.environ.get("EMBEDDING_MODEL", "qwen3-embedding")
-    
-    try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            resp = await client.post(
-                f"{base_url}/api/embeddings",
-                json={"model": model, "prompt": text}
-            )
-            if resp.status_code == 200:
-                return resp.json().get("embedding")
-    except Exception as e:
-        activity.logger.error(f"Embedding failed: {e}")
-    return None
+    # Mirror API behavior: prefer remote embedding API, then local FastEmbed fallback.
+    remote = await _embedding_from_http(text)
+    if remote is not None:
+        return remote
+    return await _embedding_from_fastembed(text)
+
 
 @activity.defn
 async def store_memory(content: str, agent_id: str, metadata: dict, embedding: list[float] | None) -> str:
@@ -41,11 +107,15 @@ async def store_memory(content: str, agent_id: str, metadata: dict, embedding: l
             VALUES ($1, $2, $3, 'user_action', $4::vector)
             RETURNING id
             """,
-            content, agent_id, json.dumps(metadata), str(embedding) if embedding else None
+            content,
+            agent_id,
+            json.dumps(metadata),
+            str(embedding) if embedding else None,
         )
         return str(row["id"])
     finally:
         await conn.close()
+
 
 @activity.defn
 async def search_memory(query: str, agent_id: str, embedding: list[float] | None) -> list:
@@ -61,16 +131,19 @@ async def search_memory(query: str, agent_id: str, embedding: list[float] | None
                 ORDER BY embedding <=> $1::vector
                 LIMIT 5
                 """,
-                str(embedding), agent_id
+                str(embedding),
+                agent_id,
             )
         else:
             rows = await conn.fetch(
                 "SELECT id, content, 0.0 as similarity FROM memories WHERE content ILIKE $1 AND agent_id = $2 LIMIT 5",
-                f"%{query}%", agent_id
+                f"%{query}%",
+                agent_id,
             )
         return [dict(r) for r in rows]
     finally:
         await conn.close()
+
 
 @activity.defn
 async def log_audit(action_type: str, agent_id: str, details: dict):
@@ -82,11 +155,14 @@ async def log_audit(action_type: str, agent_id: str, details: dict):
             INSERT INTO audit_log (action_type, agent_id, details, created_at)
             VALUES ($1, $2, $3, NOW())
             """,
-            action_type, agent_id, json.dumps(details)
+            action_type,
+            agent_id,
+            json.dumps(details),
         )
         return True
     finally:
         await conn.close()
+
 
 # Export for worker registration
 GenerateEmbeddingActivity = generate_embedding

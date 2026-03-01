@@ -1,0 +1,13 @@
+{
+  "$schema": "https://railway.com/railway.schema.json",
+  "build": {
+    "dockerfilePath": "infra/railway-ollama/Dockerfile"
+  },
+  "deploy": {
+    "startCommand": "ollama serve",
+    "healthcheckPath": "/",
+    "healthcheckTimeout": 20,
+    "restartPolicyType": "ON_FAILURE",
+    "restartPolicyMaxRetries": 10
+  }
+}
