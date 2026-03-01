@@ -27,6 +27,7 @@ from memu.models import (
     ChatResponse,
     Memory,
     MemoryCreate,
+    MemoryType,
     SearchRequest,
     SearchResult,
     Task,
@@ -110,6 +111,16 @@ async def verify_api_key(key: str | None = Security(api_key_header)) -> str:
     if not key or key != MEMU_API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
     return key
+
+
+def _coerce_memory_type(raw: str | None) -> MemoryType | None:
+    if raw is None:
+        return None
+    try:
+        return MemoryType(raw)
+    except ValueError:
+        raise HTTPException(status_code=422, detail=f"invalid memory_type: {raw}")
+
 
 
 # --- Embedding ---
@@ -461,6 +472,59 @@ async def search_memories(req: SearchRequest, _key: str = Depends(verify_api_key
             logger.warning("NATS publish failed for search: %s", e)
 
     return final
+
+
+@app.get("/memories/search")
+async def memories_search_compat(
+    q: str,
+    agent: str | None = None,
+    agent_id: str | None = None,
+    memory_type: str | None = None,
+    min_confidence: float = 0.0,
+    limit: int = 10,
+    temporal_weight: float = DECAY_RATE,
+    _key: str = Depends(verify_api_key),
+):
+    """Backward-compatible GET alias for memory search."""
+    req = SearchRequest(
+        query=q,
+        limit=limit,
+        agent_id=agent_id or agent,
+        memory_type=_coerce_memory_type(memory_type),
+        min_confidence=min_confidence,
+        temporal_weight=temporal_weight,
+    )
+    return await search_memories(req, _key=_key)
+
+
+@app.get("/api/v1/memu/search")
+async def memu_search_compat(
+    q: str,
+    agent: str | None = None,
+    agent_id: str | None = None,
+    limit: int = 10,
+    memory_type: str | None = None,
+    _key: str = Depends(verify_api_key),
+):
+    req = SearchRequest(
+        query=q,
+        limit=limit,
+        agent_id=agent_id or agent,
+        memory_type=_coerce_memory_type(memory_type),
+    )
+    return await search_memories(req, _key=_key)
+
+
+@app.get("/search-text")
+async def search_text_compat(
+    q: str,
+    agent_id: str | None = None,
+    memory_type: str | None = None,
+    limit: int = 10,
+    _key: str = Depends(verify_api_key),
+):
+    """Backward-compatible query-param form for search-text."""
+    return await search_text(q, agent_id=agent_id, memory_type=memory_type, limit=limit, _key=_key)
 
 
 @app.post("/search-text")
@@ -852,9 +916,21 @@ async def notion_health(_key: str = Depends(verify_api_key)):
 
 # --- Search Vault / Recall Endpoints ---
 
+@app.get("/api/v1/memu/search/recall")
+async def recall_search_compat(
+    q: str,
+    limit: int = 5,
+    agent: str | None = None,
+    agent_id: str | None = None,
+    _key: str = Depends(verify_api_key),
+):
+    return await recall_search(query=q, limit=limit, agent_id=agent_id or agent, _key=_key)
+
+
 @app.get("/search/recall")
 async def recall_search(
-    query: str, 
+    query: str | None = None,
+    q: str | None = None,
     limit: int = 5,
     agent_id: Optional[str] = None,
     _key: str = Depends(verify_api_key)
@@ -862,9 +938,13 @@ async def recall_search(
     """
     Search the Vault (search_history) for similar past searches.
     Returns: List of {query, timestamp, agent_id, similarity}
+    Supports both `query` (canonical) and `q` (backward-compatible).
     """
+    normalized_query = query or q
+    if not normalized_query:
+        raise HTTPException(status_code=400, detail="query parameter is required")
     try:
-        embedding = await get_embedding(query)
+        embedding = await get_embedding(normalized_query)
     except Exception as e:
         logger.error(f"Failed to embed query: {e}")
         raise HTTPException(status_code=500, detail="Embedding failure")
