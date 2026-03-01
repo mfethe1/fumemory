@@ -12,8 +12,15 @@ async def run_migrations(pool: asyncpg.Pool):
         logger.warning("No migrations directory found.")
         return
 
-    # Create migrations table if not exists
+    # Enable pgvector if available
     async with pool.acquire() as conn:
+        try:
+            await conn.execute("CREATE EXTENSION IF NOT EXISTS vector;")
+            logger.info("pgvector extension enabled.")
+        except Exception as e:
+            logger.warning(f"pgvector not available (non-fatal): {e}")
+
+        # Create migrations table if not exists
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS schema_migrations (
                 version TEXT PRIMARY KEY,
