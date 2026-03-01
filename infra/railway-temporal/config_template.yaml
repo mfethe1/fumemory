@@ -1,0 +1,109 @@
+log:
+  stdout: true
+  level: {{ default "info" (env "LOG_LEVEL") }}
+
+persistence:
+  numHistoryShards: {{ default "4" (env "NUM_HISTORY_SHARDS") }}
+  defaultStore: default
+  visibilityStore: visibility
+  datastores:
+    default:
+      sql:
+        pluginName: {{ default "postgres12" (env "DB") }}
+        databaseName: {{ default "temporal" (env "DBNAME") | quote }}
+        connectAddr: "{{ env \"POSTGRES_SEEDS\" }}:{{ default \"5432\" (env \"DB_PORT\") }}"
+        connectProtocol: "tcp"
+        user: {{ env "POSTGRES_USER" | quote }}
+        password: {{ env "POSTGRES_PWD" | quote }}
+        maxConns: {{ default "20" (env "SQL_MAX_CONNS") }}
+        maxIdleConns: {{ default "20" (env "SQL_MAX_IDLE_CONNS") }}
+        maxConnLifetime: {{ default "1h" (env "SQL_MAX_CONN_TIME") }}
+    visibility:
+      sql:
+        pluginName: {{ default "postgres12" (env "DB") }}
+        databaseName: {{ default "temporal_visibility" (env "VISIBILITY_DBNAME") | quote }}
+        connectAddr: "{{ env \"POSTGRES_SEEDS\" }}:{{ default \"5432\" (env \"DB_PORT\") }}"
+        connectProtocol: "tcp"
+        user: {{ env "POSTGRES_USER" | quote }}
+        password: {{ env "POSTGRES_PWD" | quote }}
+        maxConns: {{ default "10" (env "SQL_VIS_MAX_CONNS") }}
+        maxIdleConns: {{ default "10" (env "SQL_VIS_MAX_IDLE_CONNS") }}
+        maxConnLifetime: {{ default "1h" (env "SQL_VIS_MAX_CONN_TIME") }}
+
+global:
+  membership:
+    maxJoinDuration: 30s
+    broadcastAddress: "127.0.0.1"
+  pprof:
+    port: {{ default "0" (env "PPROF_PORT") }}
+
+services:
+  frontend:
+    rpc:
+      grpcPort: 7233
+      membershipPort: 6933
+      bindOnIP: "0.0.0.0"
+      httpPort: 7243
+
+  matching:
+    rpc:
+      grpcPort: 0
+      membershipPort: 0
+      bindOnIP: "127.0.0.1"
+
+  history:
+    rpc:
+      grpcPort: 0
+      membershipPort: 0
+      bindOnIP: "127.0.0.1"
+
+  worker:
+    rpc:
+      grpcPort: 0
+      membershipPort: 0
+      bindOnIP: "127.0.0.1"
+
+clusterMetadata:
+  enableGlobalNamespace: false
+  failoverVersionIncrement: 10
+  masterClusterName: "active"
+  currentClusterName: "active"
+  clusterInformation:
+    active:
+      enabled: true
+      initialFailoverVersion: 1
+      rpcName: "frontend"
+      rpcAddress: "127.0.0.1:7233"
+      httpAddress: "127.0.0.1:7243"
+
+dcRedirectionPolicy:
+  policy: "noop"
+
+archival:
+  history:
+    state: "enabled"
+    enableRead: true
+    provider:
+      filestore:
+        fileMode: "0666"
+        dirMode: "0766"
+  visibility:
+    state: "enabled"
+    enableRead: true
+    provider:
+      filestore:
+        fileMode: "0666"
+        dirMode: "0766"
+
+namespaceDefaults:
+  archival:
+    history:
+      state: "disabled"
+      URI: "file:///tmp/temporal_archival/development"
+    visibility:
+      state: "disabled"
+      URI: "file:///tmp/temporal_vis_archival/development"
+
+dynamicConfigClient:
+  filepath: "{{ default \"/etc/temporal/config/dynamicconfig/docker.yaml\" (env \"DYNAMIC_CONFIG_FILE_PATH\") }}"
+  pollInterval: "60s"
