@@ -4,7 +4,6 @@ import os
 import asyncpg
 import json
 from temporalio import activity
-from memu.models import MemoryCreate
 import httpx
 
 # Helper to get DB connection
