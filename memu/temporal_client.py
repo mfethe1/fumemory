@@ -14,12 +14,13 @@ async def store_memory_workflow(content: str, agent_id: str, metadata: dict):
     try:
         client = await get_client()
         wf_id = f"memory-ingest-{agent_id}-{abs(hash(content))}"
-        return await client.execute_workflow(
+        handle = await client.start_workflow(
             MemoryIngestionWorkflow.run,
             args=[content, agent_id, metadata],
             id=wf_id,
             task_queue="memu-queue",
         )
+        return handle.id
     except Exception as e:
         logger.error(f"Failed to start store workflow: {e}")
         return None
