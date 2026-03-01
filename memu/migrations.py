@@ -12,40 +12,71 @@ async def run_migrations(pool: asyncpg.Pool):
         logger.warning("No migrations directory found.")
         return
 
-    # Enable pgvector if available
     async with pool.acquire() as conn:
+        # Enable pgvector if available (before any migrations)
         try:
             await conn.execute("CREATE EXTENSION IF NOT EXISTS vector;")
             logger.info("pgvector extension enabled.")
         except Exception as e:
             logger.warning(f"pgvector not available (non-fatal): {e}")
 
-        # Create migrations table if not exists
+        # Enable uuid-ossp (required by schema)
+        try:
+            await conn.execute('CREATE EXTENSION IF NOT EXISTS "uuid-ossp";')
+            logger.info("uuid-ossp extension enabled.")
+        except Exception as e:
+            logger.warning(f"uuid-ossp not available: {e}")
+
+        # Create migrations tracking table
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS schema_migrations (
                 version TEXT PRIMARY KEY,
-                applied_at TIMESTAMPTZ DEFAULT NOW()
+                applied_at TIMESTAMPTZ DEFAULT NOW(),
+                success BOOLEAN DEFAULT TRUE
             );
         """)
-        
-        # Get sorted list of sql files
+
+        # Add success column if it doesn't exist (upgrade from old schema)
+        await conn.execute("""
+            ALTER TABLE schema_migrations ADD COLUMN IF NOT EXISTS success BOOLEAN DEFAULT TRUE;
+        """)
+
         sql_files = sorted(migration_dir.glob("*.sql"))
-        
+
         for sql_file in sql_files:
             version = sql_file.name
-            
-            # Check if applied
-            row = await conn.fetchrow("SELECT 1 FROM schema_migrations WHERE version = $1", version)
-            if row:
+
+            # Only skip if previously applied successfully
+            row = await conn.fetchrow(
+                "SELECT success FROM schema_migrations WHERE version = $1", version
+            )
+            if row and row["success"]:
+                logger.debug(f"Migration {version} already applied, skipping.")
                 continue
-                
+
+            # Remove failed/partial record so we can retry
+            if row and not row["success"]:
+                await conn.execute("DELETE FROM schema_migrations WHERE version = $1", version)
+                logger.info(f"Retrying previously failed migration: {version}")
+
             logger.info(f"Applying migration: {version}")
             try:
                 sql = sql_file.read_text()
                 await conn.execute(sql)
-                await conn.execute("INSERT INTO schema_migrations (version) VALUES ($1)", version)
+                await conn.execute(
+                    "INSERT INTO schema_migrations (version, success) VALUES ($1, TRUE) "
+                    "ON CONFLICT (version) DO UPDATE SET success = TRUE, applied_at = NOW()",
+                    version,
+                )
                 logger.info(f"Migration {version} applied successfully.")
             except Exception as e:
                 logger.error(f"Migration {version} failed: {e}")
-                logger.warning(f"Migration startup failed: {e}")
-                # Continue to next migration instead of breaking startup
+                # Record failure so we retry next boot
+                try:
+                    await conn.execute(
+                        "INSERT INTO schema_migrations (version, success) VALUES ($1, FALSE) "
+                        "ON CONFLICT (version) DO UPDATE SET success = FALSE",
+                        version,
+                    )
+                except Exception:
+                    pass
