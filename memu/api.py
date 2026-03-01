@@ -932,7 +932,7 @@ async def recall_search(
     query: str | None = None,
     q: str | None = None,
     limit: int = 5,
-    agent_id: Optional[str] = None,
+    agent_id: str | None = None,
     _key: str = Depends(verify_api_key)
 ):
     """
