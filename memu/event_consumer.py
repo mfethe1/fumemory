@@ -24,8 +24,8 @@ import nats
 
 logger = logging.getLogger(__name__)
 
-NATS_LOCAL_URL = os.environ.get("NATS_LOCAL_URL", "nats://nats:4222")
-NATS_RAILWAY_URL = os.environ.get("NATS_RAILWAY_URL", "nats://nats-railway.railway.internal:4222")
+NATS_LOCAL_URL = os.environ.get("NATS_LOCAL_URL")
+NATS_RAILWAY_URL = os.environ.get("NATS_RAILWAY_URL")
 SUBJECTS = [
     "swarm.>",
 ]
@@ -51,6 +51,8 @@ async def _connect_with_fallback():
     last_error = None
 
     for url in (NATS_LOCAL_URL, NATS_RAILWAY_URL):
+        if not url:
+            continue
         try:
             nc = await nats.connect(url)
             logger.info("Connected to NATS: %s", url)

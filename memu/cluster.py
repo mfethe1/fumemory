@@ -25,6 +25,7 @@ import os
 import time
 from dataclasses import dataclass, field
 from enum import Enum
+from urllib.parse import urlparse
 from typing import Any, Callable, Coroutine
 
 import nats
@@ -51,14 +52,28 @@ class NodeHealth:
 
 
 class NATSClusterManager:
-    """Manages dual NATS connections with automatic failover.
+    """Manages dual NATS connections with automatic failover."""
 
-    - Connects to both local and Railway NATS instances
-    - Routes traffic to the healthiest node (lowest latency)
-    - Automatic failover: if primary dies, switch to secondary in <100ms
-    - Automatic recovery: when primary returns, gradually shift traffic back
-    - Health monitoring with configurable ping interval
-    """
+    @staticmethod
+    def _clean_url(value: str | None) -> str | None:
+        if not value:
+            return None
+        value = value.strip()
+        if not value or value.lower() in {"none", "null", "undefined", "-", "-1"}:
+            return None
+        # Ignore known placeholder hostnames that aren't valid in production envs
+        placeholder_hosts = {
+            "nats",
+            "nats.railway.internal",
+            "nats-railway.railway.internal",
+        }
+        parsed = urlparse(value)
+        host = parsed.hostname
+        if not host:
+            return value
+        if host in placeholder_hosts:
+            return None
+        return value
 
     def __init__(
         self,
@@ -68,25 +83,22 @@ class NATSClusterManager:
         failover_threshold_ms: float = 500.0,
         auth_token: str | None = None,
     ):
-        self.local_url = local_url or os.environ.get(
-            "NATS_LOCAL_URL", "nats://localhost:4222"
-        )
-        self.railway_url = railway_url or os.environ.get(
-            "NATS_RAILWAY_URL", "nats://nats.railway.internal:4222"
-        )
+        self.local_url = self._clean_url(local_url or os.environ.get("NATS_LOCAL_URL"))
+        self.railway_url = self._clean_url(railway_url or os.environ.get("NATS_RAILWAY_URL"))
         self.ping_interval_s = ping_interval_s
         self.failover_threshold_ms = failover_threshold_ms
         self.auth_token = auth_token or os.environ.get("NATS_AUTH_TOKEN")
 
         self._connections: dict[ClusterNode, NATSClient] = {}
         self._jetstreams: dict[ClusterNode, JetStreamContext] = {}
-        self._health: dict[ClusterNode, NodeHealth] = {
-            ClusterNode.LOCAL: NodeHealth(node=ClusterNode.LOCAL, url=self.local_url),
-            ClusterNode.RAILWAY: NodeHealth(node=ClusterNode.RAILWAY, url=self.railway_url),
-        }
         self._active_node: ClusterNode = ClusterNode.LOCAL
         self._monitor_task: asyncio.Task | None = None
         self._on_failover_callbacks: list[Callable] = []
+
+        self._health: dict[ClusterNode, NodeHealth] = {
+            ClusterNode.LOCAL: NodeHealth(node=ClusterNode.LOCAL, url=self.local_url or ""),
+            ClusterNode.RAILWAY: NodeHealth(node=ClusterNode.RAILWAY, url=self.railway_url or ""),
+        }
 
     async def __aenter__(self):
         await self.connect()
@@ -144,20 +156,27 @@ class NATSClusterManager:
 
     async def connect(self):
         """Connect to both NATS instances concurrently."""
+        connect_targets = []
+        if self.local_url:
+            connect_targets.append((ClusterNode.LOCAL, self.local_url))
+        if self.railway_url:
+            connect_targets.append((ClusterNode.RAILWAY, self.railway_url))
+
+        if not connect_targets:
+            raise ConnectionError("No NATS URLs configured")
+
         tasks = [
-            self._connect_node(ClusterNode.LOCAL, self.local_url),
-            self._connect_node(ClusterNode.RAILWAY, self.railway_url),
+            self._connect_node(node, url)
+            for node, url in connect_targets
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        connected = sum(
-            1 for r in results if not isinstance(r, Exception)
-        )
+        connected = sum(1 for r in results if not isinstance(r, Exception))
 
         if connected == 0:
             raise ConnectionError(
-                f"Failed to connect to any NATS instance. "
-                f"Local: {results[0]}, Railway: {results[1]}"
+                "Failed to connect to any NATS instance. "
+                f"Configured local={self.local_url}, railway={self.railway_url}"
             )
 
         # Prefer local if both connected

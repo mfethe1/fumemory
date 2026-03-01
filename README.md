@@ -292,7 +292,7 @@ memU supports dual-instance failover via NATS:
 ```bash
 # Configure in .env
 NATS_LOCAL_URL=nats://localhost:4222
-NATS_RAILWAY_URL=nats://nats.railway.internal:4222
+NATS_RAILWAY_URL=nats://gondola.proxy.rlwy.net:22393
 ```
 
 See `docs/MULTI_MACHINE.md` for full setup.
@@ -334,7 +334,7 @@ DEDUP_THRESHOLD=0.95
 
 # NATS clustering
 NATS_LOCAL_URL=nats://localhost:4222
-NATS_RAILWAY_URL=nats://nats.railway.internal:4222
+NATS_RAILWAY_URL=nats://gondola.proxy.rlwy.net:22393
 ```
 
 ---
