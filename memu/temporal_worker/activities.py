@@ -24,39 +24,56 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 
 
 async def _embedding_from_http(text: str) -> list[float] | None:
-    """Try OpenAI-compatible endpoint (/v1/embeddings), including Ollama."""
+    """Try OpenAI-compatible endpoint (/v1/embeddings), including Ollama compatibility."""
     # Only attempt remote embedding call for explicit providers.
     if not OPENAI_API_KEY and "ollama" not in EMBEDDING_BASE_URL:
         return None
 
-    url = f"{EMBEDDING_BASE_URL.rstrip('/')}/v1/embeddings"
+    base = EMBEDDING_BASE_URL.rstrip("/")
     headers = {"Content-Type": "application/json"}
     if OPENAI_API_KEY:
         headers["Authorization"] = f"Bearer {OPENAI_API_KEY}"
 
-    try:
-        async with httpx.AsyncClient(timeout=90.0) as client:
-            resp = await client.post(
-                url,
-                headers=headers,
-                json={
-                    "input": text,
-                    "model": EMBEDDING_MODEL,
-                    "dimensions": EMBEDDING_DIMS,
-                },
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            emb = data["data"][0]["embedding"]
-            if len(emb) == EMBEDDING_DIMS:
-                return emb
-            activity.logger.warning(
-                "Embedding dim mismatch from remote provider: got=%d expected=%d",
-                len(emb),
-                EMBEDDING_DIMS,
-            )
-    except Exception as e:
-        activity.logger.warning("Remote embedding request failed: %s", e)
+    async def _try(url: str, payload: dict) -> list[float] | None:
+        try:
+            async with httpx.AsyncClient(timeout=90.0) as client:
+                resp = await client.post(url, headers=headers, json=payload)
+                resp.raise_for_status()
+                data = resp.json()
+                emb = data.get("data", [{}])[0].get("embedding")
+                if emb is not None:
+                    return emb
+        except Exception as e:
+            activity.logger.warning("Remote embedding request failed (%s): %s", url, e)
+        return None
+
+    emb = await _try(
+        f"{base}/v1/embeddings",
+        {
+            "input": text,
+            "model": EMBEDDING_MODEL,
+            "dimensions": EMBEDDING_DIMS,
+        },
+    )
+    if emb is not None and len(emb) == EMBEDDING_DIMS:
+        return emb
+
+    emb = await _try(
+        f"{base}/api/embeddings",
+        {
+            "model": EMBEDDING_MODEL,
+            "prompt": text,
+        },
+    )
+    if emb is not None and len(emb) == EMBEDDING_DIMS:
+        return emb
+    if emb is not None:
+        activity.logger.warning(
+            "Embedding dim mismatch from remote provider: got=%d expected=%d",
+            len(emb),
+            EMBEDDING_DIMS,
+        )
+
     return None
 
 

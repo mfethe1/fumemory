@@ -129,27 +129,44 @@ async def get_embedding(text: str) -> list[float] | None:
     """Get embedding vector from any OpenAI-compatible API (Ollama, OpenAI, etc.).
     Falls back to FastEmbed (local) if API fails, then None if both fail."""
 
-    # 1. Try OpenAI/Ollama API
+    # 1. Try OpenAI-compatible /v1 or Ollama /api endpoint
     if OPENAI_API_KEY or "ollama" in EMBEDDING_BASE_URL:
-        url = f"{EMBEDDING_BASE_URL.rstrip('/')}/v1/embeddings"
         headers = {"Content-Type": "application/json"}
         if OPENAI_API_KEY:
             headers["Authorization"] = f"Bearer {OPENAI_API_KEY}"
 
-        try:
-            async with httpx.AsyncClient(timeout=120.0) as client:
-                r = await client.post(
-                    url,
-                    headers=headers,
-                    json={"input": text, "model": EMBEDDING_MODEL, "dimensions": EMBEDDING_DIMS},
-                )
-                r.raise_for_status()
-                emb = r.json()["data"][0]["embedding"]
-                if len(emb) == EMBEDDING_DIMS:
-                    return emb
-                logger.warning("Primary embedding dim mismatch: got %d, expected %d", len(emb), EMBEDDING_DIMS)
-        except Exception as e:
-            logger.warning("Primary embedding API failed (%s), trying FastEmbed fallback", e)
+        async def _try_embedding(url: str, body: dict) -> list[float] | None:
+            try:
+                async with httpx.AsyncClient(timeout=120.0) as client:
+                    r = await client.post(url, headers=headers, json=body)
+                    r.raise_for_status()
+                    if "data" in r.json() and r.json()["data"]:
+                        emb = r.json()["data"][0].get("embedding")
+                        if emb is not None:
+                            return emb
+            except Exception as e:
+                logger.debug("Embedding probe failed for %s: %s", url, e)
+            return None
+
+        # Modern Ollama/OpenAI-compatible endpoint
+        emb = await _try_embedding(
+            f"{EMBEDDING_BASE_URL.rstrip('/')}/v1/embeddings",
+            {"input": text, "model": EMBEDDING_MODEL, "dimensions": EMBEDDING_DIMS},
+        )
+        if emb is not None and len(emb) == EMBEDDING_DIMS:
+            return emb
+
+        # Legacy Ollama endpoint (some self-hosted builds still use this shape)
+        emb = await _try_embedding(
+            f"{EMBEDDING_BASE_URL.rstrip('/')}/api/embeddings",
+            {"model": EMBEDDING_MODEL, "prompt": text},
+        )
+        if emb is not None and len(emb) == EMBEDDING_DIMS:
+            return emb
+        if emb is not None:
+            logger.warning("Primary embedding dim mismatch: got %d, expected %d", len(emb), EMBEDDING_DIMS)
+
+        logger.warning("Primary embedding API failed, trying FastEmbed fallback")
 
     # 2. Try FastEmbed (Local fallback)
     global _fastembed_model
