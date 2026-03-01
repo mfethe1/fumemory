@@ -303,6 +303,29 @@ async def create_memory(req: MemoryCreate, _key: str = Depends(verify_api_key)):
     return memory
 
 
+@app.get("/memories/search")
+async def memories_search_compat(
+    q: str,
+    agent: str | None = None,
+    agent_id: str | None = None,
+    memory_type: str | None = None,
+    min_confidence: float = 0.0,
+    limit: int = 10,
+    temporal_weight: float = DECAY_RATE,
+    _key: str = Depends(verify_api_key),
+):
+    """Backward-compatible GET alias for memory search."""
+    req = SearchRequest(
+        query=q,
+        limit=limit,
+        agent_id=agent_id or agent,
+        memory_type=_coerce_memory_type(memory_type),
+        min_confidence=min_confidence,
+        temporal_weight=temporal_weight,
+    )
+    return await search_memories(req, _key=_key)
+
+
 @app.get("/memories/{memory_id}", response_model=Memory)
 async def get_memory(memory_id: UUID, _key: str = Depends(verify_api_key)):
     async with pool.acquire() as conn:
@@ -472,29 +495,6 @@ async def search_memories(req: SearchRequest, _key: str = Depends(verify_api_key
             logger.warning("NATS publish failed for search: %s", e)
 
     return final
-
-
-@app.get("/memories/search")
-async def memories_search_compat(
-    q: str,
-    agent: str | None = None,
-    agent_id: str | None = None,
-    memory_type: str | None = None,
-    min_confidence: float = 0.0,
-    limit: int = 10,
-    temporal_weight: float = DECAY_RATE,
-    _key: str = Depends(verify_api_key),
-):
-    """Backward-compatible GET alias for memory search."""
-    req = SearchRequest(
-        query=q,
-        limit=limit,
-        agent_id=agent_id or agent,
-        memory_type=_coerce_memory_type(memory_type),
-        min_confidence=min_confidence,
-        temporal_weight=temporal_weight,
-    )
-    return await search_memories(req, _key=_key)
 
 
 @app.get("/api/v1/memu/search")
