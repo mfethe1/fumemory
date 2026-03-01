@@ -1,11 +1,5 @@
-# memu/temporal_worker/workflows.py
 from datetime import timedelta
 from temporalio import workflow
-
-# Use string-based activity references to avoid sandbox validation issues.
-# Activity names must match the function names decorated with @activity.defn
-# in activities.py (generate_embedding, store_memory, search_memory, log_audit).
-
 
 @workflow.defn
 class MemoryIngestionWorkflow:
