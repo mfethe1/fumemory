@@ -1,9 +1,17 @@
-# memu/migrations/005_reduce_embedding_dims.sql
--- Reduce vector dimensions to 1536 for compatibility with standard pgvector index limits (2000)
--- This assumes we switch embedding model to standard size or truncate
-ALTER TABLE search_history
-ALTER COLUMN embedding TYPE vector(1536);
+-- Compatibility migration: enforce 4096-dim embeddings for search_history.
+-- Note: pgvector index backends have limits; index creation is handled elsewhere.
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1
+    FROM information_schema.columns
+    WHERE table_schema='public'
+      AND table_name='search_history'
+      AND column_name='embedding'
+  ) THEN
+    ALTER TABLE search_history ALTER COLUMN embedding TYPE vector(4096);
+  END IF;
+END
+$$;
 
--- Recreate index with new dimensions
 DROP INDEX IF EXISTS idx_search_history_embedding;
-CREATE INDEX idx_search_history_embedding ON search_history USING hnsw (embedding vector_cosine_ops);

@@ -61,6 +61,7 @@ services:
       OPENAI_API_KEY: ${OPENAI_API_KEY}
       EMBEDDING_BASE_URL: http://ollama:11434
       EMBEDDING_MODEL: ${EMBEDDING_MODEL:-qwen3-embedding}
+      EMBEDDING_DIMS: ${EMBEDDING_DIMS:-4096}
       NATS_LOCAL_URL: nats://nats:4222
       NATS_RAILWAY_URL: ${NATS_RAILWAY_URL:-nats://nats:4222}
     depends_on:

@@ -96,10 +96,10 @@ async def run_tests():
         # 7. Bulk Import
         print("\n=== 7. Bulk Import ===")
         r = await c.post(f"{BASE}/memories/bulk", headers=HEADERS, json={
-            "memories": [
-                {"content": f"[TEST] bulk item 1 {time.time()}", "memory_type": "lesson", "agent_id": "lenny"},
-                {"content": f"[TEST] bulk item 2 {time.time()}", "memory_type": "decision", "agent_id": "lenny"},
-            ]
+            "content": f"[TEST] bulk item 1 {time.time()}\n[TEST] bulk item 2 {time.time()}",
+            "split_on": "\n",
+            "memory_type": "lesson",
+            "agent_id": "lenny",
         })
         log("Bulk import", r.status_code == 200, f"HTTP {r.status_code}")
 

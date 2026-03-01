@@ -222,11 +222,12 @@ async def create_memory(req: MemoryCreate, _key: str = Depends(verify_api_key)):
     async with pool.acquire() as conn:
         # Check for duplicates (content hash always works; vector similarity only when embedding available)
         if embedding is not None:
+            vec = f"vector({EMBEDDING_DIMS})"
             existing = await conn.fetchrow(
-                """
-                SELECT id, 1 - (embedding <=> $1::vector) AS similarity
+                f"""
+                SELECT id, 1 - (embedding <=> $1::{vec}) AS similarity
                 FROM memories
-                WHERE content_hash = $2 OR (1 - (embedding <=> $1::vector)) > $3
+                WHERE content_hash = $2 OR (1 - (embedding <=> $1::{vec})) > $3
                 ORDER BY similarity DESC
                 LIMIT 1
                 """,
@@ -387,12 +388,13 @@ async def search_memories(req: SearchRequest, _key: str = Depends(verify_api_key
 
     where = (" AND " + " AND ".join(filters)) if filters else ""
     async with pool.acquire() as conn:
+        vec = f"vector({EMBEDDING_DIMS})"
         rows = await conn.fetch(
             f"""
-            SELECT *, 1 - (embedding <=> $1::vector) AS similarity
+            SELECT *, 1 - (embedding <=> $1::{vec}) AS similarity
             FROM memories
             WHERE embedding IS NOT NULL{where}
-            ORDER BY embedding <=> $1::vector
+            ORDER BY embedding <=> $1::{vec}
             LIMIT {req.limit * 3}
             """,
             *params,
@@ -434,7 +436,7 @@ async def search_memories(req: SearchRequest, _key: str = Depends(verify_api_key
             await conn.execute(
                 """
                 INSERT INTO search_history (query, agent_id, results_count, search_type, metadata, embedding)
-                VALUES ($1, $2, $3, $4, $5::jsonb, $6::vector)
+                VALUES ($1, $2, $3, $4, $5::jsonb, $6)
                 """,
                 req.query,
                 req.agent_id or "system",
@@ -688,14 +690,15 @@ async def temporal_search_endpoint(
     where = " AND ".join(filters)
 
     async with pool.acquire() as conn:
+        vec = f"vector({EMBEDDING_DIMS})"
         rows = await conn.fetch(
             f"""
             SELECT *,
-                1 - (embedding <=> $1::vector) AS similarity,
+                1 - (embedding <=> $1::{vec}) AS similarity,
                 EXTRACT(EPOCH FROM (NOW() - created_at)) / 86400.0 AS age_days
             FROM memories
             WHERE embedding IS NOT NULL AND {where}
-            ORDER BY embedding <=> $1::vector
+            ORDER BY embedding <=> $1::{vec}
             LIMIT {limit * 3}
             """,
             *params,
@@ -847,10 +850,6 @@ async def notion_health(_key: str = Depends(verify_api_key)):
 
 
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
-
 # --- Search Vault / Recall Endpoints ---
 
 @app.get("/search/recall")
@@ -858,7 +857,7 @@ async def recall_search(
     query: str, 
     limit: int = 5,
     agent_id: Optional[str] = None,
-    api_key: str = Security(get_api_key)
+    _key: str = Depends(verify_api_key)
 ):
     """
     Search the Vault (search_history) for similar past searches.
@@ -870,20 +869,27 @@ async def recall_search(
         logger.error(f"Failed to embed query: {e}")
         raise HTTPException(status_code=500, detail="Embedding failure")
 
-    async with app.state.pool.acquire() as conn:
+    if pool is None:
+        raise HTTPException(status_code=503, detail="Database not initialized")
+
+    async with pool.acquire() as conn:
+        vec = f"vector({EMBEDDING_DIMS})"
         rows = await conn.fetch(
-            """
+            f"""
             SELECT query, agent_id, created_at, results_count, 
-                   1 - (embedding <=> $1) as similarity
+                   1 - (embedding <=> $1::{vec}) as similarity
             FROM search_history
             WHERE embedding IS NOT NULL
-            ORDER BY embedding <=> $1
+            ORDER BY embedding <=> $1::{vec}
             LIMIT $2
             """,
-            embedding, limit
+            str(embedding),
+            limit,
         )
         
     return [dict(r) for r in rows]
 
-# Note: /search endpoint logic must be updated to use ingest_web_search (vector version)
-# This assumes ingest_web_search is imported and used in the search route handler.
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
