@@ -16,7 +16,7 @@ async def store_memory_workflow(content: str, agent_id: str, metadata: dict):
         wf_id = f"memory-ingest-{agent_id}-{abs(hash(content))}"
         return await client.execute_workflow(
             MemoryIngestionWorkflow.run,
-            content, agent_id, metadata,
+            args=[content, agent_id, metadata],
             id=wf_id,
             task_queue="memu-queue",
         )
@@ -30,7 +30,7 @@ async def search_memory_workflow(query: str, agent_id: str):
         wf_id = f"memory-search-{agent_id}-{abs(hash(query))}"
         return await client.execute_workflow(
             MemorySearchWorkflow.run,
-            query, agent_id,
+            args=[query, agent_id],
             id=wf_id,
             task_queue="memu-queue",
         )
