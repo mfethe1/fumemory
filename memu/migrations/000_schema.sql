@@ -6,7 +6,7 @@ CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 CREATE TABLE IF NOT EXISTS memories (
     id            UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     content       TEXT NOT NULL,
-    embedding     vector(4096),  -- qwen3-embedding dimensions
+    embedding     vector(1536),  -- qwen3-embedding dimensions
     memory_type   VARCHAR(20) NOT NULL DEFAULT 'fact'
                   CHECK (memory_type IN ('fact', 'decision', 'lesson', 'pattern', 'failure')),
     agent_id      VARCHAR(64),
@@ -21,7 +21,7 @@ CREATE TABLE IF NOT EXISTS memories (
 );
 
 -- Indexes
-CREATE INDEX IF NOT EXISTS idx_memories_embedding ON memories USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
+CREATE INDEX IF NOT EXISTS idx_memories_embedding ON memories USING hnsw (embedding vector_cosine_ops);
 CREATE INDEX IF NOT EXISTS idx_memories_agent_id ON memories (agent_id);
 CREATE INDEX IF NOT EXISTS idx_memories_type ON memories (memory_type);
 CREATE INDEX IF NOT EXISTS idx_memories_parent ON memories (parent_id);
