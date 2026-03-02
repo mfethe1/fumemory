@@ -107,6 +107,7 @@ async def _embedding_from_fastembed(text: str) -> list[float] | None:
     return None
 
 
+@activity.defn
 async def generate_embedding(text: str) -> list[float] | None:
     """Generate embedding vector (activity wrapper)."""
     # Mirror API behavior: prefer remote embedding API, then local FastEmbed fallback.
