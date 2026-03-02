@@ -1,12 +1,10 @@
-FROM ollama/ollama:latest
+﻿FROM ollama/ollama:latest
 
-# Railway private networking uses IPv6 — bind both
 ENV OLLAMA_HOST=[::]
 
-# Bake the embedding model into the image at build time
-# so it survives container restarts (no persistent volume needed)
+# Bake model at build time with longer startup wait
 RUN ollama serve & \
-    sleep 8 && \
+    for i in $(seq 1 30); do sleep 2 && ollama list 2>/dev/null && break; done && \
     ollama pull qwen3-embedding && \
     pkill ollama || true
 
