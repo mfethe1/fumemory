@@ -5,10 +5,10 @@ import logging
 from temporalio.client import Client
 from temporalio.worker import Worker
 from memu.temporal_worker.activities import (
-    StoreMemoryActivity,
-    SearchMemoryActivity,
-    LogAuditActivity,
-    GenerateEmbeddingActivity
+    store_memory,
+    search_memory,
+    log_audit,
+    generate_embedding,
 )
 from memu.temporal_worker.workflows import MemoryIngestionWorkflow, MemorySearchWorkflow
 
@@ -30,10 +30,10 @@ async def main():
         task_queue="memu-queue",
         workflows=[MemoryIngestionWorkflow, MemorySearchWorkflow],
         activities=[
-            StoreMemoryActivity,
-            SearchMemoryActivity,
-            LogAuditActivity,
-            GenerateEmbeddingActivity
+            store_memory,
+            search_memory,
+            log_audit,
+            generate_embedding
         ],
     )
     
@@ -43,3 +43,5 @@ async def main():
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     asyncio.run(main())
+
+
