@@ -145,7 +145,7 @@ async def get_embedding(text: str) -> list[float] | None:
                         if emb is not None:
                             return emb
             except Exception as e:
-                logger.debug("Embedding probe failed for %s: %s", url, e)
+                logger.warning("Embedding probe failed for %s: %s", url, e)
             return None
 
         # Modern Ollama/OpenAI-compatible endpoint
