@@ -140,10 +140,13 @@ async def get_embedding(text: str) -> list[float] | None:
                 async with httpx.AsyncClient(timeout=120.0) as client:
                     r = await client.post(url, headers=headers, json=body)
                     r.raise_for_status()
-                    if "data" in r.json() and r.json()["data"]:
-                        emb = r.json()["data"][0].get("embedding")
+                    res = r.json()
+                    if "data" in res and res["data"]:
+                        emb = res["data"][0].get("embedding")
                         if emb is not None:
                             return emb
+                    if "embedding" in res:
+                        return res["embedding"]
             except Exception as e:
                 logger.warning("Embedding probe failed for %s: %s", url, e)
             return None

@@ -40,9 +40,12 @@ async def _embedding_from_http(text: str) -> list[float] | None:
                 resp = await client.post(url, headers=headers, json=payload)
                 resp.raise_for_status()
                 data = resp.json()
-                emb = data.get("data", [{}])[0].get("embedding")
-                if emb is not None:
-                    return emb
+                if "data" in data and data["data"]:
+                    emb = data["data"][0].get("embedding")
+                    if emb is not None:
+                        return emb
+                if "embedding" in data:
+                    return data["embedding"]
         except Exception as e:
             activity.logger.warning("Remote embedding request failed (%s): %s", url, e)
         return None
