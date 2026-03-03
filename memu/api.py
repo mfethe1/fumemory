@@ -1227,17 +1227,28 @@ async def forensics_playback(task_id: str, _key: str = Depends(verify_api_key)):
 
     async with pool.acquire() as conn:
         # Get all decision/execution events for this task
-        events = await conn.fetch(
-            """
-            SELECT event_id, timestamp, gateway_id, event_type, payload, signature
-            FROM events
-            WHERE task_id = $1::uuid
-              AND event_type IN ('decision_made', 'task_completed', 'task_failed', 
-                                 'rollback_executed', 'dlq_enqueued')
-            ORDER BY timestamp ASC
-            """,
-            task_id,
-        )
+        # Note: events table may not exist in memU-only deployments
+        try:
+            events = await conn.fetch(
+                """
+                SELECT event_id, timestamp, gateway_id, event_type, payload, signature
+                FROM events
+                WHERE task_id = $1::uuid
+                  AND event_type IN ('decision_made', 'task_completed', 'task_failed', 
+                                     'rollback_executed', 'dlq_enqueued')
+                ORDER BY timestamp ASC
+                """,
+                task_id,
+            )
+        except Exception as e:
+            # events table doesn't exist in this environment
+            return {
+                "task_id": task_id,
+                "timeline": [],
+                "decision_count": 0,
+                "generated_at": dt.now().isoformat(),
+                "note": f"Events table not available in this environment: {e}",
+            }
 
         for event in events:
             ts = event["timestamp"]
