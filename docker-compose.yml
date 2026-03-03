@@ -78,11 +78,12 @@ services:
       - "7233:7233"
       - "8233:8233"
     environment:
-      - DB=postgresql
+      - DB=postgres12_pgx
       - DB_PORT=5432
       - POSTGRES_USER=memu
       - POSTGRES_PWD=memu
       - POSTGRES_DB=temporal
+      - POSTGRES_SEEDS=postgres
     depends_on:
       postgres:
         condition: service_healthy

@@ -19,7 +19,7 @@ def get_db_url():
 
 EMBEDDING_BASE_URL = os.environ.get("EMBEDDING_BASE_URL", "http://localhost:11434")
 EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "qwen3-embedding")
-EMBEDDING_DIMS = int(os.environ.get("EMBEDDING_DIMS", "1536"))
+EMBEDDING_DIMS = int(os.environ.get("EMBEDDING_DIMS", "4096"))
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 
 

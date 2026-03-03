@@ -17,9 +17,10 @@ logger = logging.getLogger(__name__)
 async def main():
     # Connect to Temporal server
     host = os.environ.get("TEMPORAL_HOST", "localhost:7233")
+    use_tls = os.environ.get("TEMPORAL_TLS", "").lower() == "true" or "443" in host
     try:
-        client = await Client.connect(host)
-        logger.info(f"Connected to Temporal at {host}")
+        client = await Client.connect(host, tls=use_tls)
+        logger.info(f"Connected to Temporal at {host} (tls={use_tls})")
     except Exception as e:
         logger.error(f"Failed to connect to Temporal: {e}")
         return

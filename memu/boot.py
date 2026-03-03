@@ -161,10 +161,11 @@ async def _summarize(client, text: str, max_tokens: int) -> str:
 
 
 async def register_with_mesh():
-    """Connect to NATS and announce this gateway's capabilities."""
+    """Connect to NATS, generate signing keypair, and announce this gateway's capabilities."""
     import nats
 
     from memu.cluster import NATSClusterManager
+    from memu.crypto import GatewayKeyPair, get_backend
     from memu.swarm_models import GatewayAnnounce, GatewayStatus
 
     cluster = NATSClusterManager(
@@ -172,6 +173,23 @@ async def register_with_mesh():
         railway_url=NATS_RAILWAY_URL,
     )
     await cluster.connect()
+
+    # === Ed25519 Keypair Generation (Cryptographic Compliance) ===
+    keypair = None
+    if get_backend() != "none":
+        keypair = GatewayKeyPair()
+        logger.info(
+            f"Ed25519 keypair generated for {GATEWAY_ID} "
+            f"(backend={get_backend()}, pubkey={keypair.public_key_hex[:16]}...)"
+        )
+    else:
+        logger.warning(
+            "No crypto backend available — install PyNaCl or cryptography. "
+            "Events will be published unsigned."
+        )
+
+    # Store keypair on cluster for use by NATSEventPublisher
+    cluster._gateway_keypair = keypair
 
     # === SUICIDE SIGNAL LISTENER (Lenny's Split-Brain Fix) ===
     # High-priority listener: if this gateway's ID appears on the suicide channel,
@@ -198,7 +216,7 @@ async def register_with_mesh():
     await nc.subscribe("swarm.advisory.suicide.*", cb=_suicide_handler)
     logger.info(f"Suicide signal listener active on swarm.advisory.suicide.{GATEWAY_ID}")
 
-    # Announce presence
+    # Announce presence (include public key for signature verification)
     announce = GatewayAnnounce(
         gateway_id=GATEWAY_ID,
         capabilities=[],  # Populated by the gateway's tool registry
@@ -207,6 +225,8 @@ async def register_with_mesh():
             "role": GATEWAY_ROLE,
             "boot_time": datetime.now(timezone.utc).isoformat(),
             "task_id": TASK_ID,
+            "public_key": keypair.public_key_hex if keypair else None,
+            "crypto_backend": get_backend(),
         },
     )
 

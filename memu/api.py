@@ -1,5 +1,4 @@
-﻿from datetime import datetime, timezone
-"""memU API â€” FastAPI application."""
+﻿"""memU API â€” FastAPI application."""
 
 from __future__ import annotations
 
@@ -19,6 +18,14 @@ from fastapi.security import APIKeyHeader
 from pydantic import BaseModel
 
 from memu.decay import compute_final_score, should_deduplicate
+
+# --- Logging Config ---
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
+# Reduce noise from verbose libraries
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("fastembed").setLevel(logging.WARNING)
 from memu.cluster import NATSClusterManager
 from memu.nats_publisher import NATSEventPublisher
 from memu.models import (
@@ -39,6 +46,13 @@ from memu.models import (
 from memu.notion_bridge import create_bridge_from_env, NotionBridge
 from memu.migrations import run_migrations
 from memu.temporal_routes import router as temporal_router
+from memu.tenancy import (
+    resolve_tenant_id,
+    tenant_connection,
+    tenant_transaction,
+    DEFAULT_TENANT_ID,
+    SINGLE_TENANT_MODE,
+)
 
 # --- Config ---
 
@@ -47,7 +61,7 @@ MEMU_API_KEY = os.environ.get("MEMU_API_KEY", "memu-dev-key")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 EMBEDDING_BASE_URL = os.environ.get("EMBEDDING_BASE_URL", "http://localhost:11434")
 EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "qwen3-embedding")
-EMBEDDING_DIMS = int(os.environ.get("EMBEDDING_DIMS", "1536"))
+EMBEDDING_DIMS = int(os.environ.get("EMBEDDING_DIMS", "4096"))
 DEDUP_THRESHOLD = float(os.environ.get("DEDUP_THRESHOLD", "0.95"))
 DECAY_RATE = float(os.environ.get("DECAY_RATE", "0.01"))
 
@@ -107,11 +121,47 @@ app.include_router(temporal_router, tags=["Async Workflows"])
 
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
+# ---------------------------------------------------------------------------
+# Tenant resolution + RLS enforcement
+# Uses tenancy.py module for core logic. API key â†’ tenant_id â†’ RLS context.
+# ---------------------------------------------------------------------------
 
-async def verify_api_key(key: str | None = Security(api_key_header)) -> str:
+
+class AuthContext(str):
+    """Authenticated request context with tenant information.
+    
+    Extends str for backward compatibility â€” existing endpoints that
+    type-hint `_key: str` will still work. Access tenant_id via .tenant_id.
+    """
+    tenant_id: UUID
+
+    def __new__(cls, api_key: str, tenant_id: UUID | None = None):
+        instance = super().__new__(cls, api_key)
+        instance.tenant_id = tenant_id or DEFAULT_TENANT_ID
+        return instance
+
+
+async def verify_api_key(key: str | None = Security(api_key_header)) -> AuthContext:
+    """Verify API key and resolve tenant context for RLS."""
     if not key or key != MEMU_API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
-    return key
+    tid = await resolve_tenant_id(pool, key) if pool else DEFAULT_TENANT_ID
+    return AuthContext(api_key=key, tenant_id=tid)
+
+
+async def _tenant_conn(auth: AuthContext):
+    """Helper: acquire a tenant-scoped connection (sets RLS context).
+    
+    Usage in endpoints:
+        auth = Depends(verify_api_key)
+        async with _tenant_conn(auth) as conn:
+            rows = await conn.fetch("SELECT * FROM memories")  # RLS filters
+    """
+    async with tenant_connection(pool, auth.tenant_id) as conn:
+        yield conn
+
+# TODO: MCP_MOUNT â€” Rosie to mount MCP server here
+# TODO: OTEL_STARTUP â€” Macklemore to wire OTel exporter into lifespan
 
 
 def _coerce_memory_type(raw: str | None) -> MemoryType | None:
@@ -290,10 +340,12 @@ async def create_memory(req: MemoryCreate, _key: str = Depends(verify_api_key)):
                 json.dumps(req.metadata) if req.metadata else "{}",
             )
         else:
+            # Include tenant_id for RLS multi-tenancy
+            tenant_id = getattr(_key, 'tenant_id', DEFAULT_TENANT_ID)
             row = await conn.fetchrow(
                 """
-                INSERT INTO memories (content, embedding, memory_type, agent_id, metadata, parent_id, confidence, content_hash)
-                VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8)
+                INSERT INTO memories (content, embedding, memory_type, agent_id, metadata, parent_id, confidence, content_hash, tenant_id)
+                VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9)
                 RETURNING *
                 """,
                 req.content,
@@ -304,6 +356,7 @@ async def create_memory(req: MemoryCreate, _key: str = Depends(verify_api_key)):
                 req.parent_id,
                 req.confidence,
                 c_hash,
+                tenant_id,
             )
 
     memory = _row_to_memory(row)
@@ -481,12 +534,9 @@ async def search_memories(req: SearchRequest, _key: str = Depends(verify_api_key
     results.sort(key=lambda r: r.final_score, reverse=True)
     final = results[: req.limit]
 
-    # Audit Trail: Log Search History
+    # Audit Trail: Log Search History (reuse the embedding we already computed)
     try:
-        # Get embedding for query if available
-        emb = await get_embedding(req.query)
-        emb_str = str(emb) if emb else None
-        
+        emb_str = str(embedding) if embedding else None
         async with pool.acquire() as conn:
             await conn.execute(
                 """
@@ -501,7 +551,8 @@ async def search_memories(req: SearchRequest, _key: str = Depends(verify_api_key
                 emb_str
             )
     except Exception as e:
-        logger.error(f"Failed to log search history: {e}")
+        # Log at debug level â€” search_history logging failure is non-critical
+        logger.debug(f"Failed to log search history: {e}")
 
     # Publish search event to NATS
     if _nats_publisher:
@@ -667,11 +718,12 @@ async def bulk_import(req: BulkImportRequest, _key: str = Depends(verify_api_key
 
 @app.post("/tasks", response_model=Task)
 async def create_task(req: TaskCreate, _key: str = Depends(verify_api_key)):
+    tenant_id = getattr(_key, 'tenant_id', DEFAULT_TENANT_ID)
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
-            INSERT INTO backlog (task, priority, owner_id, lane, metadata, dependency_id)
-            VALUES ($1, $2, $3, $4, $5::jsonb, $6)
+            INSERT INTO backlog (task, priority, owner_id, lane, metadata, dependency_id, tenant_id)
+            VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7)
             RETURNING *
             """,
             req.task,
@@ -680,6 +732,7 @@ async def create_task(req: TaskCreate, _key: str = Depends(verify_api_key)):
             req.lane,
             json.dumps(req.metadata) if req.metadata else "{}",
             req.dependency_id,
+            tenant_id,
         )
     return _row_to_task(row)
 
@@ -935,6 +988,313 @@ async def notion_health(_key: str = Depends(verify_api_key)):
 
 
 
+# --- Forensics Endpoints (Compliance Engine) ---
+
+
+@app.get("/api/forensics/{task_id}")
+async def forensics_task_bundle(task_id: str, _key: str = Depends(verify_api_key)):
+    """Aggregate the DAG, events, and bi-temporal memory context for a task.
+    
+    This is the core forensic playback endpoint â€” given a task_id, reconstruct
+    exactly what happened, what the agent knew, and what it decided.
+    
+    Returns a downloadable JSON "Incident Bundle" suitable for compliance
+    officers, insurance adjusters, and legal review.
+    """
+    from datetime import datetime as dt
+
+    bundle: dict[str, Any] = {
+        "forensics_version": "1.0.0",
+        "task_id": task_id,
+        "generated_at": dt.now().isoformat(),
+        "events": [],
+        "task_state": None,
+        "context_at_execution": [],
+        "gateway_signatures": [],
+        "dead_letter_queue": None,
+    }
+
+    async with pool.acquire() as conn:
+        # 1. Get all events for this task (ordered chronologically)
+        try:
+            events = await conn.fetch(
+                """
+                SELECT event_id, timestamp, gateway_id, event_type, payload, 
+                       parent_event, signature, compute_cost
+                FROM events
+                WHERE task_id = $1::uuid
+                ORDER BY timestamp ASC
+                """,
+                task_id,
+            )
+            bundle["events"] = [
+                {
+                    "event_id": str(row["event_id"]),
+                    "timestamp": row["timestamp"].isoformat() if row["timestamp"] else None,
+                    "gateway_id": row["gateway_id"],
+                    "event_type": row["event_type"],
+                    "payload": row["payload"] if isinstance(row["payload"], dict) else json.loads(row["payload"]) if row["payload"] else {},
+                    "signature": row["signature"],
+                    "compute_cost": row["compute_cost"],
+                    "signature_present": bool(row["signature"]),
+                }
+                for row in events
+            ]
+        except Exception as e:
+            bundle["events_error"] = str(e)
+
+        # 2. Get task state from tasks table
+        try:
+            task_row = await conn.fetchrow(
+                """
+                SELECT task_id, root_prompt_id, parent_task_id, title, description,
+                       status, assigned_gateway, compute_budget, compute_spent, created_at, updated_at
+                FROM tasks
+                WHERE task_id = $1::uuid
+                """,
+                task_id,
+            )
+            if task_row:
+                bundle["task_state"] = {
+                    k: (str(v) if isinstance(v, UUID) else v.isoformat() if hasattr(v, 'isoformat') else v)
+                    for k, v in dict(task_row).items()
+                }
+
+                # 2b. Get root prompt if available
+                if task_row["root_prompt_id"]:
+                    root = await conn.fetchrow(
+                        "SELECT content, user_id, metadata, created_at FROM root_prompts WHERE id = $1",
+                        task_row["root_prompt_id"],
+                    )
+                    if root:
+                        bundle["root_prompt"] = {
+                            "content": root["content"],
+                            "user_id": root["user_id"],
+                            "created_at": root["created_at"].isoformat() if root["created_at"] else None,
+                        }
+        except Exception as e:
+            bundle["task_state_error"] = str(e)
+
+        # 3. Get bi-temporal memory context at the time of first event
+        if bundle["events"]:
+            first_event_time = bundle["events"][0].get("timestamp")
+            if first_event_time:
+                try:
+                    context_memories = await conn.fetch(
+                        """
+                        SELECT id, content, memory_type, agent_id, confidence, 
+                               created_at, valid_from, valid_to
+                        FROM memories
+                        WHERE valid_from <= $1::timestamptz
+                          AND (valid_to IS NULL OR valid_to > $1::timestamptz)
+                        ORDER BY created_at DESC
+                        LIMIT 50
+                        """,
+                        first_event_time,
+                    )
+                    bundle["context_at_execution"] = [
+                        {
+                            "memory_id": str(row["id"]),
+                            "content": row["content"][:500],
+                            "memory_type": row["memory_type"],
+                            "agent_id": row["agent_id"],
+                            "confidence": row["confidence"],
+                            "valid_from": row["valid_from"].isoformat() if row["valid_from"] else None,
+                            "valid_to": row["valid_to"].isoformat() if row["valid_to"] else None,
+                        }
+                        for row in context_memories
+                    ]
+                except Exception as e:
+                    bundle["context_error"] = str(e)
+
+        # 4. Collect unique gateway signatures
+        seen_gateways = set()
+        for evt in bundle["events"]:
+            gw = evt.get("gateway_id")
+            if gw and gw not in seen_gateways:
+                seen_gateways.add(gw)
+                # Look up gateway's public key from registry
+                try:
+                    gw_row = await conn.fetchrow(
+                        "SELECT capabilities, status, metadata FROM gateway_registry WHERE gateway_id = $1",
+                        gw,
+                    )
+                    bundle["gateway_signatures"].append({
+                        "gateway_id": gw,
+                        "public_key": gw_row["metadata"].get("public_key") if gw_row and gw_row["metadata"] else None,
+                        "status": gw_row["status"] if gw_row else "unknown",
+                        "events_signed": sum(1 for e in bundle["events"] if e["gateway_id"] == gw and e["signature_present"]),
+                        "events_unsigned": sum(1 for e in bundle["events"] if e["gateway_id"] == gw and not e["signature_present"]),
+                    })
+                except Exception:
+                    bundle["gateway_signatures"].append({
+                        "gateway_id": gw,
+                        "public_key": None,
+                        "events_signed": 0,
+                        "events_unsigned": 0,
+                    })
+
+        # 5. Check DLQ for this task
+        try:
+            dlq_row = await conn.fetchrow(
+                """
+                SELECT task_id, failure_count, failures, root_cause_diagnosis, 
+                       proposed_amendment, entered_at, resolved_at
+                FROM dead_letter_queue
+                WHERE task_id = $1::uuid
+                """,
+                task_id,
+            )
+            if dlq_row:
+                bundle["dead_letter_queue"] = {
+                    k: (str(v) if isinstance(v, UUID) else v.isoformat() if hasattr(v, 'isoformat') else v)
+                    for k, v in dict(dlq_row).items()
+                }
+        except Exception as e:
+            bundle["dlq_error"] = str(e)
+
+        # 6. Get checkpoints for this task
+        try:
+            checkpoints = await conn.fetch(
+                """
+                SELECT id, gateway_id, checkpoint_seq, progress_pct, tokens_consumed, created_at
+                FROM checkpoints
+                WHERE task_id = $1::uuid
+                ORDER BY checkpoint_seq ASC
+                """,
+                task_id,
+            )
+            bundle["checkpoints"] = [
+                {
+                    "checkpoint_id": str(row["id"]),
+                    "gateway_id": row["gateway_id"],
+                    "sequence": row["checkpoint_seq"],
+                    "progress_pct": row["progress_pct"],
+                    "tokens_consumed": row["tokens_consumed"],
+                    "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+                }
+                for row in checkpoints
+            ]
+        except Exception as e:
+            bundle["checkpoints_error"] = str(e)
+
+        # 7. Get lane locks that were active during this task
+        try:
+            lane_locks = await conn.fetch(
+                """
+                SELECT lane_id, gateway_id, fencing_token, acquired_at, expires_at
+                FROM lane_locks
+                WHERE task_id = $1::uuid
+                """,
+                task_id,
+            )
+            bundle["lane_locks"] = [
+                {
+                    "lane_id": row["lane_id"],
+                    "gateway_id": row["gateway_id"],
+                    "fencing_token": row["fencing_token"],
+                    "acquired_at": row["acquired_at"].isoformat() if row["acquired_at"] else None,
+                    "expires_at": row["expires_at"].isoformat() if row["expires_at"] else None,
+                }
+                for row in lane_locks
+            ]
+        except Exception as e:
+            bundle["lane_locks_error"] = str(e)
+
+    # Summary stats
+    bundle["summary"] = {
+        "total_events": len(bundle.get("events", [])),
+        "unique_gateways": len(bundle.get("gateway_signatures", [])),
+        "context_memories": len(bundle.get("context_at_execution", [])),
+        "checkpoints": len(bundle.get("checkpoints", [])),
+        "lane_locks": len(bundle.get("lane_locks", [])),
+        "has_dlq_entry": bundle.get("dead_letter_queue") is not None,
+        "all_events_signed": all(e.get("signature_present") for e in bundle.get("events", [])),
+    }
+
+    return bundle
+
+
+@app.get("/api/forensics/playback/{task_id}")
+async def forensics_playback(task_id: str, _key: str = Depends(verify_api_key)):
+    """Time Machine: reconstruct the agent's exact brain state at the moment 
+    it made each decision on this task.
+    
+    Returns a timeline of decisions with their bi-temporal memory context,
+    allowing perfect reconstruction of what the agent knew vs what it did.
+    """
+    from datetime import datetime as dt
+
+    timeline: list[dict[str, Any]] = []
+
+    async with pool.acquire() as conn:
+        # Get all decision/execution events for this task
+        # Note: events table may not exist in memU-only deployments
+        try:
+            events = await conn.fetch(
+                """
+                SELECT event_id, timestamp, gateway_id, event_type, payload, signature
+                FROM events
+                WHERE task_id = $1::uuid
+                  AND event_type IN ('decision_made', 'task_completed', 'task_failed', 
+                                     'rollback_executed', 'dlq_enqueued')
+                ORDER BY timestamp ASC
+                """,
+                task_id,
+            )
+        except Exception as e:
+            # events table doesn't exist in this environment
+            return {
+                "task_id": task_id,
+                "timeline": [],
+                "decision_count": 0,
+                "generated_at": dt.now().isoformat(),
+                "note": f"Events table not available in this environment: {e}",
+            }
+
+        for event in events:
+            ts = event["timestamp"]
+            # Query bi-temporal memory at this exact moment
+            memories = await conn.fetch(
+                """
+                SELECT id, content, memory_type, agent_id, confidence, valid_from
+                FROM memories
+                WHERE valid_from <= $1
+                  AND (valid_to IS NULL OR valid_to > $1)
+                ORDER BY confidence DESC, created_at DESC
+                LIMIT 20
+                """,
+                ts,
+            )
+
+            timeline.append({
+                "event_id": str(event["event_id"]),
+                "timestamp": ts.isoformat(),
+                "event_type": event["event_type"],
+                "gateway_id": event["gateway_id"],
+                "payload": event["payload"],
+                "signed": bool(event["signature"]),
+                "agent_brain_state": {
+                    "memories_in_scope": len(memories),
+                    "memories": [
+                        {
+                            "id": str(m["id"]),
+                            "content_preview": m["content"][:200],
+                            "type": m["memory_type"],
+                            "confidence": m["confidence"],
+                        }
+                        for m in memories
+                    ],
+                },
+            })
+
+    return {
+        "task_id": task_id,
+        "timeline": timeline,
+        "decision_count": len(timeline),
+        "generated_at": dt.now().isoformat(),
+    }
+
 
 
 # --- Lane Coordination (NATS bridge for external agents) ---
@@ -980,7 +1340,6 @@ async def get_lane_status(api_key: str = Security(api_key_header)):
     verify_api_key(api_key)
     connected = _nats_publisher is not None and _nats_publisher._cluster._nc is not None
     return {"ok": connected, "nats": "connected" if connected else "disconnected"}
-
 
 if __name__ == "__main__":
     import uvicorn
@@ -1043,6 +1402,70 @@ async def recall_search(
     return [dict(r) for r in rows]
 
 
+# --- Tenant Management Endpoints ---
+
+class TenantCreate(BaseModel):
+    name: str
+    slug: str
+    plan: str = "free"
+    metadata: dict[str, Any] = {}
+
+
+class TenantResponse(BaseModel):
+    id: UUID
+    name: str
+    slug: str
+    plan: str
+    created_at: Any
+
+
+@app.post("/api/v1/tenants", response_model=TenantResponse)
+async def create_tenant(req: TenantCreate, _key: str = Depends(verify_api_key)):
+    """Create a new tenant for multi-tenancy isolation."""
+    async with pool.acquire() as conn:
+        try:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO tenants (name, slug, plan, metadata)
+                VALUES ($1, $2, $3, $4::jsonb)
+                RETURNING id, name, slug, plan, created_at
+                """,
+                req.name,
+                req.slug,
+                req.plan,
+                json.dumps(req.metadata),
+            )
+            return TenantResponse(**dict(row))
+        except Exception as e:
+            if "unique" in str(e).lower():
+                raise HTTPException(status_code=409, detail=f"Tenant slug '{req.slug}' already exists")
+            raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/api/v1/tenants")
+async def list_tenants(_key: str = Depends(verify_api_key)):
+    """List all tenants."""
+    async with pool.acquire() as conn:
+        try:
+            rows = await conn.fetch("SELECT id, name, slug, plan, created_at FROM tenants ORDER BY created_at")
+            return [dict(r) for r in rows]
+        except Exception as e:
+            # tenants table may not exist yet
+            return {"error": str(e), "note": "Run migration 009 to enable multi-tenancy"}
+
+
+@app.get("/api/v1/tenants/{tenant_slug}")
+async def get_tenant(tenant_slug: str, _key: str = Depends(verify_api_key)):
+    """Get tenant details by slug."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT id, name, slug, plan, metadata, created_at FROM tenants WHERE slug = $1",
+            tenant_slug,
+        )
+        if not row:
+            raise HTTPException(status_code=404, detail="Tenant not found")
+        return dict(row)
+
 
 
 # --- Lane Coordination (NATS bridge for external agents) ---
@@ -1089,10 +1512,8 @@ async def get_lane_status(api_key: str = Security(api_key_header)):
     connected = _nats_publisher is not None and _nats_publisher._cluster._nc is not None
     return {"ok": connected, "nats": "connected" if connected else "disconnected"}
 
-
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
-
 

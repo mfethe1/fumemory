@@ -38,19 +38,24 @@ class EventProjector:
         logger.info(f"Projector connected to {self.nats_url}")
 
     async def run(self):
-        # Durable consumer for reliable projection
-        sub = await self.js.subscribe("swarm.events", durable="memu-projector")
-        logger.info("Projector subscription active")
+        # Pull-based durable consumer for reliable projection
+        sub = await self.js.pull_subscribe("swarm.events", durable="memu-projector")
+        logger.info("Projector pull subscription active on swarm.events")
 
-        async for msg in sub.messages:
+        while True:
             try:
-                event_data = json.loads(msg.data.decode())
-                event = SwarmEvent.model_validate(event_data)
-                await self.process_event(event)
-                await msg.ack()
-            except Exception as e:
-                logger.error(f"Failed to project event: {e}")
-                # We don't ack so we can retry later or manual triage
+                msgs = await sub.fetch(batch=10, timeout=5)
+                for msg in msgs:
+                    try:
+                        event_data = json.loads(msg.data.decode())
+                        event = SwarmEvent.model_validate(event_data)
+                        await self.process_event(event)
+                        await msg.ack()
+                    except Exception as e:
+                        logger.error(f"Failed to project event: {e}")
+            except nats.errors.TimeoutError:
+                # No messages available, loop back
+                pass
 
     async def process_event(self, event: SwarmEvent):
         logger.info(f"Projecting event: {event.event_type} ({event.event_id})")
@@ -99,6 +104,13 @@ class EventProjector:
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    projector = EventProjector()
-    asyncio.run(projector.connect())
-    asyncio.run(projector.run())
+
+    async def main():
+        projector = EventProjector()
+        await projector.connect()
+        try:
+            await projector.run()
+        finally:
+            await projector.close()
+
+    asyncio.run(main())
