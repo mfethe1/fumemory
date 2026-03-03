@@ -46,6 +46,13 @@ from memu.models import (
 from memu.notion_bridge import create_bridge_from_env, NotionBridge
 from memu.migrations import run_migrations
 from memu.temporal_routes import router as temporal_router
+from memu.tenancy import (
+    resolve_tenant_id,
+    tenant_connection,
+    tenant_transaction,
+    DEFAULT_TENANT_ID,
+    SINGLE_TENANT_MODE,
+)
 
 # --- Config ---
 
@@ -115,56 +122,46 @@ app.include_router(temporal_router, tags=["Async Workflows"])
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 # ---------------------------------------------------------------------------
-# Tenant resolution — maps API key → tenant_id for RLS
+# Tenant resolution + RLS enforcement
+# Uses tenancy.py module for core logic. API key → tenant_id → RLS context.
 # ---------------------------------------------------------------------------
-import hashlib as _hashlib
-
-def _hash_key(raw_key: str) -> str:
-    return _hashlib.sha256(raw_key.encode()).hexdigest()
-
-async def _resolve_tenant_id(key: str) -> str | None:
-    """Look up tenant_id from api_keys table. Returns None if not found."""
-    if pool is None:
-        return None
-    try:
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "SELECT tenant_id FROM api_keys WHERE key_hash = $1 AND revoked_at IS NULL",
-                _hash_key(key),
-            )
-            return str(row["tenant_id"]) if row else None
-    except Exception:
-        return None
 
 
-async def verify_api_key(key: str | None = Security(api_key_header)) -> str:
+class AuthContext(str):
+    """Authenticated request context with tenant information.
+    
+    Extends str for backward compatibility — existing endpoints that
+    type-hint `_key: str` will still work. Access tenant_id via .tenant_id.
+    """
+    tenant_id: UUID
+
+    def __new__(cls, api_key: str, tenant_id: UUID | None = None):
+        instance = super().__new__(cls, api_key)
+        instance.tenant_id = tenant_id or DEFAULT_TENANT_ID
+        return instance
+
+
+async def verify_api_key(key: str | None = Security(api_key_header)) -> AuthContext:
+    """Verify API key and resolve tenant context for RLS."""
     if not key or key != MEMU_API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
-    return key
+    tid = await resolve_tenant_id(pool, key) if pool else DEFAULT_TENANT_ID
+    return AuthContext(api_key=key, tenant_id=tid)
 
 
-@asynccontextmanager
-async def tenant_transaction(tenant_id: str):
-    """Acquire a DB connection and set the RLS tenant context for this transaction.
-
-    Usage:
-        async with tenant_transaction(tenant_id) as conn:
-            await conn.fetch("SELECT * FROM memories")  # RLS auto-filters
-
-    Falls back gracefully if RLS is not yet enabled (e.g., dev DB without migration).
+async def _tenant_conn(auth: AuthContext):
+    """Helper: acquire a tenant-scoped connection (sets RLS context).
+    
+    Usage in endpoints:
+        auth = Depends(verify_api_key)
+        async with _tenant_conn(auth) as conn:
+            rows = await conn.fetch("SELECT * FROM memories")  # RLS filters
     """
-    if pool is None:
-        raise RuntimeError("DB pool not initialised")
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            try:
-                await conn.execute("SET LOCAL app.current_tenant = $1", tenant_id)
-            except Exception as e:
-                logger.warning("Could not set RLS tenant context: %s", e)
-            yield conn
+    async with tenant_connection(pool, auth.tenant_id) as conn:
+        yield conn
 
 # TODO: MCP_MOUNT — Rosie to mount MCP server here
-# TODO: OTEL_STARTUP — Lenny to wire OTel exporter into lifespan
+# TODO: OTEL_STARTUP — Macklemore to wire OTel exporter into lifespan
 
 
 def _coerce_memory_type(raw: str | None) -> MemoryType | None:
@@ -343,10 +340,12 @@ async def create_memory(req: MemoryCreate, _key: str = Depends(verify_api_key)):
                 json.dumps(req.metadata) if req.metadata else "{}",
             )
         else:
+            # Include tenant_id for RLS multi-tenancy
+            tenant_id = getattr(_key, 'tenant_id', DEFAULT_TENANT_ID)
             row = await conn.fetchrow(
                 """
-                INSERT INTO memories (content, embedding, memory_type, agent_id, metadata, parent_id, confidence, content_hash)
-                VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8)
+                INSERT INTO memories (content, embedding, memory_type, agent_id, metadata, parent_id, confidence, content_hash, tenant_id)
+                VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9)
                 RETURNING *
                 """,
                 req.content,
@@ -357,6 +356,7 @@ async def create_memory(req: MemoryCreate, _key: str = Depends(verify_api_key)):
                 req.parent_id,
                 req.confidence,
                 c_hash,
+                tenant_id,
             )
 
     memory = _row_to_memory(row)
@@ -718,11 +718,12 @@ async def bulk_import(req: BulkImportRequest, _key: str = Depends(verify_api_key
 
 @app.post("/tasks", response_model=Task)
 async def create_task(req: TaskCreate, _key: str = Depends(verify_api_key)):
+    tenant_id = getattr(_key, 'tenant_id', DEFAULT_TENANT_ID)
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
-            INSERT INTO backlog (task, priority, owner_id, lane, metadata, dependency_id)
-            VALUES ($1, $2, $3, $4, $5::jsonb, $6)
+            INSERT INTO backlog (task, priority, owner_id, lane, metadata, dependency_id, tenant_id)
+            VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7)
             RETURNING *
             """,
             req.task,
@@ -731,6 +732,7 @@ async def create_task(req: TaskCreate, _key: str = Depends(verify_api_key)):
             req.lane,
             json.dumps(req.metadata) if req.metadata else "{}",
             req.dependency_id,
+            tenant_id,
         )
     return _row_to_task(row)
 
@@ -1353,6 +1355,71 @@ async def recall_search(
         )
         
     return [dict(r) for r in rows]
+
+
+# --- Tenant Management Endpoints ---
+
+class TenantCreate(BaseModel):
+    name: str
+    slug: str
+    plan: str = "free"
+    metadata: dict[str, Any] = {}
+
+
+class TenantResponse(BaseModel):
+    id: UUID
+    name: str
+    slug: str
+    plan: str
+    created_at: Any
+
+
+@app.post("/api/v1/tenants", response_model=TenantResponse)
+async def create_tenant(req: TenantCreate, _key: str = Depends(verify_api_key)):
+    """Create a new tenant for multi-tenancy isolation."""
+    async with pool.acquire() as conn:
+        try:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO tenants (name, slug, plan, metadata)
+                VALUES ($1, $2, $3, $4::jsonb)
+                RETURNING id, name, slug, plan, created_at
+                """,
+                req.name,
+                req.slug,
+                req.plan,
+                json.dumps(req.metadata),
+            )
+            return TenantResponse(**dict(row))
+        except Exception as e:
+            if "unique" in str(e).lower():
+                raise HTTPException(status_code=409, detail=f"Tenant slug '{req.slug}' already exists")
+            raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/api/v1/tenants")
+async def list_tenants(_key: str = Depends(verify_api_key)):
+    """List all tenants."""
+    async with pool.acquire() as conn:
+        try:
+            rows = await conn.fetch("SELECT id, name, slug, plan, created_at FROM tenants ORDER BY created_at")
+            return [dict(r) for r in rows]
+        except Exception as e:
+            # tenants table may not exist yet
+            return {"error": str(e), "note": "Run migration 009 to enable multi-tenancy"}
+
+
+@app.get("/api/v1/tenants/{tenant_slug}")
+async def get_tenant(tenant_slug: str, _key: str = Depends(verify_api_key)):
+    """Get tenant details by slug."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT id, name, slug, plan, metadata, created_at FROM tenants WHERE slug = $1",
+            tenant_slug,
+        )
+        if not row:
+            raise HTTPException(status_code=404, detail="Tenant not found")
+        return dict(row)
 
 
 if __name__ == "__main__":
