@@ -37,5 +37,8 @@ async def sync_file(path):
             except Exception as e:
                 print(f"Error syncing chunk from {path}: {e}")
 
+async def main():
+    await asyncio.gather(*[sync_file(p) for p in FILES_TO_SYNC])
+
 if __name__ == "__main__":
-    asyncio.run(asyncio.gather(*[sync_file(p) for p in FILES_TO_SYNC]))
+    asyncio.run(main())

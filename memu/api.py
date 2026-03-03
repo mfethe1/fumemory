@@ -18,6 +18,14 @@ from fastapi.security import APIKeyHeader
 from pydantic import BaseModel
 
 from memu.decay import compute_final_score, should_deduplicate
+
+# --- Logging Config ---
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
+# Reduce noise from verbose libraries
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("fastembed").setLevel(logging.WARNING)
 from memu.cluster import NATSClusterManager
 from memu.nats_publisher import NATSEventPublisher
 from memu.models import (
@@ -46,7 +54,7 @@ MEMU_API_KEY = os.environ.get("MEMU_API_KEY", "memu-dev-key")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 EMBEDDING_BASE_URL = os.environ.get("EMBEDDING_BASE_URL", "http://localhost:11434")
 EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "qwen3-embedding")
-EMBEDDING_DIMS = int(os.environ.get("EMBEDDING_DIMS", "1536"))
+EMBEDDING_DIMS = int(os.environ.get("EMBEDDING_DIMS", "4096"))
 DEDUP_THRESHOLD = float(os.environ.get("DEDUP_THRESHOLD", "0.95"))
 DECAY_RATE = float(os.environ.get("DECAY_RATE", "0.01"))
 
@@ -480,12 +488,9 @@ async def search_memories(req: SearchRequest, _key: str = Depends(verify_api_key
     results.sort(key=lambda r: r.final_score, reverse=True)
     final = results[: req.limit]
 
-    # Audit Trail: Log Search History
+    # Audit Trail: Log Search History (reuse the embedding we already computed)
     try:
-        # Get embedding for query if available
-        emb = await get_embedding(req.query)
-        emb_str = str(emb) if emb else None
-        
+        emb_str = str(embedding) if embedding else None
         async with pool.acquire() as conn:
             await conn.execute(
                 """
@@ -500,7 +505,8 @@ async def search_memories(req: SearchRequest, _key: str = Depends(verify_api_key
                 emb_str
             )
     except Exception as e:
-        logger.error(f"Failed to log search history: {e}")
+        # Log at debug level — search_history logging failure is non-critical
+        logger.debug(f"Failed to log search history: {e}")
 
     # Publish search event to NATS
     if _nats_publisher:
