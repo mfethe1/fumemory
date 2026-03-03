@@ -2,7 +2,7 @@
 
 __version__ = "0.1.0"
 
-__all__ = ["MemUClient", "Memory", "MemoryType", "SearchResult"]
+__all__ = ["MemUClient", "Memory", "MemoryType", "SearchResult", "adapters"]
 
 
 def __getattr__(name):
@@ -18,4 +18,7 @@ def __getattr__(name):
     if name == "SearchResult":
         from memu.models import SearchResult
         return SearchResult
+    if name == "adapters":
+        import memu.adapters
+        return memu.adapters
     raise AttributeError(name)

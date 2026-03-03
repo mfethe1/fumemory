@@ -1,0 +1,3 @@
+httpx
+opentelemetry-sdk
+opentelemetry-exporter-otlp

@@ -27,6 +27,8 @@ dependencies = [
     "nats-py>=2.7",
     "docker>=7",
     "fastembed>=0.5",
+    "opentelemetry-sdk>=1.20",
+    "opentelemetry-exporter-otlp>=1.20",
 ]
 
 [project.optional-dependencies]

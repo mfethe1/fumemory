@@ -39,26 +39,11 @@ logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # OPA Policy Hook (Track #1 — Lenny wires this)
-# TODO: OPA_POLICY_HOOK — replace this stub with real OPA/Cedar enforcement
 # ---------------------------------------------------------------------------
 async def _policy_check(action: str, context: dict) -> tuple[bool, str]:
-    """Gate all Warden actions through OPA/Cedar policy engine.
-    
-    Returns (allowed: bool, reason: str).
-    Stub returns True until Lenny wires memu/policy/opa_client.py.
-    
-    Expected context keys:
-        gateway_id, task_id, role, compute_budget, requested_by
-    
-    Example OPA rule (Rego):
-        package memu.warden
-        allow { input.action == "spawn_gateway"; input.role != "admin" }
-        deny { input.compute_budget > 100.0 }
-    """
-    # TODO: OPA_POLICY_HOOK — Lenny: replace stub below with OPA client call
-    # from memu.policy.opa_client import OPAClient
-    # return await OPAClient.evaluate("memu/warden/allow", {"action": action, **context})
-    return True, "policy stub — OPA not yet wired"
+    """Gate all Warden actions through OPA/Cedar policy engine."""
+    from memu.policy.opa_client import OPAClient
+    return await OPAClient.evaluate("memu/warden/allow", {"action": action, **context})
 
 
 @dataclass

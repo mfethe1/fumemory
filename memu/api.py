@@ -99,6 +99,17 @@ async def lifespan(app: FastAPI):
         await _nats_cluster.connect()
         _nats_publisher = NATSEventPublisher(_nats_cluster, gateway_id="memu-api")
         logger.info("NATS event publisher connected")
+
+        # Start OTel Exporter
+        try:
+            from memu.otel_exporter import OTelExporterTask
+            import asyncio
+            otel_task = OTelExporterTask(_nats_cluster)
+            asyncio.create_task(otel_task.start())
+            logger.info("OTel Exporter started")
+        except Exception as e:
+            logger.error(f"Failed to start OTel Exporter: {e}")
+
     except Exception as e:
         logger.warning("NATS connection failed (API will work without events): %s", e)
         _nats_cluster = None
@@ -164,6 +175,7 @@ async def _tenant_conn(auth: AuthContext):
 
 # TODO: MCP_MOUNT â€” Rosie to mount MCP server here
 # TODO: OTEL_STARTUP â€” Macklemore to wire OTel exporter into lifespan
+# TODO: MCP_MOUNT — Rosie to mount MCP server here
 
 
 def _coerce_memory_type(raw: str | None) -> MemoryType | None:
