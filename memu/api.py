@@ -1,4 +1,5 @@
-"""memU API — FastAPI application."""
+﻿from datetime import datetime, timezone
+"""memU API â€” FastAPI application."""
 
 from __future__ import annotations
 
@@ -77,7 +78,7 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning("FastEmbed pre-warm failed: %s", e)
 
-    # Connect NATS cluster (non-blocking — API works without NATS)
+    # Connect NATS cluster (non-blocking â€” API works without NATS)
     try:
         _nats_cluster = NATSClusterManager()
         await _nats_cluster.connect()
@@ -556,7 +557,7 @@ async def search_text(
     _key: str = Depends(verify_api_key),
 ):
     """
-    Full-text search using PostgreSQL ILIKE — no embeddings needed.
+    Full-text search using PostgreSQL ILIKE â€” no embeddings needed.
     Useful for environments without an embedding provider or for exact keyword lookups.
     """
     filters = ["content ILIKE $1"]
@@ -590,7 +591,7 @@ async def search_text(
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest, _key: str = Depends(verify_api_key)):
-    """RAG chat — retrieves relevant memories and generates an answer."""
+    """RAG chat â€” retrieves relevant memories and generates an answer."""
     # Search for relevant context
     search_req = SearchRequest(query=req.question, limit=req.context_limit, agent_id=req.agent_id)
     search_results = await search_memories(search_req, _key="internal")
@@ -934,6 +935,53 @@ async def notion_health(_key: str = Depends(verify_api_key)):
 
 
 
+
+
+# --- Lane Coordination (NATS bridge for external agents) ---
+
+class LaneMessage(BaseModel):
+    task_id: str
+    owner: str
+    lane: str
+    fencing_token: str
+    state: str  # claimed, in_progress, blocked, done
+
+@app.post("/api/v1/lanes/publish")
+async def publish_lane_message(msg: LaneMessage, api_key: str = Security(api_key_header)):
+    """Publish a lane coordination message to NATS swarm.tasks.<lane>.* subject."""
+    verify_api_key(api_key)
+    if not _nats_publisher:
+        raise HTTPException(503, "NATS not connected")
+
+    subject = f"swarm.tasks.{msg.lane}.{msg.state}"
+    payload = {
+        "task_id": msg.task_id,
+        "owner": msg.owner,
+        "lane": msg.lane,
+        "fencing_token": msg.fencing_token,
+        "state": msg.state,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    try:
+        nc = _nats_publisher._cluster._nc
+        await nc.publish(subject, json.dumps(payload).encode())
+        await nc.flush()
+        logger.info("Lane message published: %s -> %s", subject, msg.owner)
+        return {"ok": True, "subject": subject, "payload": payload}
+    except Exception as e:
+        logger.error("Lane publish failed: %s", e)
+        raise HTTPException(500, f"NATS publish failed: {e}")
+
+
+@app.get("/api/v1/lanes/status")
+async def get_lane_status(api_key: str = Security(api_key_header)):
+    """Check NATS connectivity for lane coordination."""
+    verify_api_key(api_key)
+    connected = _nats_publisher is not None and _nats_publisher._cluster._nc is not None
+    return {"ok": connected, "nats": "connected" if connected else "disconnected"}
+
+
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
@@ -995,7 +1043,56 @@ async def recall_search(
     return [dict(r) for r in rows]
 
 
+
+
+# --- Lane Coordination (NATS bridge for external agents) ---
+
+class LaneMessage(BaseModel):
+    task_id: str
+    owner: str
+    lane: str
+    fencing_token: str
+    state: str  # claimed, in_progress, blocked, done
+
+@app.post("/api/v1/lanes/publish")
+async def publish_lane_message(msg: LaneMessage, api_key: str = Security(api_key_header)):
+    """Publish a lane coordination message to NATS swarm.tasks.<lane>.* subject."""
+    verify_api_key(api_key)
+    if not _nats_publisher:
+        raise HTTPException(503, "NATS not connected")
+
+    subject = f"swarm.tasks.{msg.lane}.{msg.state}"
+    payload = {
+        "task_id": msg.task_id,
+        "owner": msg.owner,
+        "lane": msg.lane,
+        "fencing_token": msg.fencing_token,
+        "state": msg.state,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    try:
+        nc = _nats_publisher._cluster._nc
+        await nc.publish(subject, json.dumps(payload).encode())
+        await nc.flush()
+        logger.info("Lane message published: %s -> %s", subject, msg.owner)
+        return {"ok": True, "subject": subject, "payload": payload}
+    except Exception as e:
+        logger.error("Lane publish failed: %s", e)
+        raise HTTPException(500, f"NATS publish failed: {e}")
+
+
+@app.get("/api/v1/lanes/status")
+async def get_lane_status(api_key: str = Security(api_key_header)):
+    """Check NATS connectivity for lane coordination."""
+    verify_api_key(api_key)
+    connected = _nats_publisher is not None and _nats_publisher._cluster._nc is not None
+    return {"ok": connected, "nats": "connected" if connected else "disconnected"}
+
+
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
+
+
