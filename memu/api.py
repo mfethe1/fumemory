@@ -1324,7 +1324,7 @@ async def publish_lane_message(msg: LaneMessage, api_key: str = Security(api_key
     }
 
     try:
-        nc = _nats_publisher._cluster._nc
+        nc = _nats_publisher.cluster._nc
         await nc.publish(subject, json.dumps(payload).encode())
         await nc.flush()
         logger.info("Lane message published: %s -> %s", subject, msg.owner)
@@ -1338,7 +1338,7 @@ async def publish_lane_message(msg: LaneMessage, api_key: str = Security(api_key
 async def get_lane_status(api_key: str = Security(api_key_header)):
     """Check NATS connectivity for lane coordination."""
     verify_api_key(api_key)
-    connected = _nats_publisher is not None and _nats_publisher._cluster._nc is not None
+    connected = _nats_publisher is not None and _nats_publisher.cluster._nc is not None
     return {"ok": connected, "nats": "connected" if connected else "disconnected"}
 
 if __name__ == "__main__":
@@ -1465,6 +1465,7 @@ async def get_tenant(tenant_slug: str, _key: str = Depends(verify_api_key)):
         if not row:
             raise HTTPException(status_code=404, detail="Tenant not found")
         return dict(row)
+
 
 
 
