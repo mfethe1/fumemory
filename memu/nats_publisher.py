@@ -20,17 +20,40 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from memu.cluster import NATSClusterManager
+from memu.crypto import GatewayKeyPair, canonical_event_hash, get_backend
 from memu.swarm_models import EventType, SwarmEvent
 
 logger = logging.getLogger(__name__)
 
 
 class NATSEventPublisher:
-    """Publish validated events onto the NATS swarm mesh."""
+    """Publish validated and cryptographically signed events onto the NATS swarm mesh."""
 
-    def __init__(self, cluster: NATSClusterManager, gateway_id: str = "memu-api"):
+    def __init__(
+        self,
+        cluster: NATSClusterManager,
+        gateway_id: str = "memu-api",
+        keypair: GatewayKeyPair | None = None,
+    ):
         self.cluster = cluster
         self.gateway_id = gateway_id
+        # Generate keypair if not provided and crypto backend is available
+        if keypair is not None:
+            self.keypair = keypair
+        elif get_backend() != "none":
+            self.keypair = GatewayKeyPair()
+            logger.info(
+                f"Gateway keypair generated (backend={get_backend()}, "
+                f"pubkey={self.keypair.public_key_hex[:16]}...)"
+            )
+        else:
+            self.keypair = None
+            logger.warning("No crypto backend — events will be published unsigned")
+
+    @property
+    def public_key_hex(self) -> str:
+        """Public key for registration in gateway_registry."""
+        return self.keypair.public_key_hex if self.keypair else ""
 
     async def _publish(self, subject: str, event: SwarmEvent) -> bool:
         """Publish a single event, return True on success."""
@@ -44,18 +67,33 @@ class NATSEventPublisher:
             logger.error(f"Failed to publish {event.event_type.value}: {e}")
             return False
 
+    def _sign_event(self, event: SwarmEvent) -> str | None:
+        """Sign an event and return the hex signature."""
+        if not self.keypair:
+            return None
+        payload_hash = canonical_event_hash(
+            task_id=event.task_id,
+            timestamp=event.timestamp,
+            event_type=event.event_type.value,
+            payload=event.payload,
+        )
+        return self.keypair.sign(payload_hash)
+
     def _make_event(
         self,
         event_type: EventType,
         task_id: UUID | None = None,
         payload: dict[str, Any] | None = None,
     ) -> SwarmEvent:
-        return SwarmEvent(
+        event = SwarmEvent(
             source_gateway=self.gateway_id,
             event_type=event_type,
             task_id=task_id or uuid4(),
             payload=payload or {},
         )
+        # Sign the event before publishing
+        event.signature = self._sign_event(event)
+        return event
 
     # --- Concrete event publishers ---
 

@@ -940,6 +940,303 @@ async def notion_health(_key: str = Depends(verify_api_key)):
 
 
 
+# --- Forensics Endpoints (Compliance Engine) ---
+
+
+@app.get("/api/forensics/{task_id}")
+async def forensics_task_bundle(task_id: str, _key: str = Depends(verify_api_key)):
+    """Aggregate the DAG, events, and bi-temporal memory context for a task.
+    
+    This is the core forensic playback endpoint — given a task_id, reconstruct
+    exactly what happened, what the agent knew, and what it decided.
+    
+    Returns a downloadable JSON "Incident Bundle" suitable for compliance
+    officers, insurance adjusters, and legal review.
+    """
+    from datetime import datetime as dt
+
+    bundle: dict[str, Any] = {
+        "forensics_version": "1.0.0",
+        "task_id": task_id,
+        "generated_at": dt.now().isoformat(),
+        "events": [],
+        "task_state": None,
+        "context_at_execution": [],
+        "gateway_signatures": [],
+        "dead_letter_queue": None,
+    }
+
+    async with pool.acquire() as conn:
+        # 1. Get all events for this task (ordered chronologically)
+        try:
+            events = await conn.fetch(
+                """
+                SELECT event_id, timestamp, gateway_id, event_type, payload, 
+                       parent_event, signature, compute_cost
+                FROM events
+                WHERE task_id = $1::uuid
+                ORDER BY timestamp ASC
+                """,
+                task_id,
+            )
+            bundle["events"] = [
+                {
+                    "event_id": str(row["event_id"]),
+                    "timestamp": row["timestamp"].isoformat() if row["timestamp"] else None,
+                    "gateway_id": row["gateway_id"],
+                    "event_type": row["event_type"],
+                    "payload": row["payload"] if isinstance(row["payload"], dict) else json.loads(row["payload"]) if row["payload"] else {},
+                    "signature": row["signature"],
+                    "compute_cost": row["compute_cost"],
+                    "signature_present": bool(row["signature"]),
+                }
+                for row in events
+            ]
+        except Exception as e:
+            bundle["events_error"] = str(e)
+
+        # 2. Get task state from tasks table
+        try:
+            task_row = await conn.fetchrow(
+                """
+                SELECT task_id, root_prompt_id, parent_task_id, title, description,
+                       status, assigned_gateway, compute_budget, compute_spent, created_at, updated_at
+                FROM tasks
+                WHERE task_id = $1::uuid
+                """,
+                task_id,
+            )
+            if task_row:
+                bundle["task_state"] = {
+                    k: (str(v) if isinstance(v, UUID) else v.isoformat() if hasattr(v, 'isoformat') else v)
+                    for k, v in dict(task_row).items()
+                }
+
+                # 2b. Get root prompt if available
+                if task_row["root_prompt_id"]:
+                    root = await conn.fetchrow(
+                        "SELECT content, user_id, metadata, created_at FROM root_prompts WHERE id = $1",
+                        task_row["root_prompt_id"],
+                    )
+                    if root:
+                        bundle["root_prompt"] = {
+                            "content": root["content"],
+                            "user_id": root["user_id"],
+                            "created_at": root["created_at"].isoformat() if root["created_at"] else None,
+                        }
+        except Exception as e:
+            bundle["task_state_error"] = str(e)
+
+        # 3. Get bi-temporal memory context at the time of first event
+        if bundle["events"]:
+            first_event_time = bundle["events"][0].get("timestamp")
+            if first_event_time:
+                try:
+                    context_memories = await conn.fetch(
+                        """
+                        SELECT id, content, memory_type, agent_id, confidence, 
+                               created_at, valid_from, valid_to
+                        FROM memories
+                        WHERE valid_from <= $1::timestamptz
+                          AND (valid_to IS NULL OR valid_to > $1::timestamptz)
+                        ORDER BY created_at DESC
+                        LIMIT 50
+                        """,
+                        first_event_time,
+                    )
+                    bundle["context_at_execution"] = [
+                        {
+                            "memory_id": str(row["id"]),
+                            "content": row["content"][:500],
+                            "memory_type": row["memory_type"],
+                            "agent_id": row["agent_id"],
+                            "confidence": row["confidence"],
+                            "valid_from": row["valid_from"].isoformat() if row["valid_from"] else None,
+                            "valid_to": row["valid_to"].isoformat() if row["valid_to"] else None,
+                        }
+                        for row in context_memories
+                    ]
+                except Exception as e:
+                    bundle["context_error"] = str(e)
+
+        # 4. Collect unique gateway signatures
+        seen_gateways = set()
+        for evt in bundle["events"]:
+            gw = evt.get("gateway_id")
+            if gw and gw not in seen_gateways:
+                seen_gateways.add(gw)
+                # Look up gateway's public key from registry
+                try:
+                    gw_row = await conn.fetchrow(
+                        "SELECT capabilities, status, metadata FROM gateway_registry WHERE gateway_id = $1",
+                        gw,
+                    )
+                    bundle["gateway_signatures"].append({
+                        "gateway_id": gw,
+                        "public_key": gw_row["metadata"].get("public_key") if gw_row and gw_row["metadata"] else None,
+                        "status": gw_row["status"] if gw_row else "unknown",
+                        "events_signed": sum(1 for e in bundle["events"] if e["gateway_id"] == gw and e["signature_present"]),
+                        "events_unsigned": sum(1 for e in bundle["events"] if e["gateway_id"] == gw and not e["signature_present"]),
+                    })
+                except Exception:
+                    bundle["gateway_signatures"].append({
+                        "gateway_id": gw,
+                        "public_key": None,
+                        "events_signed": 0,
+                        "events_unsigned": 0,
+                    })
+
+        # 5. Check DLQ for this task
+        try:
+            dlq_row = await conn.fetchrow(
+                """
+                SELECT task_id, failure_count, failures, root_cause_diagnosis, 
+                       proposed_amendment, entered_at, resolved_at
+                FROM dead_letter_queue
+                WHERE task_id = $1::uuid
+                """,
+                task_id,
+            )
+            if dlq_row:
+                bundle["dead_letter_queue"] = {
+                    k: (str(v) if isinstance(v, UUID) else v.isoformat() if hasattr(v, 'isoformat') else v)
+                    for k, v in dict(dlq_row).items()
+                }
+        except Exception as e:
+            bundle["dlq_error"] = str(e)
+
+        # 6. Get checkpoints for this task
+        try:
+            checkpoints = await conn.fetch(
+                """
+                SELECT id, gateway_id, checkpoint_seq, progress_pct, tokens_consumed, created_at
+                FROM checkpoints
+                WHERE task_id = $1::uuid
+                ORDER BY checkpoint_seq ASC
+                """,
+                task_id,
+            )
+            bundle["checkpoints"] = [
+                {
+                    "checkpoint_id": str(row["id"]),
+                    "gateway_id": row["gateway_id"],
+                    "sequence": row["checkpoint_seq"],
+                    "progress_pct": row["progress_pct"],
+                    "tokens_consumed": row["tokens_consumed"],
+                    "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+                }
+                for row in checkpoints
+            ]
+        except Exception as e:
+            bundle["checkpoints_error"] = str(e)
+
+        # 7. Get lane locks that were active during this task
+        try:
+            lane_locks = await conn.fetch(
+                """
+                SELECT lane_id, gateway_id, fencing_token, acquired_at, expires_at
+                FROM lane_locks
+                WHERE task_id = $1::uuid
+                """,
+                task_id,
+            )
+            bundle["lane_locks"] = [
+                {
+                    "lane_id": row["lane_id"],
+                    "gateway_id": row["gateway_id"],
+                    "fencing_token": row["fencing_token"],
+                    "acquired_at": row["acquired_at"].isoformat() if row["acquired_at"] else None,
+                    "expires_at": row["expires_at"].isoformat() if row["expires_at"] else None,
+                }
+                for row in lane_locks
+            ]
+        except Exception as e:
+            bundle["lane_locks_error"] = str(e)
+
+    # Summary stats
+    bundle["summary"] = {
+        "total_events": len(bundle.get("events", [])),
+        "unique_gateways": len(bundle.get("gateway_signatures", [])),
+        "context_memories": len(bundle.get("context_at_execution", [])),
+        "checkpoints": len(bundle.get("checkpoints", [])),
+        "lane_locks": len(bundle.get("lane_locks", [])),
+        "has_dlq_entry": bundle.get("dead_letter_queue") is not None,
+        "all_events_signed": all(e.get("signature_present") for e in bundle.get("events", [])),
+    }
+
+    return bundle
+
+
+@app.get("/api/forensics/playback/{task_id}")
+async def forensics_playback(task_id: str, _key: str = Depends(verify_api_key)):
+    """Time Machine: reconstruct the agent's exact brain state at the moment 
+    it made each decision on this task.
+    
+    Returns a timeline of decisions with their bi-temporal memory context,
+    allowing perfect reconstruction of what the agent knew vs what it did.
+    """
+    from datetime import datetime as dt
+
+    timeline: list[dict[str, Any]] = []
+
+    async with pool.acquire() as conn:
+        # Get all decision/execution events for this task
+        events = await conn.fetch(
+            """
+            SELECT event_id, timestamp, gateway_id, event_type, payload, signature
+            FROM events
+            WHERE task_id = $1::uuid
+              AND event_type IN ('decision_made', 'task_completed', 'task_failed', 
+                                 'rollback_executed', 'dlq_enqueued')
+            ORDER BY timestamp ASC
+            """,
+            task_id,
+        )
+
+        for event in events:
+            ts = event["timestamp"]
+            # Query bi-temporal memory at this exact moment
+            memories = await conn.fetch(
+                """
+                SELECT id, content, memory_type, agent_id, confidence, valid_from
+                FROM memories
+                WHERE valid_from <= $1
+                  AND (valid_to IS NULL OR valid_to > $1)
+                ORDER BY confidence DESC, created_at DESC
+                LIMIT 20
+                """,
+                ts,
+            )
+
+            timeline.append({
+                "event_id": str(event["event_id"]),
+                "timestamp": ts.isoformat(),
+                "event_type": event["event_type"],
+                "gateway_id": event["gateway_id"],
+                "payload": event["payload"],
+                "signed": bool(event["signature"]),
+                "agent_brain_state": {
+                    "memories_in_scope": len(memories),
+                    "memories": [
+                        {
+                            "id": str(m["id"]),
+                            "content_preview": m["content"][:200],
+                            "type": m["memory_type"],
+                            "confidence": m["confidence"],
+                        }
+                        for m in memories
+                    ],
+                },
+            })
+
+    return {
+        "task_id": task_id,
+        "timeline": timeline,
+        "decision_count": len(timeline),
+        "generated_at": dt.now().isoformat(),
+    }
+
+
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))

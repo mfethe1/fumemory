@@ -52,6 +52,7 @@ class EventType(str, enum.Enum):
     DLQ_HEALED = "dlq_healed"
     RPC_REQUEST = "rpc_request"
     RPC_RESPONSE = "rpc_response"
+    MERKLE_ANCHOR = "merkle_anchor"
 
 
 class TaskStatus(str, enum.Enum):
@@ -142,6 +143,26 @@ class AuditProposed(BaseModel):
         description="Semantic alignment with original root prompt (1.0 = perfect)")
 
 
+class ContextSnapshot(BaseModel):
+    """Exact memory state that was in the LLM's prompt window at decision time.
+    
+    This is the "Proof of Context" — cryptographic evidence of what the agent
+    knew when it made a decision. Required for forensic playback and liability.
+    """
+    memory_ids: list[UUID] = Field(default_factory=list, description="Exact memory IDs in context")
+    memory_version_hashes: list[str] = Field(
+        default_factory=list, description="SHA256 of each memory's content at retrieval time"
+    )
+    blackboard_entries: list[UUID] = Field(
+        default_factory=list, description="Blackboard entry IDs in context"
+    )
+    prompt_template_hash: str = Field("", description="SHA256 of the system prompt template")
+    model_id: str = Field("", description="LLM model used for this decision")
+    temperature: float = Field(0.0, description="Temperature setting at decision time")
+    timestamp: datetime = Field(default_factory=lambda: datetime.now())
+    total_context_tokens: int = Field(0, description="Estimated tokens in context window")
+
+
 class ExecutionResult(BaseModel):
     """Published when a gateway completes (or fails) task execution."""
     task_id: UUID
@@ -152,6 +173,9 @@ class ExecutionResult(BaseModel):
     tokens_used: int = 0
     duration_ms: int = 0
     sandbox_id: str | None = Field(None, description="Ephemeral sandbox container ID if used")
+    context_snapshot: ContextSnapshot | None = Field(
+        None, description="Proof of Context: exact agent state at execution time"
+    )
 
 
 class CircuitBreaker(BaseModel):
@@ -360,13 +384,44 @@ class HydrationHandoff(BaseModel):
 
 # --- Dead Letter Queue (DLQ) & Self-Healing ---
 
+class FailureCategory(str, enum.Enum):
+    """Rigid taxonomy of failure modes for actuarial analysis.
+    
+    Every DLQ entry and rollback MUST be classified into one of these
+    categories. This data feeds the actuarial pipeline that prices
+    enterprise AI insurance premiums.
+    """
+    HALLUCINATION = "hallucination"           # LLM produced factually wrong output
+    API_TIMEOUT = "api_timeout"               # External API call exceeded deadline
+    LOGIC_LOOP = "logic_loop"                 # Agent stuck in circular reasoning
+    UNAUTHORIZED_DATA_ACCESS = "unauthorized_data_access"  # Attempted access to restricted data
+    GUARDRAIL_VIOLATION = "guardrail_violation"  # Violated safety/compliance guardrails
+    RESOURCE_EXHAUSTION = "resource_exhaustion"  # Exceeded compute/memory/token budget
+    DEPENDENCY_FAILURE = "dependency_failure"   # Required upstream task/service failed
+    SCHEMA_VIOLATION = "schema_violation"       # Output failed Pydantic/contract validation
+    SPLIT_BRAIN = "split_brain"               # Fencing token conflict / concurrent mutation
+    UNKNOWN = "unknown"                        # Unclassified — requires human triage
+
+
 class DLQEntry(BaseModel):
-    """A poison pill task that has failed 3+ times."""
+    """A poison pill task that has failed 3+ times.
+    
+    Each entry is classified with a FailureCategory for actuarial analysis.
+    Anonymized aggregates of DLQ entries across all clients feed the
+    "Actuarial Table for Autonomous AI" — pricing data for insurance underwriters.
+    """
     task_id: UUID
     failure_count: int = Field(..., ge=3)
+    failure_category: FailureCategory = Field(
+        FailureCategory.UNKNOWN,
+        description="Primary failure classification for actuarial pipeline"
+    )
+    failure_subcategory: str | None = Field(
+        None, description="Freeform sub-classification (e.g., 'openai_429', 'infinite_tool_loop')"
+    )
     failures: list[dict[str, Any]] = Field(
         default_factory=list,
-        description="List of {gateway_id, error, timestamp, stack_trace} for each failure"
+        description="List of {gateway_id, error, timestamp, stack_trace, category} for each failure"
     )
     root_cause_diagnosis: str | None = Field(None, description="Medic gateway's diagnosis")
     proposed_amendment: dict[str, Any] | None = Field(None, description="DAG patch to heal the plan")
@@ -380,6 +435,10 @@ class RollbackExecuted(BaseModel):
     rollback_instruction: str
     success: bool
     error: str | None = None
+    failure_category: FailureCategory = Field(
+        FailureCategory.UNKNOWN,
+        description="Why this rollback was triggered — feeds actuarial pipeline"
+    )
     artifacts_cleaned: list[str] = Field(
         default_factory=list,
         description="List of resources that were rolled back (temp tables, files, etc.)"
@@ -428,6 +487,9 @@ class DecisionMade(BaseModel):
     options: list[str] = Field(default_factory=list)
     selected_option: str | None = None
     agent_id: str
+    context_snapshot: ContextSnapshot | None = Field(
+        None, description="Proof of Context: exact agent state at decision time"
+    )
 
 
 class HealthCheck(BaseModel):
