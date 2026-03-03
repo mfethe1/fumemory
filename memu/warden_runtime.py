@@ -33,8 +33,32 @@ from memu.swarm_models import (
     TaskOrphaned,
 )
 from memu.warden import RespawnRequest
+from memu.sandbox import get_sandbox_provider, SandboxProvider
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# OPA Policy Hook (Track #1 — Lenny wires this)
+# TODO: OPA_POLICY_HOOK — replace this stub with real OPA/Cedar enforcement
+# ---------------------------------------------------------------------------
+async def _policy_check(action: str, context: dict) -> tuple[bool, str]:
+    """Gate all Warden actions through OPA/Cedar policy engine.
+    
+    Returns (allowed: bool, reason: str).
+    Stub returns True until Lenny wires memu/policy/opa_client.py.
+    
+    Expected context keys:
+        gateway_id, task_id, role, compute_budget, requested_by
+    
+    Example OPA rule (Rego):
+        package memu.warden
+        allow { input.action == "spawn_gateway"; input.role != "admin" }
+        deny { input.compute_budget > 100.0 }
+    """
+    # TODO: OPA_POLICY_HOOK — Lenny: replace stub below with OPA client call
+    # from memu.policy.opa_client import OPAClient
+    # return await OPAClient.evaluate("memu/warden/allow", {"action": action, **context})
+    return True, "policy stub — OPA not yet wired"
 
 
 @dataclass
@@ -67,7 +91,12 @@ class WardenRuntime:
         self._spawn_inflight: set[str] = set()
         self._respawn_cooldown_s = int(os.environ.get("WARDEN_RESPAWN_COOLDOWN_S", "30"))
 
-        # Optional docker integration (non-fatal if missing)
+        # Pluggable sandbox provider (docker | e2b | extism | none)
+        self._sandbox: SandboxProvider = get_sandbox_provider()
+        logger.info("Warden sandbox provider: %s", self._sandbox.name)
+
+        # Optional docker integration (non-fatal if missing) — kept for gateway respawn
+        # Sandbox execution now goes through self._sandbox (see memu/sandbox/)
         self._docker = None
         self._use_docker = False
         try:
@@ -195,6 +224,18 @@ class WardenRuntime:
         await nc.publish("swarm.warden.respawn", req.model_dump_json().encode())
 
     async def _spawn_gateway_container(self, dead_gateway_id: str, task_id: str | None = None, requested_from: str = "direct"):
+        # --- OPA/Cedar policy gate (Lenny wires full implementation) ---
+        allowed, reason = await _policy_check("spawn_gateway", {
+            "gateway_id": dead_gateway_id,
+            "task_id": task_id,
+            "requested_from": requested_from,
+            "active_containers": len(self.active_containers),
+            "max_containers": self.max_containers,
+        })
+        if not allowed:
+            logger.warning("POLICY DENIED spawn for %s: %s", dead_gateway_id, reason)
+            return
+
         if not self._use_docker:
             logger.warning("Docker unavailable; cannot spawn gateway container for %s", dead_gateway_id)
             return
