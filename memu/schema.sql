@@ -10,6 +10,7 @@ CREATE TABLE IF NOT EXISTS memories (
     memory_type   VARCHAR(20) NOT NULL DEFAULT 'fact'
                   CHECK (memory_type IN ('fact', 'decision', 'lesson', 'pattern', 'failure')),
     agent_id      VARCHAR(64),
+    tenant_id     UUID NOT NULL DEFAULT uuid_generate_v4(),  -- RLS: row belongs to this tenant
     metadata      JSONB NOT NULL DEFAULT '{}',
     parent_id     UUID REFERENCES memories(id) ON DELETE SET NULL,
     confidence    FLOAT NOT NULL DEFAULT 1.0 CHECK (confidence >= 0 AND confidence <= 1),
@@ -29,15 +30,18 @@ CREATE INDEX IF NOT EXISTS idx_memories_content_hash ON memories (content_hash);
 CREATE INDEX IF NOT EXISTS idx_memories_created ON memories (created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_memories_decay ON memories (decay_score DESC);
 
--- API keys table
+-- API keys table — each key maps to a tenant
 CREATE TABLE IF NOT EXISTS api_keys (
     id         UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     key_hash   VARCHAR(128) NOT NULL UNIQUE,
     name       VARCHAR(128),
     agent_id   VARCHAR(64),
+    tenant_id  UUID NOT NULL DEFAULT uuid_generate_v4(),
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     revoked_at TIMESTAMPTZ
 );
+CREATE INDEX IF NOT EXISTS idx_api_keys_tenant ON api_keys (tenant_id);
+CREATE INDEX IF NOT EXISTS idx_api_keys_hash ON api_keys (key_hash);
 
 -- Update trigger for updated_at
 CREATE OR REPLACE FUNCTION update_updated_at()

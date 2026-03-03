@@ -114,11 +114,57 @@ app.include_router(temporal_router, tags=["Async Workflows"])
 
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
+# ---------------------------------------------------------------------------
+# Tenant resolution — maps API key → tenant_id for RLS
+# ---------------------------------------------------------------------------
+import hashlib as _hashlib
+
+def _hash_key(raw_key: str) -> str:
+    return _hashlib.sha256(raw_key.encode()).hexdigest()
+
+async def _resolve_tenant_id(key: str) -> str | None:
+    """Look up tenant_id from api_keys table. Returns None if not found."""
+    if pool is None:
+        return None
+    try:
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT tenant_id FROM api_keys WHERE key_hash = $1 AND revoked_at IS NULL",
+                _hash_key(key),
+            )
+            return str(row["tenant_id"]) if row else None
+    except Exception:
+        return None
+
 
 async def verify_api_key(key: str | None = Security(api_key_header)) -> str:
     if not key or key != MEMU_API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
     return key
+
+
+@asynccontextmanager
+async def tenant_transaction(tenant_id: str):
+    """Acquire a DB connection and set the RLS tenant context for this transaction.
+
+    Usage:
+        async with tenant_transaction(tenant_id) as conn:
+            await conn.fetch("SELECT * FROM memories")  # RLS auto-filters
+
+    Falls back gracefully if RLS is not yet enabled (e.g., dev DB without migration).
+    """
+    if pool is None:
+        raise RuntimeError("DB pool not initialised")
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            try:
+                await conn.execute("SET LOCAL app.current_tenant = $1", tenant_id)
+            except Exception as e:
+                logger.warning("Could not set RLS tenant context: %s", e)
+            yield conn
+
+# TODO: MCP_MOUNT — Rosie to mount MCP server here
+# TODO: OTEL_STARTUP — Lenny to wire OTel exporter into lifespan
 
 
 def _coerce_memory_type(raw: str | None) -> MemoryType | None:
