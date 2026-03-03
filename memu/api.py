@@ -150,6 +150,7 @@ async def verify_api_key(key: str | None = Security(api_key_header)) -> AuthCont
     return AuthContext(api_key=key, tenant_id=tid)
 
 
+@asynccontextmanager
 async def _tenant_conn(auth: AuthContext):
     """Helper: acquire a tenant-scoped connection (sets RLS context).
     
@@ -302,7 +303,7 @@ async def create_memory(req: MemoryCreate, _key: str = Depends(verify_api_key)):
     embedding = await get_embedding(req.content)
     c_hash = content_hash(req.content)
 
-    async with pool.acquire() as conn:
+    async with _tenant_conn(_key) as conn:
         # Check for duplicates (content hash always works; vector similarity only when embedding available)
         if embedding is not None:
             vec = f"vector({EMBEDDING_DIMS})"
@@ -403,7 +404,7 @@ async def memories_search_compat(
 
 @app.get("/memories/{memory_id}", response_model=Memory)
 async def get_memory(memory_id: UUID, _key: str = Depends(verify_api_key)):
-    async with pool.acquire() as conn:
+    async with _tenant_conn(_key) as conn:
         # Increment access count (reinforcement)
         row = await conn.fetchrow(
             """
@@ -420,7 +421,7 @@ async def get_memory(memory_id: UUID, _key: str = Depends(verify_api_key)):
 
 @app.delete("/memories/{memory_id}")
 async def delete_memory(memory_id: UUID, _key: str = Depends(verify_api_key)):
-    async with pool.acquire() as conn:
+    async with _tenant_conn(_key) as conn:
         result = await conn.execute("DELETE FROM memories WHERE id = $1", memory_id)
     if result == "DELETE 0":
         raise HTTPException(status_code=404, detail="Memory not found")
@@ -434,7 +435,7 @@ async def search_memories(req: SearchRequest, _key: str = Depends(verify_api_key
     if embedding is None:
         logger.warning("Embedding service unavailable for /search, falling back to text search")
         # Delegate to text-based search as fallback
-        async with pool.acquire() as conn:
+        async with _tenant_conn(_key) as conn:
             filters = ["content ILIKE $1"]
             params: list[Any] = [f"%{req.query}%"]
             idx = 2
@@ -496,7 +497,7 @@ async def search_memories(req: SearchRequest, _key: str = Depends(verify_api_key
         idx += 1
 
     where = (" AND " + " AND ".join(filters)) if filters else ""
-    async with pool.acquire() as conn:
+    async with _tenant_conn(_key) as conn:
         vec = f"vector({EMBEDDING_DIMS})"
         rows = await conn.fetch(
             f"""
@@ -538,7 +539,7 @@ async def search_memories(req: SearchRequest, _key: str = Depends(verify_api_key
     # Audit Trail: Log Search History (reuse the embedding we already computed)
     try:
         emb_str = str(embedding) if embedding else None
-        async with pool.acquire() as conn:
+        async with _tenant_conn(_key) as conn:
             await conn.execute(
                 """
                 INSERT INTO search_history (query, agent_id, results_count, search_type, metadata, embedding)
@@ -627,7 +628,7 @@ async def search_text(
 
     where = " AND ".join(filters)
 
-    async with pool.acquire() as conn:
+    async with _tenant_conn(_key) as conn:
         rows = await conn.fetch(
             f"""
             SELECT * FROM memories
@@ -691,7 +692,7 @@ async def bulk_import(req: BulkImportRequest, _key: str = Depends(verify_api_key
             embedding = await get_embedding(chunk)
             c_hash = content_hash(chunk)
 
-            async with pool.acquire() as conn:
+            async with _tenant_conn(_key) as conn:
                 existing = await conn.fetchrow(
                     "SELECT id FROM memories WHERE content_hash = $1", c_hash
                 )
@@ -720,7 +721,7 @@ async def bulk_import(req: BulkImportRequest, _key: str = Depends(verify_api_key
 @app.post("/tasks", response_model=Task)
 async def create_task(req: TaskCreate, _key: str = Depends(verify_api_key)):
     tenant_id = getattr(_key, 'tenant_id', DEFAULT_TENANT_ID)
-    async with pool.acquire() as conn:
+    async with _tenant_conn(_key) as conn:
         row = await conn.fetchrow(
             """
             INSERT INTO backlog (task, priority, owner_id, lane, metadata, dependency_id, tenant_id)
@@ -753,7 +754,7 @@ async def list_tasks(status: TaskStatus | None = None, owner: str | None = None,
         idx += 1
     
     where = (" WHERE " + " AND ".join(filters)) if filters else ""
-    async with pool.acquire() as conn:
+    async with _tenant_conn(_key) as conn:
         rows = await conn.fetch(f"SELECT * FROM backlog{where} ORDER BY priority ASC, created_at DESC", *params)
     return [_row_to_task(row) for row in rows]
 
@@ -769,7 +770,7 @@ class LinkCreate(BaseModel):
 
 @app.post("/api/v1/memu/links")
 async def create_link(req: LinkCreate, _key: str = Depends(verify_api_key)):
-    async with pool.acquire() as conn:
+    async with _tenant_conn(_key) as conn:
         try:
             row = await conn.fetchrow(
                 """
@@ -788,7 +789,7 @@ async def create_link(req: LinkCreate, _key: str = Depends(verify_api_key)):
 
 @app.get("/api/v1/memu/links/{memory_id}")
 async def get_links(memory_id: UUID, _key: str = Depends(verify_api_key)):
-    async with pool.acquire() as conn:
+    async with _tenant_conn(_key) as conn:
         rows = await conn.fetch(
             """
             SELECT ml.*, m.content AS linked_content, m.memory_type, m.agent_id
@@ -828,7 +829,7 @@ async def temporal_search_endpoint(
 
     where = " AND ".join(filters)
 
-    async with pool.acquire() as conn:
+    async with _tenant_conn(_key) as conn:
         vec = f"vector({EMBEDDING_DIMS})"
         rows = await conn.fetch(
             f"""
@@ -894,7 +895,7 @@ async def point_in_time_query(
 
     where = " AND ".join(filters)
 
-    async with pool.acquire() as conn:
+    async with _tenant_conn(_key) as conn:
         rows = await conn.fetch(
             f"""
             SELECT id, content, memory_type, agent_id, confidence, created_at, valid_from, valid_to
@@ -1015,7 +1016,7 @@ async def forensics_task_bundle(task_id: str, _key: str = Depends(verify_api_key
         "dead_letter_queue": None,
     }
 
-    async with pool.acquire() as conn:
+    async with _tenant_conn(_key) as conn:
         # 1. Get all events for this task (ordered chronologically)
         try:
             events = await conn.fetch(
@@ -1228,7 +1229,7 @@ async def forensics_playback(task_id: str, _key: str = Depends(verify_api_key)):
 
     timeline: list[dict[str, Any]] = []
 
-    async with pool.acquire() as conn:
+    async with _tenant_conn(_key) as conn:
         # Get all decision/execution events for this task
         # Note: events table may not exist in memU-only deployments
         try:
@@ -1385,7 +1386,7 @@ async def recall_search(
     if pool is None:
         raise HTTPException(status_code=503, detail="Database not initialized")
 
-    async with pool.acquire() as conn:
+    async with _tenant_conn(_key) as conn:
         vec = f"vector({EMBEDDING_DIMS})"
         rows = await conn.fetch(
             f"""
@@ -1423,7 +1424,7 @@ class TenantResponse(BaseModel):
 @app.post("/api/v1/tenants", response_model=TenantResponse)
 async def create_tenant(req: TenantCreate, _key: str = Depends(verify_api_key)):
     """Create a new tenant for multi-tenancy isolation."""
-    async with pool.acquire() as conn:
+    async with _tenant_conn(_key) as conn:
         try:
             row = await conn.fetchrow(
                 """
@@ -1446,7 +1447,7 @@ async def create_tenant(req: TenantCreate, _key: str = Depends(verify_api_key)):
 @app.get("/api/v1/tenants")
 async def list_tenants(_key: str = Depends(verify_api_key)):
     """List all tenants."""
-    async with pool.acquire() as conn:
+    async with _tenant_conn(_key) as conn:
         try:
             rows = await conn.fetch("SELECT id, name, slug, plan, created_at FROM tenants ORDER BY created_at")
             return [dict(r) for r in rows]
@@ -1458,7 +1459,7 @@ async def list_tenants(_key: str = Depends(verify_api_key)):
 @app.get("/api/v1/tenants/{tenant_slug}")
 async def get_tenant(tenant_slug: str, _key: str = Depends(verify_api_key)):
     """Get tenant details by slug."""
-    async with pool.acquire() as conn:
+    async with _tenant_conn(_key) as conn:
         row = await conn.fetchrow(
             "SELECT id, name, slug, plan, metadata, created_at FROM tenants WHERE slug = $1",
             tenant_slug,
