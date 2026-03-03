@@ -1343,10 +1343,7 @@ async def get_lane_status(api_key: str = Security(api_key_header)):
     connected = _nats_publisher is not None and _nats_publisher.cluster.active_connection is not None
     return {"ok": connected, "nats": "connected" if connected else "disconnected"}
 
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+
 
 # --- Search Vault / Recall Endpoints ---
 
@@ -1468,10 +1465,7 @@ async def get_tenant(tenant_slug: str, _key: str = Depends(verify_api_key)):
             raise HTTPException(status_code=404, detail="Tenant not found")
         return dict(row)
 
-
-
-
-
-
-
-
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
