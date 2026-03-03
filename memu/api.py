@@ -1,7 +1,7 @@
-﻿from datetime import datetime, timezone
-"""memU API â€” FastAPI application."""
+﻿"""memU API â€” FastAPI application."""
 
 from __future__ import annotations
+from datetime import datetime, timezone
 
 import hashlib
 import json
@@ -1466,6 +1466,7 @@ async def get_tenant(tenant_slug: str, _key: str = Depends(verify_api_key)):
         if not row:
             raise HTTPException(status_code=404, detail="Tenant not found")
         return dict(row)
+
 
 
 
