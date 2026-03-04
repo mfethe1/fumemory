@@ -1,0 +1,19 @@
+{
+  "domain": "infra",
+  "ownerAgent": "macklemore",
+  "allowedSkills": [
+    "healthcheck",
+    "github",
+    "qmd",
+    "cron-retry",
+    "railway",
+    "cloudflare-manager",
+    "idempotency-gate",
+    "antfarm-workflows"
+  ],
+  "defaultCategory": "deep",
+  "escalation": {
+    "onSecondFailure": "oracle",
+    "onComplexProject": "prometheus+atlas"
+  }
+}
