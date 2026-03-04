@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 import hashlib
 import json
 from memu.web_search_ingest import ingest_web_search
-from memu.next_intent import infer_next_intents
+from memu.next_intent import infer_next_intents, build_proactive_drafts
 import os
 import logging
 from contextlib import asynccontextmanager
@@ -981,6 +981,15 @@ async def predict_next_intent(req: IntentPredictRequest, _key: str = Depends(ver
             logger.warning("NATS publish failed for intent prediction: %s", e)
 
     return {"ok": True, "predictions": stored}
+
+
+@app.post("/api/v1/intent/proactive-draft")
+async def proactive_draft(req: IntentPredictRequest, _key: str = Depends(verify_api_key)):
+    """Predict likely next intent + return reversible proactive prep drafts."""
+    async with _tenant_conn(_key) as conn:
+        predictions = await infer_next_intents(conn, user_id=req.user_id, signal=req.signal, limit=req.limit)
+    drafts = build_proactive_drafts(predictions, signal=req.signal)
+    return {"ok": True, "predictions": predictions, "drafts": drafts}
 
 
 @app.post("/api/v1/intent/feedback")

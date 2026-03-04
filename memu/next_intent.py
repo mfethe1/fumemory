@@ -6,7 +6,7 @@ from typing import Any
 import asyncpg
 
 
-def _classify_text_to_intent(text: str) -> str:
+def classify_text_to_intent(text: str) -> str:
     t = (text or "").lower()
     if any(k in t for k in ["status", "health", "uptime", "down", "error"]):
         return "status_check"
@@ -46,7 +46,7 @@ async def infer_next_intents(
         user_id,
     )
 
-    intents = [_classify_text_to_intent(r["query"]) for r in rows]
+    intents = [classify_text_to_intent(r["query"]) for r in rows]
 
     # sequence pairs: current->next in reverse chronological list
     pairs: list[tuple[str, str]] = []
@@ -55,7 +55,7 @@ async def infer_next_intents(
         next_i = intents[i + 1]
         pairs.append((next_i, current_i))
 
-    signal_intent = _classify_text_to_intent(signal)
+    signal_intent = classify_text_to_intent(signal)
 
     # 2) Count transitions where previous intent resembles current signal.
     trans_counter = Counter([n for prev, n in pairs if prev == signal_intent])
@@ -73,7 +73,7 @@ async def infer_next_intents(
             """,
             user_id,
         )
-        mem_intents = [_classify_text_to_intent(m["content"]) for m in mem_rows]
+        mem_intents = [classify_text_to_intent(m["content"]) for m in mem_rows]
         trans_counter = Counter(mem_intents)
 
     total = sum(trans_counter.values()) or 1
@@ -109,3 +109,37 @@ async def infer_next_intents(
         ]
 
     return results
+
+
+def build_proactive_drafts(predictions: list[dict[str, Any]], signal: str) -> list[dict[str, str]]:
+    """Generate reversible proactive drafts from predicted intents.
+
+    These are suggestions/preparatory actions, not irreversible execution.
+    """
+    drafts: list[dict[str, str]] = []
+    for p in predictions:
+        intent = p.get("predicted_intent", "general_followup")
+        confidence = p.get("confidence", 0.0)
+
+        if intent == "status_check":
+            action = "Preload service health checks, latest deploy status, and recent error logs."
+        elif intent == "remediation":
+            action = "Draft root-cause summary + patch plan + rollback checklist for likely failing component."
+        elif intent == "deploy":
+            action = "Prepare deployment readiness report (tests, migrations, env parity, rollback command)."
+        elif intent == "planning":
+            action = "Draft a phased implementation plan with owners, milestones, and risk gates."
+        elif intent == "summary":
+            action = "Assemble a concise DID/NEXT/NEED summary from recent events and memory."
+        else:
+            action = "Prepare top-3 likely follow-up options with recommended default."
+
+        drafts.append(
+            {
+                "intent": intent,
+                "confidence": f"{confidence:.3f}",
+                "proactive_draft": action,
+                "trigger_signal": signal,
+            }
+        )
+    return drafts

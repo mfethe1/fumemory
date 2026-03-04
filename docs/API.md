@@ -46,6 +46,40 @@ POST /api/v1/memu/chat
 ```
 Ask questions against your memory store with retrieval-augmented generation.
 
+## Next Intent Prediction
+```
+POST /api/v1/intent/predict
+```
+```json
+{
+  "user_id": "michael",
+  "signal": "status of railway and nats",
+  "limit": 3
+}
+```
+
+Returns ranked likely next intents with confidence + evidence and stores them for learning.
+
+## Proactive Drafts
+```
+POST /api/v1/intent/proactive-draft
+```
+Same request schema as predict; returns reversible action drafts (prep plans/checklists) per predicted intent.
+
+## Intent Feedback
+```
+POST /api/v1/intent/feedback
+```
+```json
+{
+  "prediction_id": "<uuid>",
+  "user_id": "michael",
+  "accepted": true,
+  "actual_intent": "remediation",
+  "notes": "good prediction"
+}
+```
+
 ## Delete
 ```
 DELETE /api/v1/memu/{id}

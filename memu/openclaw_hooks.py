@@ -68,6 +68,25 @@ async def log_search(agent_id: str, query: str, results_summary: str):
     except Exception as e:
         logger.error(f"Failed to log search: {e}")
 
+async def predict_next(agent_id: str, signal: str, limit: int = 3):
+    """Predict likely next user intent and return proactive drafts."""
+    headers = {"X-API-Key": MEMU_API_KEY}
+    payload = {"user_id": agent_id, "signal": signal, "limit": limit}
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(
+                f"{MEMU_API_URL}/api/v1/intent/proactive-draft",
+                json=payload,
+                headers=headers,
+            )
+            if resp.status_code == 200:
+                return resp.json()
+            logger.warning("predict_next non-200: %s", resp.status_code)
+    except Exception as e:
+        logger.error(f"Failed to predict next intent: {e}")
+    return {"ok": False, "predictions": [], "drafts": []}
+
+
 async def recall(query: str, agent_id: str):
     """Check if we already know this."""
     headers = {"X-API-Key": MEMU_API_KEY}
@@ -94,3 +113,6 @@ if __name__ == "__main__":
         elif cmd == "recall":
             res = asyncio.run(recall(sys.argv[2], "cli"))
             print(res if res else "No recall match.")
+        elif cmd == "predict-next":
+            res = asyncio.run(predict_next("cli", sys.argv[2]))
+            print(json.dumps(res, indent=2))
