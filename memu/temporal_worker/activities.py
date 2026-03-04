@@ -6,6 +6,7 @@ from typing import Any
 import asyncpg
 from temporalio import activity
 import httpx
+from memu.next_intent import infer_next_intents
 
 # Local cache for FastEmbed fallback (kept module-private for worker determinism)
 _fastembed_model: Any | None = None
@@ -185,8 +186,18 @@ async def log_audit(action_type: str, agent_id: str, details: dict):
         await conn.close()
 
 
+@activity.defn
+async def infer_next_intent_activity(user_id: str, signal: str, limit: int = 3) -> list[dict]:
+    conn = await asyncpg.connect(get_db_url())
+    try:
+        return await infer_next_intents(conn, user_id=user_id, signal=signal, limit=limit)
+    finally:
+        await conn.close()
+
+
 # Export for worker registration
 GenerateEmbeddingActivity = generate_embedding
 StoreMemoryActivity = store_memory
 SearchMemoryActivity = search_memory
 LogAuditActivity = log_audit
+InferNextIntentActivity = infer_next_intent_activity

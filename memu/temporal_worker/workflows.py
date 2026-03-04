@@ -61,3 +61,20 @@ class MemorySearchWorkflow:
             start_to_close_timeout=timedelta(seconds=30),
         )
         return results
+
+
+@workflow.defn
+class NextIntentWorkflow:
+    @workflow.run
+    async def run(self, user_id: str, signal: str, limit: int = 3) -> list[dict]:
+        predictions = await workflow.execute_activity(
+            "infer_next_intent_activity",
+            args=[user_id, signal, limit],
+            start_to_close_timeout=timedelta(seconds=60),
+        )
+        await workflow.execute_activity(
+            "log_audit",
+            args=["NEXT_INTENT_PREDICTED", user_id, {"signal": signal, "count": len(predictions)}],
+            start_to_close_timeout=timedelta(seconds=30),
+        )
+        return predictions

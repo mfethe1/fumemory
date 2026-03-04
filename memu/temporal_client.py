@@ -2,7 +2,7 @@
 import os
 import logging
 from temporalio.client import Client
-from memu.temporal_worker.workflows import MemoryIngestionWorkflow, MemorySearchWorkflow
+from memu.temporal_worker.workflows import MemoryIngestionWorkflow, MemorySearchWorkflow, NextIntentWorkflow
 
 logger = logging.getLogger(__name__)
 
@@ -37,4 +37,19 @@ async def search_memory_workflow(query: str, agent_id: str):
         )
     except Exception as e:
         logger.error(f"Failed to start search workflow: {e}")
+        return None
+
+
+async def predict_next_intent_workflow(user_id: str, signal: str, limit: int = 3):
+    try:
+        client = await get_client()
+        wf_id = f"next-intent-{user_id}-{abs(hash(signal))}"
+        return await client.execute_workflow(
+            NextIntentWorkflow.run,
+            args=[user_id, signal, limit],
+            id=wf_id,
+            task_queue="memu-queue",
+        )
+    except Exception as e:
+        logger.error(f"Failed to run next-intent workflow: {e}")
         return None

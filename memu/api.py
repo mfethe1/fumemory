@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 import hashlib
 import json
 from memu.web_search_ingest import ingest_web_search
+from memu.next_intent import infer_next_intents
 import os
 import logging
 from contextlib import asynccontextmanager
@@ -718,6 +719,12 @@ async def bulk_import(req: BulkImportRequest, _key: str = Depends(verify_api_key
     return BulkImportResponse(imported=imported, duplicates_skipped=dupes)
 
 
+@app.get("/api/v1/memu/health")
+async def health_compat():
+    """Backward-compatible /api/v1/memu/health alias."""
+    return await health()
+
+
 @app.post("/tasks", response_model=Task)
 async def create_task(req: TaskCreate, _key: str = Depends(verify_api_key)):
     tenant_id = getattr(_key, 'tenant_id', DEFAULT_TENANT_ID)
@@ -752,11 +759,27 @@ async def list_tasks(status: TaskStatus | None = None, owner: str | None = None,
         filters.append(f"owner_id = ${idx}")
         params.append(owner)
         idx += 1
-    
+
     where = (" WHERE " + " AND ".join(filters)) if filters else ""
     async with _tenant_conn(_key) as conn:
         rows = await conn.fetch(f"SELECT * FROM backlog{where} ORDER BY priority ASC, created_at DESC", *params)
     return [_row_to_task(row) for row in rows]
+
+
+@app.post("/api/v1/memu/tasks", response_model=Task)
+async def create_task_compat(req: TaskCreate, _key: str = Depends(verify_api_key)):
+    """Backward-compatible /api/v1/memu/tasks alias for task creation."""
+    return await create_task(req, _key=_key)
+
+
+@app.get("/api/v1/memu/tasks", response_model=list[Task])
+async def list_tasks_compat(
+    status: TaskStatus | None = None,
+    owner: str | None = None,
+    _key: str = Depends(verify_api_key),
+):
+    """Backward-compatible /api/v1/memu/tasks alias for task listing."""
+    return await list_tasks(status=status, owner=owner, _key=_key)
 
 
 # --- A-MEM Link Layer ---
@@ -912,7 +935,87 @@ async def point_in_time_query(
 
 
 
+# --- Next Intent Engine ---
+
+
+@app.post("/api/v1/intent/predict")
+async def predict_next_intent(req: IntentPredictRequest, _key: str = Depends(verify_api_key)):
+    async with _tenant_conn(_key) as conn:
+        predictions = await infer_next_intents(conn, user_id=req.user_id, signal=req.signal, limit=req.limit)
+
+        stored = []
+        tenant_id = getattr(_key, 'tenant_id', DEFAULT_TENANT_ID)
+        for p in predictions:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO intent_predictions (tenant_id, user_id, signal, predicted_intent, confidence, horizon, evidence)
+                VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
+                RETURNING id, predicted_intent, confidence, horizon, evidence, created_at
+                """,
+                tenant_id,
+                req.user_id,
+                req.signal,
+                p["predicted_intent"],
+                p["confidence"],
+                p["horizon"],
+                json.dumps(p.get("evidence") or {}),
+            )
+            stored.append(dict(row))
+
+    # Publish proactive signal to NATS for downstream orchestration
+    if _nats_publisher:
+        try:
+            for pred in stored:
+                await _nats_publisher.publish_action_logged(
+                    agent_id=req.user_id,
+                    action_type="intent_predicted",
+                    description=f"Predicted next intent: {pred['predicted_intent']}",
+                    metadata={
+                        "prediction_id": str(pred["id"]),
+                        "signal": req.signal,
+                        "confidence": pred["confidence"],
+                        "horizon": pred["horizon"],
+                    },
+                )
+        except Exception as e:
+            logger.warning("NATS publish failed for intent prediction: %s", e)
+
+    return {"ok": True, "predictions": stored}
+
+
+@app.post("/api/v1/intent/feedback")
+async def intent_feedback(req: IntentFeedbackRequest, _key: str = Depends(verify_api_key)):
+    async with _tenant_conn(_key) as conn:
+        row = await conn.fetchrow(
+            """
+            INSERT INTO intent_feedback (prediction_id, user_id, accepted, actual_intent, notes)
+            VALUES ($1, $2, $3, $4, $5)
+            RETURNING id, prediction_id, accepted, actual_intent, created_at
+            """,
+            req.prediction_id,
+            req.user_id,
+            req.accepted,
+            req.actual_intent,
+            req.notes,
+        )
+    return {"ok": True, "feedback": dict(row)}
+
+
 # --- Notion Integration ---
+
+
+class IntentPredictRequest(BaseModel):
+    user_id: str
+    signal: str
+    limit: int = 3
+
+
+class IntentFeedbackRequest(BaseModel):
+    prediction_id: UUID
+    user_id: str
+    accepted: bool
+    actual_intent: str | None = None
+    notes: str | None = None
 
 
 class NotionClaimRequest(BaseModel):

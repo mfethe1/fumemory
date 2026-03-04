@@ -2,7 +2,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Security
 from fastapi.security import APIKeyHeader
 from memu.models import MemoryCreate, SearchRequest, SearchResult
-from memu.temporal_client import store_memory_workflow, search_memory_workflow
+from memu.temporal_client import store_memory_workflow, search_memory_workflow, predict_next_intent_workflow
 import os
 
 # Circular dep issue: verify_api_key is in api.py
@@ -35,3 +35,12 @@ async def search_memories_async(req: SearchRequest, _key: str = Depends(verify_a
     if raw_results is None:
         raise HTTPException(status_code=503, detail="Search workflow unavailable")
     return raw_results
+
+
+@router.post("/intent/predict/async")
+async def predict_next_intent_async(user_id: str, signal: str, limit: int = 3, _key: str = Depends(verify_api_key)):
+    """Predict likely next user intent through Temporal for durable orchestration."""
+    results = await predict_next_intent_workflow(user_id=user_id, signal=signal, limit=limit)
+    if results is None:
+        raise HTTPException(status_code=503, detail="Intent workflow unavailable")
+    return {"ok": True, "predictions": results}

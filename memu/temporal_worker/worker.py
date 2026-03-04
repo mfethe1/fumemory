@@ -9,8 +9,9 @@ from memu.temporal_worker.activities import (
     search_memory,
     log_audit,
     generate_embedding,
+    infer_next_intent_activity,
 )
-from memu.temporal_worker.workflows import MemoryIngestionWorkflow, MemorySearchWorkflow
+from memu.temporal_worker.workflows import MemoryIngestionWorkflow, MemorySearchWorkflow, NextIntentWorkflow
 
 logger = logging.getLogger(__name__)
 
@@ -29,12 +30,13 @@ async def main():
     worker = Worker(
         client,
         task_queue="memu-queue",
-        workflows=[MemoryIngestionWorkflow, MemorySearchWorkflow],
+        workflows=[MemoryIngestionWorkflow, MemorySearchWorkflow, NextIntentWorkflow],
         activities=[
             store_memory,
             search_memory,
             log_audit,
-            generate_embedding
+            generate_embedding,
+            infer_next_intent_activity,
         ],
     )
     
