@@ -14,5 +14,6 @@ CONF
 echo "=== NATS config ==="
 cat "$CONF"
 echo "==================="
+# Unset PORT so NATS doesn't try to use it for the client port and conflict with http_port
 unset PORT
 exec nats-server -c "$CONF"
