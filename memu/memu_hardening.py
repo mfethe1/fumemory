@@ -58,7 +58,7 @@ class MemUHealthChecker:
             logger.error("memU /health check failed: %s", exc)
             return {"ok": False, "status": "unhealthy", "error": str(exc)}
 
-    async def validate_embedding_dims(self, expected_dims: int = 4096) -> bool:
+    async def validate_embedding_dims(self, expected_dims: int = 384) -> bool:
         """Request a dummy embedding and check returned dimensionality."""
         url = f"{self.embedding_base_url}/v1/embeddings"
         headers = {"Content-Type": "application/json"}
@@ -116,7 +116,7 @@ class MemUClient:
         api_key: str,
         embedding_base_url: str,
         embedding_model: str,
-        expected_dims: int = 4096,
+        expected_dims: int = 384,
     ) -> None:
         """Construct a memU client wrapper.
 

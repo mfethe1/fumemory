@@ -60,9 +60,9 @@ from memu.tenancy import (
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://memu:memu@localhost:5432/memu")
 MEMU_API_KEY = os.environ.get("MEMU_API_KEY", "memu-dev-key")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
-EMBEDDING_BASE_URL = os.environ.get("EMBEDDING_BASE_URL", "http://localhost:11434")
-EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "qwen3-embedding")
-EMBEDDING_DIMS = int(os.environ.get("EMBEDDING_DIMS", "4096"))
+EMBEDDING_BASE_URL = os.environ.get("EMBEDDING_BASE_URL", "")
+EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
+EMBEDDING_DIMS = int(os.environ.get("EMBEDDING_DIMS", "384"))
 DEDUP_THRESHOLD = float(os.environ.get("DEDUP_THRESHOLD", "0.95"))
 DECAY_RATE = float(os.environ.get("DECAY_RATE", "0.01"))
 
@@ -195,7 +195,7 @@ async def get_embedding(text: str) -> list[float] | None:
     Falls back to FastEmbed (local) if API fails, then None if both fail."""
 
     # 1. Try OpenAI-compatible /v1 or Ollama /api endpoint
-    if OPENAI_API_KEY or "ollama" in EMBEDDING_BASE_URL:
+    if EMBEDDING_BASE_URL and (OPENAI_API_KEY or "ollama" in EMBEDDING_BASE_URL) and "BAAI" not in EMBEDDING_MODEL:
         headers = {"Content-Type": "application/json"}
         if OPENAI_API_KEY:
             headers["Authorization"] = f"Bearer {OPENAI_API_KEY}"

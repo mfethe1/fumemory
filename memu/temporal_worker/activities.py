@@ -17,9 +17,9 @@ def get_db_url():
 
 # --- Embedding helpers (OpenAI-compatible + local fallback) ---
 
-EMBEDDING_BASE_URL = os.environ.get("EMBEDDING_BASE_URL", "http://localhost:11434")
-EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "qwen3-embedding")
-EMBEDDING_DIMS = int(os.environ.get("EMBEDDING_DIMS", "4096"))
+EMBEDDING_BASE_URL = os.environ.get("EMBEDDING_BASE_URL", "")
+EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
+EMBEDDING_DIMS = int(os.environ.get("EMBEDDING_DIMS", "384"))
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 
 
