@@ -53,6 +53,12 @@ class EventType(str, enum.Enum):
     RPC_REQUEST = "rpc_request"
     RPC_RESPONSE = "rpc_response"
     MERKLE_ANCHOR = "merkle_anchor"
+    # Predictive Intent System (Phase 1 — deliberation consensus 2026-03-06)
+    PREDICTION_MADE = "prediction_made"
+    PREDICTION_HIT = "prediction_hit"
+    PREDICTION_MISS = "prediction_miss"
+    PREDICTION_DISMISSED = "prediction_dismissed"
+    GATE_DECISION = "gate_decision"
 
 
 class TaskStatus(str, enum.Enum):
