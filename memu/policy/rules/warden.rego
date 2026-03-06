@@ -1,19 +1,14 @@
 package memu.warden
 
 default allow = false
-default reason = "Denied by policy"
 
+# Allow if the user role is admin
 allow {
-    input.action == "spawn"
-    input.active_containers < input.max_containers
+    input.user.role == "admin"
 }
 
-reason = "ok" {
-    allow
+# Allow if the action is read and the user is authenticated
+allow {
+    input.action == "read"
+    input.user.authenticated == true
 }
-
-reason = "budget exceeded" {
-    input.action == "spawn"
-    input.compute_budget >= 2000
-}
-

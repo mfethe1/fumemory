@@ -1,3 +1,1 @@
-from .opa_client import OPAClient
-
-__all__ = ["OPAClient"]
+"""OPA Policy Engine for memU."""

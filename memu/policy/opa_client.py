@@ -1,52 +1,29 @@
 import os
 import logging
 import httpx
-from typing import Dict, Any, Tuple
+from typing import Tuple, Dict, Any
 
 logger = logging.getLogger(__name__)
 
 class OPAClient:
-    """Client for Open Policy Agent."""
-
     @classmethod
     async def evaluate(cls, policy_path: str, input_data: Dict[str, Any]) -> Tuple[bool, str]:
-        """
-        Evaluate a policy in OPA.
-        Returns (is_allowed, reason).
-        """
-        opa_url = os.getenv("OPA_URL", "http://localhost:8181").rstrip("/")
+        opa_url = os.environ.get("OPA_URL", "http://localhost:8181")
         url = f"{opa_url}/v1/data/{policy_path}"
-        
         try:
-            async with httpx.AsyncClient(timeout=2.0) as client:
-                response = await client.post(url, json={"input": input_data})
-                
-                if response.status_code != 200:
-                    logger.warning(f"OPA error {response.status_code} for {policy_path}: {response.text}")
-                    return (True, f"OPA returned {response.status_code}, fail-open allowed")
-                
-                data = response.json()
-                
-                # OPA response format: {"result": {...}} or {"result": true/false}
-                if "result" not in data:
-                    logger.warning(f"OPA invalid response format for {policy_path}")
-                    return (True, "OPA invalid format, fail-open allowed")
-                
-                result = data["result"]
-                
-                # Simple boolean result
-                if isinstance(result, bool):
-                    return (result, "Allowed" if result else "Denied by policy")
-                
-                # Complex result map (e.g. {"allow": true, "reason": "ok"})
-                if isinstance(result, dict):
-                    allow = result.get("allow", False)
-                    reason = result.get("reason", "Denied by policy") if not allow else "Allowed"
-                    return (allow, reason)
-                
-                logger.warning(f"OPA unexpected result type {type(result)} for {policy_path}")
-                return (True, "OPA unexpected format, fail-open allowed")
-
+            async with httpx.AsyncClient() as client:
+                response = await client.post(url, json={"input": input_data}, timeout=2.0)
+                if response.status_code == 200:
+                    result = response.json().get("result", {})
+                    # Rego package memu.warden defines 'allow'. 
+                    # /v1/data/memu/warden returns {"result": {"allow": true}}
+                    # /v1/data/memu/warden/allow returns {"result": true}
+                    is_allowed = result if isinstance(result, bool) else result.get("allow", False)
+                    reason = "allowed by policy" if is_allowed else "denied by policy"
+                    return is_allowed, reason
+                else:
+                    logger.warning(f"OPA returned status {response.status_code}. Defaulting to fail-open.")
+                    return True, f"fail-open (OPA status {response.status_code})"
         except Exception as e:
-            logger.warning(f"OPA unreachable or failed: {str(e)}. Falling back to allow.")
-            return (True, f"OPA error ({str(e)}), fail-open allowed")
+            logger.warning(f"Failed to connect to OPA: {e}. Defaulting to fail-open.")
+            return True, f"fail-open (OPA unreachable: {str(e)})"

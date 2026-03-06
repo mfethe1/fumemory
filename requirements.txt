@@ -1,3 +1,5 @@
 httpx
 opentelemetry-sdk
 opentelemetry-exporter-otlp
+opentelemetry-sdk
+opentelemetry-exporter-otlp
