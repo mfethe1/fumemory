@@ -4,9 +4,7 @@
     "dockerfilePath": "infra/railway-nats/Dockerfile"
   },
   "deploy": {
-    "startCommand": "nats-server --config /etc/nats/nats-server.conf",
-    "healthcheckPath": "/healthz",
-    "healthcheckTimeout": 10,
+    "startCommand": "sh -lc 'nats-server -js --store_dir /tmp/jetstream -p ${PORT:-4222} -m ${NATS_HTTP_PORT:-8222}'",
     "restartPolicyType": "ON_FAILURE",
     "restartPolicyMaxRetries": 10
   }
