@@ -14,4 +14,5 @@ CONF
 echo "=== NATS config ==="
 cat "$CONF"
 echo "==================="
+unset PORT
 exec nats-server -c "$CONF"
