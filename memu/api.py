@@ -298,6 +298,17 @@ def _row_to_task(row) -> Task:
         updated_at=row["updated_at"],
     )
 
+
+def _expansion_schedule(base_limit: int, max_steps: int) -> list[int]:
+    cap = min(400, max(base_limit, 1) * 8)
+    limits: list[int] = []
+    n = max(base_limit, 1)
+    for _ in range(max(max_steps, 1)):
+        limits.append(min(n, cap))
+        n = min(n * 2, cap)
+    return limits
+
+
 # --- Routes ---
 
 @app.get("/health")
@@ -511,16 +522,57 @@ async def search_memories(req: SearchRequest, _key: str = Depends(verify_api_key
     where = (" AND " + " AND ".join(filters)) if filters else ""
     async with _tenant_conn(_key) as conn:
         vec = f"vector({EMBEDDING_DIMS})"
-        rows = await conn.fetch(
-            f"""
-            SELECT *, 1 - (embedding <=> $1::{vec}) AS similarity
-            FROM memories
-            WHERE embedding IS NOT NULL{where}
-            ORDER BY embedding <=> $1::{vec}
-            LIMIT {req.limit * 3}
-            """,
-            *params,
-        )
+        rows = []
+        min_results = max(1, min(req.limit, req.min_results))
+        for current_limit in _expansion_schedule(req.limit * 2, req.max_expansion_steps):
+            rows = await conn.fetch(
+                f"""
+                SELECT *, 1 - (embedding <=> $1::{vec}) AS similarity
+                FROM memories
+                WHERE embedding IS NOT NULL{where}
+                ORDER BY embedding <=> $1::{vec}
+                LIMIT {current_limit}
+                """,
+                *params,
+            )
+            if len(rows) >= min_results:
+                break
+
+        # Optional lexical tie-breaker for filtered misses.
+        if req.lexical_fallback and len(rows) < min_results:
+            lexical_filters = ["content ILIKE $1"]
+            lexical_params: list[Any] = [f"%{req.query}%"]
+            lidx = 2
+            if req.agent_id:
+                lexical_filters.append(f"agent_id = ${lidx}")
+                lexical_params.append(req.agent_id)
+                lidx += 1
+            if req.memory_type:
+                lexical_filters.append(f"memory_type = ${lidx}")
+                lexical_params.append(req.memory_type.value)
+                lidx += 1
+            if req.min_confidence > 0:
+                lexical_filters.append(f"confidence >= ${lidx}")
+                lexical_params.append(req.min_confidence)
+                lidx += 1
+
+            lexical_rows = await conn.fetch(
+                f"""
+                SELECT *, 0.45::float8 AS similarity
+                FROM memories
+                WHERE {' AND '.join(lexical_filters)}
+                ORDER BY updated_at DESC
+                LIMIT {req.limit}
+                """,
+                *lexical_params,
+            )
+
+            existing_ids = {r["id"] for r in rows}
+            for r in lexical_rows:
+                if r["id"] not in existing_ids:
+                    rows.append(r)
+                    existing_ids.add(r["id"])
+
         # Increment access counts for returned results
         if rows:
             ids = [r["id"] for r in rows]
@@ -770,6 +822,42 @@ async def list_tasks(status: TaskStatus | None = None, owner: str | None = None,
         rows = await conn.fetch(f"SELECT * FROM backlog{where} ORDER BY priority ASC, created_at DESC", *params)
     return [_row_to_task(row) for row in rows]
 
+
+# --- Graph / Cypher Queries ---
+
+class CypherRequest(BaseModel):
+    query: str
+    graph_name: str = "memu_graph"
+
+@app.post("/api/v1/memu/cypher")
+async def execute_cypher(req: CypherRequest, _key: str = Depends(verify_api_key)):
+    """Execute raw Cypher queries against the memU knowledge graph."""
+    async with pool.acquire() as conn:
+        try:
+            await conn.execute("SET search_path = ag_catalog, \"$user\", public")
+            # Example query: MATCH (v:Memory) RETURN v
+            cypher_sql = f"SELECT * FROM cypher('{req.graph_name}', $$ {req.query} $$) AS (result agtype);"
+            rows = await conn.fetch(cypher_sql)
+            return {"ok": True, "results": [dict(r) for r in rows]}
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/api/v1/memu/graph/neighbors/{memory_id}")
+async def get_graph_neighbors(memory_id: UUID, _key: str = Depends(verify_api_key)):
+    """Traverse graph to find 1st degree neighbors of a memory."""
+    async with pool.acquire() as conn:
+        try:
+            await conn.execute("SET search_path = ag_catalog, \"$user\", public")
+            cypher_sql = f"""
+            SELECT * FROM cypher('memu_graph', $$ 
+                MATCH (m:Memory {{id: "{memory_id}"}})-[r]-(neighbor:Memory)
+                RETURN type(r) as rel_type, neighbor
+            $$) AS (rel_type agtype, neighbor agtype);
+            """
+            rows = await conn.fetch(cypher_sql)
+            return {"ok": True, "neighbors": [dict(r) for r in rows]}
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=str(e))
 
 # --- A-MEM Link Layer ---
 

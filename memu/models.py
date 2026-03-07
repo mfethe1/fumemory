@@ -47,6 +47,9 @@ class SearchRequest(BaseModel):
     memory_type: MemoryType | None = None
     min_confidence: float = 0.0
     temporal_weight: float = 0.3
+    min_results: int = 3
+    max_expansion_steps: int = 3
+    lexical_fallback: bool = True
 
 class SearchResult(BaseModel):
     memory: Memory
