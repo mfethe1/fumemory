@@ -78,7 +78,13 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global pool, _fastembed_model, _nats_cluster, _nats_publisher
-    pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=10)
+    async def _init_hnsw_search(conn):
+        """Set HNSW ef_search for quality filtered retrieval (migration 013)."""
+        await conn.execute("SET hnsw.ef_search = 100")
+
+    pool = await asyncpg.create_pool(
+        DATABASE_URL, min_size=2, max_size=10, init=_init_hnsw_search
+    )
     
     # Run DB migrations
     try:
