@@ -26,6 +26,7 @@ class MemoryCreate(BaseModel):
     metadata: dict | None = None
     parent_id: UUID | None = None
     confidence: float = 1.0
+    tags: list[str] = Field(default_factory=list, description="Entity/topic tags for filtered retrieval")
 
 class Memory(BaseModel):
     id: UUID
@@ -37,6 +38,7 @@ class Memory(BaseModel):
     confidence: float
     access_count: int
     decay_score: float | None = None
+    tags: list[str] = Field(default_factory=list)
     created_at: datetime
     updated_at: datetime
 
@@ -47,6 +49,26 @@ class SearchRequest(BaseModel):
     memory_type: MemoryType | None = None
     min_confidence: float = 0.0
     temporal_weight: float = 0.3
+    tags: list[str] = Field(default_factory=list, description="Filter results to memories containing ALL of these tags")
+
+
+class MemoryBlockCreate(BaseModel):
+    """Create or update a context block."""
+    key: str = Field(..., description="Block key, e.g. 'project:jiraflow:status'")
+    content: str
+    agent_owner: str | None = None
+    metadata: dict | None = None
+
+
+class MemoryBlock(BaseModel):
+    """A stable context block for agent state."""
+    key: str
+    content: str
+    agent_owner: str | None
+    metadata: dict
+    version: int
+    created_at: datetime
+    updated_at: datetime
 
 class SearchResult(BaseModel):
     memory: Memory

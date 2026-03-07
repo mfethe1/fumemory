@@ -35,6 +35,8 @@ from memu.models import (
     ChatRequest,
     ChatResponse,
     Memory,
+    MemoryBlock,
+    MemoryBlockCreate,
     MemoryCreate,
     MemoryType,
     SearchRequest,
@@ -266,6 +268,9 @@ def _row_to_memory(row) -> Memory:
     if isinstance(metadata, str):
         metadata = json.loads(metadata)
 
+    # Handle tags column gracefully (may not exist in older schemas)
+    tags = row.get("tags") or []
+
     return Memory(
         id=row["id"],
         content=row["content"],
@@ -276,6 +281,7 @@ def _row_to_memory(row) -> Memory:
         confidence=row["confidence"],
         access_count=row["access_count"],
         decay_score=row["decay_score"],
+        tags=tags,
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )
@@ -358,8 +364,8 @@ async def create_memory(req: MemoryCreate, _key: str = Depends(verify_api_key)):
             tenant_id = getattr(_key, 'tenant_id', DEFAULT_TENANT_ID)
             row = await conn.fetchrow(
                 """
-                INSERT INTO memories (content, embedding, memory_type, agent_id, metadata, parent_id, confidence, content_hash, tenant_id)
-                VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9)
+                INSERT INTO memories (content, embedding, memory_type, agent_id, metadata, parent_id, confidence, content_hash, tenant_id, tags)
+                VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9, $10)
                 RETURNING *
                 """,
                 req.content,
@@ -371,6 +377,7 @@ async def create_memory(req: MemoryCreate, _key: str = Depends(verify_api_key)):
                 req.confidence,
                 c_hash,
                 tenant_id,
+                req.tags or [],
             )
 
     memory = _row_to_memory(row)
@@ -507,10 +514,17 @@ async def search_memories(req: SearchRequest, _key: str = Depends(verify_api_key
         filters.append(f"confidence >= ${idx}")
         params.append(req.min_confidence)
         idx += 1
+    if req.tags:
+        # Filter: memory must contain ALL requested tags (array containment)
+        filters.append(f"tags @> ${idx}")
+        params.append(req.tags)
+        idx += 1
 
     where = (" AND " + " AND ".join(filters)) if filters else ""
     async with _tenant_conn(_key) as conn:
         vec = f"vector({EMBEDDING_DIMS})"
+        # Set HNSW search ef for better recall on filtered queries
+        await conn.execute("SET LOCAL hnsw.ef_search = 100")
         rows = await conn.fetch(
             f"""
             SELECT *, 1 - (embedding <=> $1::{vec}) AS similarity
@@ -1476,6 +1490,126 @@ async def get_tenant(tenant_slug: str, _key: str = Depends(verify_api_key)):
         if not row:
             raise HTTPException(status_code=404, detail="Tenant not found")
         return dict(row)
+
+# --- Context Blocks (Stable Agent State) ---
+
+
+@app.get("/api/v1/memu/blocks/{key:path}", response_model=MemoryBlock)
+async def get_block(key: str, _key: str = Depends(verify_api_key)):
+    """Get a context block by key (e.g. 'project:jiraflow:status')."""
+    tenant_id = getattr(_key, 'tenant_id', DEFAULT_TENANT_ID)
+    async with _tenant_conn(_key) as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM memory_blocks WHERE key = $1 AND tenant_id = $2",
+            key, tenant_id,
+        )
+    if not row:
+        raise HTTPException(status_code=404, detail=f"Block '{key}' not found")
+    return MemoryBlock(
+        key=row["key"],
+        content=row["content"],
+        agent_owner=row["agent_owner"],
+        metadata=json.loads(row["metadata"]) if isinstance(row["metadata"], str) else row["metadata"],
+        version=row["version"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
+
+
+@app.put("/api/v1/memu/blocks/{key:path}", response_model=MemoryBlock)
+async def upsert_block(key: str, req: MemoryBlockCreate, _key: str = Depends(verify_api_key)):
+    """Create or update a context block. Version auto-increments on update."""
+    tenant_id = getattr(_key, 'tenant_id', DEFAULT_TENANT_ID)
+    async with _tenant_conn(_key) as conn:
+        row = await conn.fetchrow(
+            """
+            INSERT INTO memory_blocks (key, content, agent_owner, metadata, tenant_id, version)
+            VALUES ($1, $2, $3, $4::jsonb, $5, 1)
+            ON CONFLICT (key, tenant_id) DO UPDATE SET
+                content = EXCLUDED.content,
+                agent_owner = COALESCE(EXCLUDED.agent_owner, memory_blocks.agent_owner),
+                metadata = memory_blocks.metadata || EXCLUDED.metadata,
+                version = memory_blocks.version + 1,
+                updated_at = NOW()
+            RETURNING *
+            """,
+            key,
+            req.content,
+            req.agent_owner,
+            json.dumps(req.metadata) if req.metadata else "{}",
+            tenant_id,
+        )
+
+    block = MemoryBlock(
+        key=row["key"],
+        content=row["content"],
+        agent_owner=row["agent_owner"],
+        metadata=json.loads(row["metadata"]) if isinstance(row["metadata"], str) else row["metadata"],
+        version=row["version"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
+
+    # Publish NATS event for block updates
+    if _nats_publisher:
+        try:
+            nc = _nats_publisher.cluster.active_connection
+            payload = {
+                "key": key,
+                "agent_owner": req.agent_owner,
+                "version": block.version,
+                "updated_at": block.updated_at.isoformat(),
+            }
+            await nc.publish(f"agent.block.updated.{key.replace(':', '.')}", json.dumps(payload).encode())
+        except Exception as e:
+            logger.warning("NATS publish failed for block update: %s", e)
+
+    return block
+
+
+@app.delete("/api/v1/memu/blocks/{key:path}")
+async def delete_block(key: str, _key: str = Depends(verify_api_key)):
+    """Delete a context block."""
+    tenant_id = getattr(_key, 'tenant_id', DEFAULT_TENANT_ID)
+    async with _tenant_conn(_key) as conn:
+        result = await conn.execute(
+            "DELETE FROM memory_blocks WHERE key = $1 AND tenant_id = $2",
+            key, tenant_id,
+        )
+    if result == "DELETE 0":
+        raise HTTPException(status_code=404, detail=f"Block '{key}' not found")
+    return {"deleted": True, "key": key}
+
+
+@app.get("/api/v1/memu/blocks")
+async def list_blocks(
+    agent: str | None = None,
+    prefix: str | None = None,
+    _key: str = Depends(verify_api_key),
+):
+    """List all context blocks, optionally filtered by agent or key prefix."""
+    tenant_id = getattr(_key, 'tenant_id', DEFAULT_TENANT_ID)
+    filters = ["tenant_id = $1"]
+    params: list[Any] = [tenant_id]
+    idx = 2
+
+    if agent:
+        filters.append(f"agent_owner = ${idx}")
+        params.append(agent)
+        idx += 1
+    if prefix:
+        filters.append(f"key LIKE ${idx}")
+        params.append(f"{prefix}%")
+        idx += 1
+
+    where = " AND ".join(filters)
+    async with _tenant_conn(_key) as conn:
+        rows = await conn.fetch(
+            f"SELECT key, agent_owner, version, updated_at FROM memory_blocks WHERE {where} ORDER BY key",
+            *params,
+        )
+    return [dict(r) for r in rows]
+
 
 if __name__ == "__main__":
     import uvicorn
