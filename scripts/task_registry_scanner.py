@@ -279,11 +279,13 @@ async def create_or_update_task(conn: asyncpg.Connection, payload: dict[str, Any
         """
         SELECT id, status
         FROM backlog
-        WHERE source_ref = $1 OR source_fingerprint = $2
+        WHERE tenant_id = $3
+          AND (source_ref = $1 OR source_fingerprint = $2)
         LIMIT 1
         """,
         payload["source_ref"],
         payload["source_fingerprint"],
+        defaults["tenant_id"],
     )
 
     if existing_ref:
@@ -416,7 +418,7 @@ async def run_scanner() -> int:
 
     tenant_id = args.tenant_id or os.environ.get("TASK_REGISTRY_TENANT_ID") or str(DEFAULT_TENANT_ID)
 
-    include_ext = ",".join([e if e.startswith("*") else f"{e}" for e in [part.strip() for part in args.include.split(",")]])
+    include_ext = ",".join([e.strip() for e in args.include.split(",")])
     exclude_globs = [part.strip() for part in args.exclude.split(",") if part.strip()]
 
     conn = await asyncpg.connect(db_url)
@@ -464,10 +466,6 @@ async def run_scanner() -> int:
                     if await sync_github_issue(payload, args.github_repo):
                         github_created += 1
 
-        await conn.close()
-        if publisher and getattr(publisher, "cluster", None):
-            await publisher.cluster.close()
-
         print(
             json.dumps(
                 {
@@ -481,6 +479,8 @@ async def run_scanner() -> int:
                 indent=2,
             )
         )
+
+        return created
     finally:
         if not conn.is_closed():
             await conn.close()

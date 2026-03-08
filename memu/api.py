@@ -1008,14 +1008,17 @@ async def review_task(task_id: UUID, req: TaskReviewRequest, _key: str = Depends
         if req.decision.value == "approve":
             new_status = "done"
             new_review_status = "passed"
+            new_refine_status = "approved"
             new_retry = existing_retry
         elif req.decision.value == "block":
             new_status = "blocked"
             new_review_status = "blocked"
+            new_refine_status = "needs_revision"
             new_retry = existing_retry
         else:
             new_status = "pending"
             new_review_status = "needs_input"
+            new_refine_status = "needs_revision"
             new_retry = existing_retry + 1
 
         updated = await conn.fetchrow(
@@ -1028,6 +1031,7 @@ async def review_task(task_id: UUID, req: TaskReviewRequest, _key: str = Depends
                 reviewed_at = $5,
                 review_notes = $6,
                 retry_count = $7,
+                refine_status = $8,
                 refined_at = CASE WHEN $3 = 'passed' THEN $5 ELSE refined_at END,
                 updated_at = NOW()
             WHERE id = $1
@@ -1040,6 +1044,7 @@ async def review_task(task_id: UUID, req: TaskReviewRequest, _key: str = Depends
             now,
             combined_notes,
             new_retry,
+            new_refine_status,
         )
 
     task = _row_to_task(updated)
