@@ -78,3 +78,24 @@ This registry uses inverted confidence semantics:
 
 - **risk <= 80**: auto-proceed into pending flow
 - **risk > 80**: treated as blocked and routed for explicit human/agent review
+
+
+## Cycle execution helper
+
+Use:
+
+```bash
+TASK_REGISTRY_REPOS="/Users/harrisonfethe/.openclaw/workspace,/Users/harrisonfethe/Projects" TASK_REGISTRY_DB_URL="$DATABASE_URL" TASK_REGISTRY_RUN_REFINER=1 TASK_REGISTRY_REFINER_PUBLISH_NATS=1 TASK_REGISTRY_PUBLISH_NATS=1 ./scripts/run_task_registry_cycle.sh
+```
+
+Environment knobs:
+- `TASK_REGISTRY_REPOS` (required): comma-separated repo roots to scan
+- `TASK_REGISTRY_DB_URL` / `DATABASE_URL` (required): DB URL for memU
+- `TASK_REGISTRY_TENANT_ID` (default: `00000000-0000-0000-0000-000000000001`)
+- `TASK_REGISTRY_MENU_BUCKET` (default: `code-scan`)
+- `TASK_REGISTRY_OWNER` (default: `system`)
+- `TASK_REGISTRY_RUN_REFINER` (default: `1`)
+- `TASK_REGISTRY_REFINER_LIMIT` (default: `200`)
+- `TASK_REGISTRY_REFINER_PUBLISH_NATS` (default: `0`)
+- `TASK_REGISTRY_PUBLISH_NATS` (default: `0`)
+- `TASK_REGISTRY_GITHUB_SYNC` + `TASK_REGISTRY_GITHUB_REPO`

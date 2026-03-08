@@ -270,8 +270,8 @@ async def publish_events(publisher: NATSEventPublisher | None, payload: dict[str
 async def create_or_update_task(conn: asyncpg.Connection, payload: dict[str, Any], defaults: dict[str, Any]) -> tuple[bool, str]:
     risk = int(payload["risk_score"])
     payload["status"] = determine_status(risk)
-    payload["review_status"] = "needs_input" if risk > 80 else "pending_review"
-    payload["refine_status"] = build_refine_status(risk)
+    payload.setdefault("review_status", "needs_input" if risk > 80 else "pending_review")
+    payload.setdefault("refine_status", build_refine_status(risk))
     payload["refined_at"] = None
     payload["retry_count"] = 0
 
@@ -450,9 +450,10 @@ async def run_scanner() -> int:
 
                 if not passes_refine:
                     payload["review_status"] = "needs_input"
+                    payload["refine_status"] = "needs_revision"
                     payload["metadata"]["refine_fail_reason"] = reason
 
-                ok, result = await create_or_update_task(conn, payload, defaults)
+                ok, _result = await create_or_update_task(conn, payload, defaults)
                 total += 1
 
                 if not ok:
@@ -493,7 +494,6 @@ async def _main():
 
 
 if __name__ == "__main__":
-    import sys
     try:
         raise SystemExit(asyncio.run(_main()))
     except KeyboardInterrupt:
