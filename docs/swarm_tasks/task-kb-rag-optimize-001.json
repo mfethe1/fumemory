@@ -1,0 +1,35 @@
+{
+  "task_id": "task-kb-rag-optimize-001",
+  "project": "kb-rag",
+  "title": "Tune retrieval scoring with fixed evaluator",
+  "lane": "optimize",
+  "status": "queued",
+  "priority": "high",
+  "requested_by": "Michael",
+  "acceptance_criteria": [
+    "Single mutable target is enforced",
+    "Fixed evaluator runs successfully",
+    "Results ledger is produced",
+    "Reviewer signs off on improvement"
+  ],
+  "evaluation_plan": [
+    "Run baseline evaluator",
+    "Run three bounded experiment iterations",
+    "Compare best metric against baseline",
+    "Attach results.tsv and run logs"
+  ],
+  "assigned_gateway": null,
+  "assigned_agent": null,
+  "fencing_token": null,
+  "attempt_count": 0,
+  "depends_on": [],
+  "input_refs": [],
+  "artifact_refs": [],
+  "result_summary": null,
+  "score": null,
+  "review_status": null,
+  "reviewer": null,
+  "memory_proof": null,
+  "created_at": "2026-03-08T17:40:00-05:00",
+  "updated_at": "2026-03-08T17:40:00-05:00"
+}
