@@ -42,6 +42,8 @@ from memu.models import (
     Task,
     TaskCreate,
     TaskStatus,
+    TaskUpdate,
+    TaskReviewRequest,
 )
 
 from memu.notion_bridge import create_bridge_from_env, NotionBridge
@@ -294,6 +296,20 @@ def _row_to_task(row) -> Task:
         metadata=metadata,
         evidence=row["evidence"],
         dependency_id=row["dependency_id"],
+        risk_score=row.get("risk_score", 25) if hasattr(row, "get") else 25,
+        source=row.get("source"),
+        source_ref=row.get("source_ref"),
+        project=row.get("project"),
+        completion_criteria=row.get("completion_criteria"),
+        review_status=row.get("review_status", "pending_review"),
+        reviewer_id=row.get("reviewer_id"),
+        reviewed_at=row.get("reviewed_at"),
+        review_notes=row.get("review_notes"),
+        retry_count=row.get("retry_count", 0),
+        refine_status=row.get("refine_status", "pending"),
+        refined_at=row.get("refined_at"),
+        source_fingerprint=row.get("source_fingerprint"),
+        menu_bucket=row.get("menu_bucket"),
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )
@@ -784,12 +800,39 @@ async def bulk_import(req: BulkImportRequest, _key: str = Depends(verify_api_key
 
 @app.post("/tasks", response_model=Task)
 async def create_task(req: TaskCreate, _key: str = Depends(verify_api_key)):
-    tenant_id = getattr(_key, 'tenant_id', DEFAULT_TENANT_ID)
+    tenant_id = getattr(_key, "tenant_id", DEFAULT_TENANT_ID)
+
+    if req.risk_score is None:
+        req.risk_score = 25
+
+    source_fingerprint = None
+    if req.source or req.source_ref or req.task:
+        source_fingerprint = hashlib.sha256(
+            f"{req.source or ''}|{req.source_ref or ''}|{req.task}".encode()
+        ).hexdigest()[:64]
+
     async with _tenant_conn(_key) as conn:
         row = await conn.fetchrow(
             """
-            INSERT INTO backlog (task, priority, owner_id, lane, metadata, dependency_id, tenant_id)
-            VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7)
+            INSERT INTO backlog (
+                task,
+                priority,
+                owner_id,
+                lane,
+                metadata,
+                dependency_id,
+                tenant_id,
+                risk_score,
+                source,
+                source_ref,
+                project,
+                completion_criteria,
+                menu_bucket,
+                source_fingerprint
+            )
+            VALUES (
+                $1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9, $10, $11, $12, $13, $14
+            )
             RETURNING *
             """,
             req.task,
@@ -799,15 +842,46 @@ async def create_task(req: TaskCreate, _key: str = Depends(verify_api_key)):
             json.dumps(req.metadata) if req.metadata else "{}",
             req.dependency_id,
             tenant_id,
+            req.risk_score,
+            req.source,
+            req.source_ref,
+            req.project,
+            req.completion_criteria,
+            req.menu_bucket,
+            source_fingerprint,
         )
-    return _row_to_task(row)
+
+    task = _row_to_task(row)
+
+    if _nats_publisher:
+        try:
+            await _nats_publisher.publish_task_drafted(
+                agent_id=(req.owner_id or "system"),
+                task_id=str(task.id),
+                title=task.task,
+                source=req.source or "manual",
+                risk_score=task.risk_score,
+            )
+        except Exception as exc:
+            logger.warning("Failed to emit TASK_DRAFTED event: %s", exc)
+
+    return task
 
 
 @app.get("/tasks", response_model=list[Task])
-async def list_tasks(status: TaskStatus | None = None, owner: str | None = None, _key: str = Depends(verify_api_key)):
-    filters = []
-    params = []
-    idx = 1
+async def list_tasks(
+    status: TaskStatus | None = None,
+    owner: str | None = None,
+    source: str | None = None,
+    project: str | None = None,
+    review_status: str | None = None,
+    min_risk: int | None = None,
+    max_risk: int | None = None,
+    _key: str = Depends(verify_api_key),
+):
+    filters = ["tenant_id = $1"]
+    params = [str(getattr(_key, "tenant_id", DEFAULT_TENANT_ID))]
+    idx = 2
     if status:
         filters.append(f"status = ${idx}")
         params.append(status.value)
@@ -816,11 +890,183 @@ async def list_tasks(status: TaskStatus | None = None, owner: str | None = None,
         filters.append(f"owner_id = ${idx}")
         params.append(owner)
         idx += 1
-    
-    where = (" WHERE " + " AND ".join(filters)) if filters else ""
+    if source:
+        filters.append(f"source = ${idx}")
+        params.append(source)
+        idx += 1
+    if project:
+        filters.append(f"project = ${idx}")
+        params.append(project)
+        idx += 1
+    if review_status:
+        filters.append(f"review_status = ${idx}")
+        params.append(review_status)
+        idx += 1
+    if min_risk is not None:
+        filters.append(f"risk_score >= ${idx}")
+        params.append(min_risk)
+        idx += 1
+    if max_risk is not None:
+        filters.append(f"risk_score <= ${idx}")
+        params.append(max_risk)
+        idx += 1
+
+    where = " WHERE " + " AND ".join(filters)
     async with _tenant_conn(_key) as conn:
-        rows = await conn.fetch(f"SELECT * FROM backlog{where} ORDER BY priority ASC, created_at DESC", *params)
+        rows = await conn.fetch(
+            f"SELECT * FROM backlog{where} ORDER BY priority ASC, risk_score DESC, created_at DESC",
+            *params,
+        )
     return [_row_to_task(row) for row in rows]
+
+
+@app.patch("/tasks/{task_id}", response_model=Task)
+async def update_task(task_id: UUID, req: TaskUpdate, _key: str = Depends(verify_api_key)):
+    updates = []
+    values = []
+    idx = 1
+
+    if req.owner_id is not None:
+        updates.append(f"owner_id = ${idx}")
+        values.append(req.owner_id)
+        idx += 1
+
+    if req.status is not None:
+        updates.append(f"status = ${idx}")
+        values.append(req.status.value)
+        idx += 1
+
+    if req.lane is not None:
+        updates.append(f"lane = ${idx}")
+        values.append(req.lane)
+        idx += 1
+
+    if req.priority is not None:
+        updates.append(f"priority = ${idx}")
+        values.append(req.priority.value)
+        idx += 1
+
+    if req.risk_score is not None:
+        updates.append(f"risk_score = ${idx}")
+        values.append(req.risk_score)
+        idx += 1
+
+    if req.completion_criteria is not None:
+        updates.append(f"completion_criteria = ${idx}")
+        values.append(req.completion_criteria)
+        idx += 1
+
+    if req.review_status is not None:
+        updates.append(f"review_status = ${idx}")
+        values.append(req.review_status.value)
+        idx += 1
+
+    if req.reviewer_id is not None:
+        updates.append(f"reviewer_id = ${idx}")
+        values.append(req.reviewer_id)
+        idx += 1
+
+    if req.evidence is not None:
+        updates.append(f"evidence = ${idx}")
+        values.append(req.evidence)
+        idx += 1
+
+    if req.metadata is not None:
+        updates.append(f"metadata = ${idx}::jsonb")
+        values.append(json.dumps(req.metadata))
+        idx += 1
+
+    if not updates:
+        raise HTTPException(status_code=400, detail="No update fields provided")
+
+    updates.append(f"updated_at = NOW()")
+    values.append(task_id)
+
+    query = "UPDATE backlog SET " + ", ".join(updates) + f" WHERE id = ${idx} RETURNING *"
+
+    async with _tenant_conn(_key) as conn:
+        row = await conn.fetchrow(query, *values)
+        if not row:
+            raise HTTPException(status_code=404, detail="Task not found")
+
+    return _row_to_task(row)
+
+
+@app.post("/tasks/{task_id}/review", response_model=Task)
+async def review_task(task_id: UUID, req: TaskReviewRequest, _key: str = Depends(verify_api_key)):
+    now = datetime.now(timezone.utc)
+    async with _tenant_conn(_key) as conn:
+        row = await conn.fetchrow("SELECT * FROM backlog WHERE id = $1", task_id)
+        if not row:
+            raise HTTPException(status_code=404, detail="Task not found")
+
+        existing_notes = row["review_notes"] or ""
+        existing_retry = row["retry_count"] or 0
+        notes = f"[{now.isoformat()}] reviewer={req.reviewer_id} decision={req.decision.value} notes={req.notes}"
+        combined_notes = "\n".join([n for n in [existing_notes, notes] if n])
+
+        if req.decision.value == "approve":
+            new_status = "done"
+            new_review_status = "passed"
+            new_retry = existing_retry
+        elif req.decision.value == "block":
+            new_status = "blocked"
+            new_review_status = "blocked"
+            new_retry = existing_retry
+        else:
+            new_status = "pending"
+            new_review_status = "needs_input"
+            new_retry = existing_retry + 1
+
+        updated = await conn.fetchrow(
+            """
+            UPDATE backlog
+            SET
+                status = $2,
+                review_status = $3,
+                reviewer_id = $4,
+                reviewed_at = $5,
+                review_notes = $6,
+                retry_count = $7,
+                refined_at = CASE WHEN $3 = 'passed' THEN $5 ELSE refined_at END,
+                updated_at = NOW()
+            WHERE id = $1
+            RETURNING *
+            """,
+            task_id,
+            new_status,
+            new_review_status,
+            req.reviewer_id,
+            now,
+            combined_notes,
+            new_retry,
+        )
+
+    task = _row_to_task(updated)
+
+    if _nats_publisher:
+        try:
+            if req.decision.value == "approve":
+                await _nats_publisher.publish_task_completed(
+                    agent_id=row["owner_id"] or req.reviewer_id,
+                    task_id=str(task.id),
+                    title=task.task,
+                    evidence=task.evidence or "",
+                    source=task.source or "review",
+                )
+            elif req.decision.value in {"needs_info", "rework"}:
+                await _nats_publisher.publish_task_failed(
+                    agent_id=row["owner_id"] or req.reviewer_id,
+                    task_id=str(task.id),
+                    title=task.task,
+                    reason=f"{req.decision.value}: {req.notes}",
+                    source=row["source"] or "review",
+                    evidence=task.evidence or "",
+                )
+        except Exception as exc:
+            logger.warning("Failed to emit task review event: %s", exc)
+
+    return task
 
 
 # --- Graph / Cypher Queries ---

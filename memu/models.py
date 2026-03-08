@@ -1,4 +1,3 @@
-# memu/models.py
 from pydantic import BaseModel, Field
 from uuid import UUID
 from datetime import datetime
@@ -58,9 +57,11 @@ class SearchResult(BaseModel):
 
 class TaskStatus(str, Enum):
     pending = "pending"
+    claimed = "claimed"
     in_progress = "in_progress"
     done = "done"
     blocked = "blocked"
+    cancelled = "cancelled"
 
 class Priority(str, Enum):
     P0 = "P0"
@@ -68,26 +69,87 @@ class Priority(str, Enum):
     P2 = "P2"
     P3 = "P3"
 
+class TaskReviewStatus(str, Enum):
+    pending_review = "pending_review"
+    passed = "passed"
+    needs_input = "needs_input"
+    blocked = "blocked"
+    completed = "completed"
+
+class RefineStatus(str, Enum):
+    pending = "pending"
+    approved = "approved"
+    rejected = "rejected"
+    needs_revision = "needs_revision"
+
 class TaskCreate(BaseModel):
     task: str
     priority: Priority
-    owner_id: str
+    owner_id: str | None = None
     lane: str | None = None
     metadata: dict | None = None
     dependency_id: UUID | None = None
+
+    # Extended registry metadata
+    risk_score: int = Field(25, ge=0, le=100)
+    source: str | None = None
+    source_ref: str | None = None
+    project: str | None = None
+    completion_criteria: str | None = None
+    menu_bucket: str | None = None
 
 class Task(BaseModel):
     id: UUID
     task: str
     priority: str
     status: str
-    owner_id: str
+    owner_id: str | None
     lane: str | None
     metadata: dict
     evidence: str | None
     dependency_id: UUID | None
+
+    # Extended registry fields
+    risk_score: int
+    source: str | None
+    source_ref: str | None
+    project: str | None
+    completion_criteria: str | None
+    review_status: str
+    reviewer_id: str | None
+    reviewed_at: datetime | None
+    review_notes: str | None
+    retry_count: int
+    refine_status: str
+    refined_at: datetime | None
+    source_fingerprint: str | None
+    menu_bucket: str | None
+
     created_at: datetime
     updated_at: datetime
+
+class TaskUpdate(BaseModel):
+    status: TaskStatus | None = None
+    owner_id: str | None = None
+    lane: str | None = None
+    priority: Priority | None = None
+    risk_score: int | None = Field(None, ge=0, le=100)
+    completion_criteria: str | None = None
+    review_status: TaskReviewStatus | None = None
+    reviewer_id: str | None = None
+    metadata: dict | None = None
+    evidence: str | None = None
+
+class TaskReviewResult(str, Enum):
+    approve = "approve"
+    needs_info = "needs_info"
+    rework = "rework"
+    block = "block"
+
+class TaskReviewRequest(BaseModel):
+    reviewer_id: str
+    decision: TaskReviewResult
+    notes: str
 
 class BulkImportRequest(BaseModel):
     content: str
