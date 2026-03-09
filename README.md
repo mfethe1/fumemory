@@ -226,10 +226,24 @@ curl -X POST http://localhost:8000/chat \
 | `/memories/{id}` | GET | Retrieve a specific memory |
 | `/memories/{id}` | DELETE | Delete a memory |
 | `/memories/bulk` | POST | Bulk import from markdown/JSON |
+| `/tasks` | GET | List unified tasks (filter by owner, status, project, risk, etc.) |
+| `/tasks` | POST | Create a task (includes risk/refinement metadata) |
+| `/tasks/{task_id}` | PATCH | Update task state/owner/risk/outcome metadata |
+| `/tasks/{task_id}/review` | POST | Critical completion review decision endpoint |
 | `/api/dag/{root_id}` | GET | DAG snapshot for a root prompt |
 | `/api/cluster/status` | GET | NATS cluster health |
 | `/api/halt` | POST | Emergency halt (God Mode) |
 | `/ws/swarm` | WS | Real-time event stream |
+
+#### Unified Task Registry scripts
+
+- `scripts/task_registry_scanner.py` scans repos for TODO/FIXME/HACK/XXX markers and writes
+  risk-scored tasks into memU's `backlog` table.
+- `scripts/task_refiner_agent.py` enforces strict task refinement quality gates and
+  rewrites/marks tasks needing revision.
+- `scripts/task_completion_reviewer.py` validates task completion payloads before final closure.
+- Risk model is inverted from confidence: **risk > 80 enters high-risk review mode**; lower
+  risks can proceed.
 
 ---
 

@@ -119,6 +119,30 @@ class NATSEventPublisher:
         )
         return await self._publish(f"swarm.memory.{agent_id}", event)
 
+    async def publish_task_drafted(
+        self,
+        agent_id: str,
+        task_id: str,
+        title: str,
+        source: str = "notion",
+        risk_score: int = 25,
+        project: str | None = None,
+    ) -> bool:
+        """Fired when a new task is drafted into the unified task registry."""
+        event = self._make_event(
+            EventType.TASK_DRAFTED,
+            payload={
+                "agent_id": agent_id,
+                "task_id": task_id,
+                "title": title[:256],
+                "source": source,
+                "risk_score": risk_score,
+                "project": project,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+        return await self._publish("swarm.task.drafted", event)
+
     async def publish_task_claimed(
         self,
         agent_id: str,
@@ -138,6 +162,30 @@ class NATSEventPublisher:
             },
         )
         return await self._publish(f"swarm.task.claimed", event)
+
+    async def publish_task_failed(
+        self,
+        agent_id: str,
+        task_id: str,
+        title: str,
+        reason: str = "failed",
+        source: str = "notion",
+        evidence: str = "",
+    ) -> bool:
+        """Fired when a task fails review or completion criteria are not met."""
+        event = self._make_event(
+            EventType.TASK_FAILED,
+            payload={
+                "agent_id": agent_id,
+                "task_id": task_id,
+                "title": title[:256],
+                "reason": reason,
+                "evidence": evidence[:500],
+                "source": source,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+        return await self._publish("swarm.task.failed", event)
 
     async def publish_task_completed(
         self,
