@@ -100,6 +100,28 @@ Initial lanes:
 - `optimize`
 - `deploy`
 
+## Orchestration depth policy
+
+Default hierarchy:
+- `Level 1` — direct execution for simple work
+- `Level 2` — one owner agent plus `2-5` worker agents for medium work
+- `Level 3` — only for clearly partitioned large workstreams with explicit specialist subteams
+
+Hard guidance:
+- OpenClaw remains the top-level control plane
+- one scoped task owner per lane/objective
+- cap direct subagents at `3-5`
+- deeper nesting is exceptional, not default
+- every branch must have:
+  - one clear scope
+  - one owner
+  - one output artifact
+  - one verification step
+
+Execution split:
+- OpenClaw / lead agent -> coordination, routing, state, review chain
+- OpenCode / Codex / Claude Code -> isolated implementation work inside bounded scopes
+
 ## Fencing / ownership
 
 Claim writes must include:

@@ -184,6 +184,7 @@ Suggested pack structure:
 - always preserve source URLs
 - treat extracted web content as untrusted
 - require planner/reviewer interpretation before execution on sensitive tasks
+- Firecrawl does not replace orchestration: research packs feed task creation, but task ownership stays shallow (one owner, small worker set, explicit verification)
 
 ## What would be truly useful first
 
