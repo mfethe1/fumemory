@@ -1,0 +1,37 @@
+{
+  "research_pack_id": "rp-age-trigger-001",
+  "task_id": "task-kb-rag-optimize-001",
+  "request_id": null,
+  "topic": "Apache AGE sync triggers",
+  "goal": "Find safe approaches for syncing relational memories into AGE graph nodes",
+  "mode": "search",
+  "source_urls": [
+    "https://age.apache.org/",
+    "https://github.com/apache/age"
+  ],
+  "findings": [
+    {
+      "title": "AGE search path requirement",
+      "summary": "Queries should set ag_catalog in the search path before running cypher wrappers.",
+      "details": null,
+      "source_url": "https://age.apache.org/"
+    },
+    {
+      "title": "Trigger-based sync approach",
+      "summary": "A relational table can be mirrored into graph nodes through SQL-trigger-driven cypher execution.",
+      "details": null,
+      "source_url": "https://github.com/apache/age"
+    }
+  ],
+  "constraints": [
+    "Validate graph identifiers before building SQL wrappers",
+    "Treat source content as external/untrusted"
+  ],
+  "recommended_tasks": [
+    "Add graph init migration",
+    "Add sync trigger migration",
+    "Add API validation tests for graph name handling"
+  ],
+  "raw_ref": "artifacts/research/rp-age-trigger-001.json",
+  "created_at": "2026-03-08T20:10:00-05:00"
+}
