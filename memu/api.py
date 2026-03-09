@@ -1,7 +1,7 @@
 ﻿"""memU API â€” FastAPI application."""
 
 from __future__ import annotations
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import hashlib
 import json
@@ -11,6 +11,7 @@ import logging
 from contextlib import asynccontextmanager
 from typing import Any
 from uuid import UUID
+import re
 
 import asyncpg
 import httpx
@@ -34,6 +35,11 @@ from memu.models import (
     BulkImportResponse,
     ChatRequest,
     ChatResponse,
+    GatewayLease,
+    GatewayLeaseAcquireRequest,
+    GatewayLeaseAcquireResponse,
+    GatewayLeaseReleaseRequest,
+    GatewayLeaseRenewRequest,
     Memory,
     MemoryCreate,
     MemoryType,
@@ -189,6 +195,15 @@ def _coerce_memory_type(raw: str | None) -> MemoryType | None:
         raise HTTPException(status_code=422, detail=f"invalid memory_type: {raw}")
 
 
+def _validate_graph_identifier(graph_name: str) -> str:
+    """Whitelist graph identifiers to prevent SQL injection in cypher wrapper SQL."""
+    normalized = graph_name.strip()
+    if not normalized:
+        raise HTTPException(status_code=422, detail="graph_name is required")
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,62}", normalized):
+        raise HTTPException(status_code=422, detail="invalid graph_name")
+    return normalized
+
 
 # --- Embedding ---
 
@@ -313,6 +328,52 @@ def _row_to_task(row) -> Task:
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )
+
+
+def _row_to_gateway_lease(row) -> GatewayLease:
+    task_state = row["task_state"]
+    metadata = row["metadata"]
+    if isinstance(task_state, str):
+        task_state = json.loads(task_state)
+    if isinstance(metadata, str):
+        metadata = json.loads(metadata)
+    return GatewayLease(
+        lease_key=row["lease_key"],
+        owner_gateway=row["owner_gateway"],
+        backup_gateway=row["backup_gateway"],
+        lease_expires_at=row["lease_expires_at"],
+        last_message_id=row["last_message_id"],
+        last_reply_id=row["last_reply_id"],
+        context_digest=row["context_digest"],
+        task_state=task_state or {},
+        metadata=metadata or {},
+        version=row["version"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
+
+
+async def _publish_gateway_lease_event(action: str, lease: GatewayLease):
+    if not _nats_publisher:
+        return
+    try:
+        subject = f"swarm.gateway.lease.{action}"
+        payload = {
+            "action": action,
+            "lease_key": lease.lease_key,
+            "owner_gateway": lease.owner_gateway,
+            "backup_gateway": lease.backup_gateway,
+            "lease_expires_at": lease.lease_expires_at.isoformat(),
+            "version": lease.version,
+            "last_message_id": lease.last_message_id,
+            "last_reply_id": lease.last_reply_id,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        nc = _nats_publisher.cluster.active_connection
+        await nc.publish(subject, json.dumps(payload).encode())
+        await nc.flush()
+    except Exception as e:
+        logger.warning("NATS publish failed for gateway lease %s: %s", action, e)
 
 
 def _expansion_schedule(base_limit: int, max_steps: int) -> list[int]:
@@ -1072,6 +1133,142 @@ async def review_task(task_id: UUID, req: TaskReviewRequest, _key: str = Depends
             logger.warning("Failed to emit task review event: %s", exc)
 
     return task
+@app.get("/api/v1/gateway-leases/{lease_key:path}", response_model=GatewayLease)
+async def get_gateway_lease(lease_key: str, _key: str = Depends(verify_api_key)):
+    async with _tenant_conn(_key) as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM gateway_topic_leases WHERE lease_key = $1",
+            lease_key,
+        )
+    if not row:
+        raise HTTPException(status_code=404, detail="Lease not found")
+    return _row_to_gateway_lease(row)
+
+
+@app.post("/api/v1/gateway-leases/acquire", response_model=GatewayLeaseAcquireResponse)
+async def acquire_gateway_lease(req: GatewayLeaseAcquireRequest, _key: str = Depends(verify_api_key)):
+    now = datetime.now(timezone.utc)
+    expires_at = now.replace(microsecond=0) + timedelta(seconds=req.ttl_seconds)
+    status = "claimed"
+
+    async with _tenant_conn(_key) as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                "SELECT * FROM gateway_topic_leases WHERE lease_key = $1 FOR UPDATE",
+                req.lease_key,
+            )
+            if row is None:
+                row = await conn.fetchrow(
+                    """
+                    INSERT INTO gateway_topic_leases (
+                        lease_key, owner_gateway, backup_gateway, lease_expires_at,
+                        last_message_id, context_digest, task_state, metadata
+                    )
+                    VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb)
+                    RETURNING *
+                    """,
+                    req.lease_key,
+                    req.gateway_id,
+                    req.backup_gateway,
+                    expires_at,
+                    req.last_message_id,
+                    req.context_digest,
+                    json.dumps(req.task_state or {}),
+                    json.dumps(req.metadata or {}),
+                )
+            else:
+                if row["owner_gateway"] == req.gateway_id:
+                    status = "renewed"
+                elif row["lease_expires_at"] > now:
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "message": "Lease is currently held by another gateway",
+                            "owner_gateway": row["owner_gateway"],
+                            "lease_expires_at": row["lease_expires_at"].isoformat(),
+                            "version": row["version"],
+                        },
+                    )
+                else:
+                    status = "stolen"
+
+                row = await conn.fetchrow(
+                    """
+                    UPDATE gateway_topic_leases
+                    SET owner_gateway = $2,
+                        backup_gateway = COALESCE($3, backup_gateway),
+                        lease_expires_at = $4,
+                        last_message_id = COALESCE($5, last_message_id),
+                        context_digest = COALESCE($6, context_digest),
+                        task_state = CASE WHEN $7::jsonb = '{}'::jsonb THEN task_state ELSE $7::jsonb END,
+                        metadata = metadata || $8::jsonb,
+                        version = version + 1
+                    WHERE lease_key = $1
+                    RETURNING *
+                    """,
+                    req.lease_key,
+                    req.gateway_id,
+                    req.backup_gateway,
+                    expires_at,
+                    req.last_message_id,
+                    req.context_digest,
+                    json.dumps(req.task_state or {}),
+                    json.dumps(req.metadata or {}),
+                )
+
+    lease = _row_to_gateway_lease(row)
+    await _publish_gateway_lease_event(status, lease)
+    return GatewayLeaseAcquireResponse(status=status, lease=lease)
+
+
+@app.post("/api/v1/gateway-leases/renew", response_model=GatewayLeaseAcquireResponse)
+async def renew_gateway_lease(req: GatewayLeaseRenewRequest, _key: str = Depends(verify_api_key)):
+    now = datetime.now(timezone.utc)
+    expires_at = now.replace(microsecond=0) + timedelta(seconds=req.ttl_seconds)
+    async with _tenant_conn(_key) as conn:
+        row = await conn.fetchrow(
+            """
+            UPDATE gateway_topic_leases
+            SET lease_expires_at = $3,
+                last_message_id = COALESCE($4, last_message_id),
+                last_reply_id = COALESCE($5, last_reply_id),
+                context_digest = COALESCE($6, context_digest),
+                task_state = CASE WHEN $7::jsonb = '{}'::jsonb THEN task_state ELSE $7::jsonb END,
+                metadata = metadata || $8::jsonb,
+                version = version + 1
+            WHERE lease_key = $1
+              AND owner_gateway = $2
+            RETURNING *
+            """,
+            req.lease_key,
+            req.gateway_id,
+            expires_at,
+            req.last_message_id,
+            req.last_reply_id,
+            req.context_digest,
+            json.dumps(req.task_state or {}),
+            json.dumps(req.metadata or {}),
+        )
+    if not row:
+        raise HTTPException(status_code=409, detail="Lease renew rejected: caller is not current owner")
+    lease = _row_to_gateway_lease(row)
+    await _publish_gateway_lease_event("renewed", lease)
+    return GatewayLeaseAcquireResponse(status="renewed", lease=lease)
+
+
+@app.post("/api/v1/gateway-leases/release")
+async def release_gateway_lease(req: GatewayLeaseReleaseRequest, _key: str = Depends(verify_api_key)):
+    async with _tenant_conn(_key) as conn:
+        row = await conn.fetchrow(
+            "DELETE FROM gateway_topic_leases WHERE lease_key = $1 AND owner_gateway = $2 RETURNING *",
+            req.lease_key,
+            req.gateway_id,
+        )
+    if not row:
+        raise HTTPException(status_code=409, detail="Lease release rejected: caller is not current owner")
+    lease = _row_to_gateway_lease(row)
+    await _publish_gateway_lease_event("released", lease)
+    return {"ok": True, "status": "released", "lease": lease.model_dump(mode="json")}
 
 
 # --- Graph / Cypher Queries ---
@@ -1083,11 +1280,12 @@ class CypherRequest(BaseModel):
 @app.post("/api/v1/memu/cypher")
 async def execute_cypher(req: CypherRequest, _key: str = Depends(verify_api_key)):
     """Execute raw Cypher queries against the memU knowledge graph."""
+    graph_name = _validate_graph_identifier(req.graph_name)
     async with pool.acquire() as conn:
         try:
             await conn.execute("SET search_path = ag_catalog, \"$user\", public")
             # Example query: MATCH (v:Memory) RETURN v
-            cypher_sql = f"SELECT * FROM cypher('{req.graph_name}', $$ {req.query} $$) AS (result agtype);"
+            cypher_sql = f"SELECT * FROM cypher('{graph_name}', $$ {req.query} $$) AS (result agtype);"
             rows = await conn.fetch(cypher_sql)
             return {"ok": True, "results": [dict(r) for r in rows]}
         except Exception as e:

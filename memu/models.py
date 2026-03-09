@@ -2,6 +2,7 @@ from pydantic import BaseModel, Field
 from uuid import UUID
 from datetime import datetime
 from enum import Enum
+from typing import Any
 
 class MemoryType(str, Enum):
     # Original types (backwards compatibility)
@@ -169,3 +170,51 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     answer: str
     sources: list[Memory]
+
+
+class GatewayLeaseAcquireRequest(BaseModel):
+    lease_key: str = Field(min_length=1, max_length=255)
+    gateway_id: str = Field(min_length=1, max_length=128)
+    backup_gateway: str | None = Field(default=None, max_length=128)
+    ttl_seconds: int = Field(default=120, ge=5, le=3600)
+    last_message_id: str | None = None
+    context_digest: str | None = None
+    task_state: dict[str, Any] | None = None
+    metadata: dict[str, Any] | None = None
+
+
+class GatewayLeaseRenewRequest(BaseModel):
+    lease_key: str = Field(min_length=1, max_length=255)
+    gateway_id: str = Field(min_length=1, max_length=128)
+    ttl_seconds: int = Field(default=120, ge=5, le=3600)
+    last_message_id: str | None = None
+    last_reply_id: str | None = None
+    context_digest: str | None = None
+    task_state: dict[str, Any] | None = None
+    metadata: dict[str, Any] | None = None
+
+
+class GatewayLeaseReleaseRequest(BaseModel):
+    lease_key: str = Field(min_length=1, max_length=255)
+    gateway_id: str = Field(min_length=1, max_length=128)
+
+
+class GatewayLease(BaseModel):
+    lease_key: str
+    owner_gateway: str
+    backup_gateway: str | None = None
+    lease_expires_at: datetime
+    last_message_id: str | None = None
+    last_reply_id: str | None = None
+    context_digest: str | None = None
+    task_state: dict[str, Any]
+    metadata: dict[str, Any]
+    version: int
+    created_at: datetime
+    updated_at: datetime
+
+
+class GatewayLeaseAcquireResponse(BaseModel):
+    ok: bool = True
+    status: str
+    lease: GatewayLease

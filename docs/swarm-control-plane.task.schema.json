@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fumemory.local/schemas/swarm/task.schema.json",
+  "title": "Swarm Task",
+  "type": "object",
+  "required": ["task_id", "project", "title", "lane", "status", "priority", "requested_by", "acceptance_criteria", "evaluation_plan", "created_at", "updated_at"],
+  "properties": {
+    "task_id": { "type": "string", "minLength": 1 },
+    "project": { "type": "string", "minLength": 1 },
+    "title": { "type": "string", "minLength": 1 },
+    "lane": { "enum": ["plan", "build", "test", "review", "research", "optimize", "deploy"] },
+    "status": { "enum": ["queued", "claimed", "running", "blocked", "review", "done", "failed", "cancelled"] },
+    "priority": { "enum": ["low", "medium", "high", "critical"] },
+    "requested_by": { "type": "string", "minLength": 1 },
+    "acceptance_criteria": { "type": "array", "items": { "type": "string" } },
+    "evaluation_plan": { "type": "array", "items": { "type": "string" } },
+    "assigned_gateway": { "type": ["string", "null"] },
+    "assigned_agent": { "type": ["string", "null"] },
+    "fencing_token": { "type": ["string", "null"] },
+    "attempt_count": { "type": "integer", "minimum": 0, "default": 0 },
+    "depends_on": { "type": "array", "items": { "type": "string" }, "default": [] },
+    "input_refs": { "type": "array", "items": { "type": "string" }, "default": [] },
+    "artifact_refs": { "type": "array", "items": { "type": "string" }, "default": [] },
+    "result_summary": { "type": ["string", "null"] },
+    "score": { "type": ["number", "null"] },
+    "review_status": { "enum": ["pending", "approved", "rejected", "needs_changes", null], "default": null },
+    "reviewer": { "type": ["string", "null"] },
+    "memory_proof": { "type": ["string", "null"] },
+    "created_at": { "type": "string", "format": "date-time" },
+    "updated_at": { "type": "string", "format": "date-time" }
+  },
+  "additionalProperties": false
+}

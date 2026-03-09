@@ -139,6 +139,20 @@ services:
         condition: service_healthy
 
 
+  memu-worker:
+    restart: unless-stopped
+    build: .
+    command: ["python", "-m", "memu.nats_worker"]
+    environment:
+      - NATS_URL=nats://nats:4222
+      - NOTION_API_KEY=${NOTION_API_KEY}
+      - NOTION_TASK_BOARD_ID=${NOTION_TASK_BOARD_ID}
+      - MEMU_BASE_URL=http://api:8000
+      - MEMU_API_KEY=${MEMU_API_KEY}
+    depends_on:
+      - api
+      - nats
+
   notion_poller:
     restart: unless-stopped
     build: .

@@ -31,7 +31,6 @@ from typing import Any
 from uuid import UUID, uuid4
 
 import httpx
-import nats
 
 # --- Config ---
 
@@ -92,25 +91,67 @@ def validate_memory(content: str, memory_type: str, confidence: float, agent_id:
 
 # --- NATS Emitter ---
 
+def _nats_outbox_dir() -> str:
+    """Outbox path for offline NATS publish payloads."""
+    env_path = os.environ.get("NATS_OUTBOX_DIR")
+    if env_path:
+        return env_path
+
+    workspace = os.environ.get("OPENCLAW_WORKSPACE")
+    if workspace:
+        return os.path.join(workspace, "nats", "outbox")
+
+    # Fall back to current working directory convention.
+    return os.path.join(os.getcwd(), "nats", "outbox")
+
+
+def _write_nats_outbox(subject: str, event: dict, error: str) -> str:
+    os.makedirs(_nats_outbox_dir(), exist_ok=True)
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    path = os.path.join(_nats_outbox_dir(), f"lenny-{ts}.json")
+    payload = {
+        "subject": subject,
+        "event": event,
+        "error": error,
+        "publish_command": f"nats pub {subject} '{json.dumps(event)}'",
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+    return path
+
+
 async def emit_nats_event(event_type: str, task_id: str, payload: dict, agent_id: str):
-    """Emit a SwarmEvent to the NATS mesh."""
+    """Emit a SwarmEvent to the NATS mesh.
+
+    Reliability behavior:
+    - If python nats dependency is unavailable, don't fail write flow.
+    - If NATS connect/publish fails, persist publish-ready outbox payload.
+    """
+    subject = "swarm.events"
+    event = {
+        "event_id": str(uuid4()),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "source_gateway": agent_id,
+        "event_type": event_type,
+        "task_id": task_id,
+        "payload": payload,
+    }
+
+    try:
+        import nats  # type: ignore
+    except Exception as e:
+        outbox_path = _write_nats_outbox(subject, event, f"nats_import_failed: {e}")
+        print(f"NATS unavailable; wrote outbox payload: {outbox_path}", file=sys.stderr)
+        return
+
     try:
         nc = await nats.connect(NATS_URL)
-        
-        event = {
-            "event_id": str(uuid4()),
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "source_gateway": agent_id,
-            "event_type": event_type,
-            "task_id": task_id,
-            "payload": payload
-        }
-        
-        await nc.publish("swarm.events", json.dumps(event).encode())
+        await nc.publish(subject, json.dumps(event).encode())
         await nc.flush()
         await nc.close()
     except Exception as e:
-        print(f"Failed to emit NATS event: {e}", file=sys.stderr)
+        outbox_path = _write_nats_outbox(subject, event, f"nats_publish_failed: {e}")
+        print(f"Failed to emit NATS event; wrote outbox payload: {outbox_path}", file=sys.stderr)
 
 
 # --- API Client ---
