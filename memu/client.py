@@ -83,10 +83,20 @@ class MemUClient:
         memory_type: str | MemoryType | None = None,
         temporal_weight: float = 0.3,
         min_confidence: float = 0.0,
+        tags: list[str] | None = None,
+        metadata_filters: dict[str, Any] | None = None,
         search_strategy: str = "hybrid",
         graph_depth: int = 1,
+        keyword_limit: int | None = None,
+        vector_rerank_limit: int | None = None,
+        recency_boost: float = 0.08,
+        supermemory_fallback: bool = False,
     ) -> list[SearchResult]:
-        """Hybrid/vector/text search over memories."""
+        """Hybrid/vector/text search over memories.
+
+        Default behavior is hybrid retrieval with metadata/tags filter-first,
+        keyword prefiltering, vector reranking, and a small recency boost.
+        """
         payload = {
             "query": query,
             "limit": limit,
@@ -94,8 +104,14 @@ class MemUClient:
             "memory_type": MemoryType(memory_type).value if memory_type else None,
             "temporal_weight": temporal_weight,
             "min_confidence": min_confidence,
+            "tags": tags or [],
+            "metadata_filters": metadata_filters or {},
             "search_strategy": search_strategy,
             "graph_depth": graph_depth,
+            "keyword_limit": keyword_limit,
+            "vector_rerank_limit": vector_rerank_limit,
+            "recency_boost": recency_boost,
+            "supermemory_fallback": supermemory_fallback,
         }
         r = self._client.post("/search", json=payload)
         r.raise_for_status()
@@ -140,8 +156,8 @@ class MemUClient:
     def close(self) -> None:
         self._client.close()
 
-    def __enter__(self):
+    def __enter__(self) -> "MemUClient":
         return self
 
-    def __exit__(self, *args):
+    def __exit__(self, *args) -> None:
         self.close()

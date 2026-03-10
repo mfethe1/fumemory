@@ -28,6 +28,11 @@ def normalize_ranked_rows(rows: list[Any], score_key: str, id_key: str = "id") -
     return normalized
 
 
+def candidate_limit(limit: int, multiplier: int = 4, minimum: int = 20, maximum: int = 200) -> int:
+    """Expand a final result count into a bounded candidate pool size."""
+    return max(minimum, min(limit * multiplier, maximum))
+
+
 def compute_graph_temporal_boost(
     memory_id: str,
     neighbor_rows: list[Any],
@@ -57,10 +62,30 @@ def compute_graph_temporal_boost(
     return min(total, 1.0) * 0.15
 
 
+def compute_recency_boost(
+    created_at: datetime,
+    now: datetime | None = None,
+    half_life_days: float = 14.0,
+    max_boost: float = 0.12,
+) -> float:
+    """Compute an explicit additive boost favoring newer memories.
+
+    Unlike the temporal decay score, this is a small bounded nudge applied during
+    the final rerank so recent memories win ties without overwhelming relevance.
+    """
+    now = now or datetime.now(timezone.utc)
+    if created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=timezone.utc)
+    age_days = max((now - created_at).total_seconds() / 86400.0, 0.0)
+    decay_days = max(half_life_days / 1.4427, 0.1)
+    return max_boost * exp(-age_days / decay_days)
+
+
 def blend_hybrid_score(
     fused_score: float,
     temporal_score: float,
     graph_boost: float,
+    recency_boost: float = 0.0,
 ) -> float:
-    """Combine fused retrieval, temporal relevance, and graph adjacency."""
-    return fused_score + (0.35 * temporal_score) + graph_boost
+    """Combine fused retrieval, temporal relevance, graph adjacency, and recency."""
+    return fused_score + (0.35 * temporal_score) + graph_boost + recency_boost

@@ -10,7 +10,7 @@ import os
 import logging
 from contextlib import asynccontextmanager
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import asyncpg
 import httpx
@@ -21,7 +21,9 @@ from pydantic import BaseModel
 from memu.decay import compute_final_score, should_deduplicate
 from memu.retrieval import (
     blend_hybrid_score,
+    candidate_limit,
     compute_graph_temporal_boost,
+    compute_recency_boost,
     normalize_ranked_rows,
     reciprocal_rank_fusion,
 )
@@ -73,6 +75,12 @@ EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
 EMBEDDING_DIMS = int(os.environ.get("EMBEDDING_DIMS", "384"))
 DEDUP_THRESHOLD = float(os.environ.get("DEDUP_THRESHOLD", "0.95"))
 DECAY_RATE = float(os.environ.get("DECAY_RATE", "0.01"))
+HYBRID_KEYWORD_MULTIPLIER = int(os.environ.get("HYBRID_KEYWORD_MULTIPLIER", "8"))
+HYBRID_VECTOR_MULTIPLIER = int(os.environ.get("HYBRID_VECTOR_MULTIPLIER", "4"))
+HYBRID_MAX_CANDIDATES = int(os.environ.get("HYBRID_MAX_CANDIDATES", "200"))
+SUPERMEMORY_SEARCH_URL = os.environ.get("SUPERMEMORY_SEARCH_URL", "")
+SUPERMEMORY_API_KEY = os.environ.get("SUPERMEMORY_API_KEY", "")
+SUPERMEMORY_TIMEOUT_S = float(os.environ.get("SUPERMEMORY_TIMEOUT_S", "15"))
 
 # --- Globals ---
 
@@ -310,6 +318,101 @@ def _row_to_task(row) -> Task:
         updated_at=row["updated_at"],
     )
 
+
+def _build_search_filter_clause(req: SearchRequest, start_index: int = 2) -> tuple[str, list[Any]]:
+    clauses: list[str] = []
+    params: list[Any] = []
+
+    def add(clause_template: str, value: Any) -> None:
+        params.append(value)
+        clauses.append(clause_template.format(idx=start_index + len(params) - 1))
+
+    if req.agent_id:
+        add("agent_id = ${idx}", req.agent_id)
+    if req.memory_type:
+        add("memory_type = ${idx}", req.memory_type.value)
+    if req.min_confidence > 0:
+        add("confidence >= ${idx}", req.min_confidence)
+    if req.tags:
+        add("tags @> ${idx}", req.tags)
+    for key, value in sorted((req.metadata_filters or {}).items()):
+        add("metadata @> ${idx}::jsonb", json.dumps({key: value}))
+
+    return ((" AND " + " AND ".join(clauses)) if clauses else ""), params
+
+
+async def _supermemory_fallback_search(req: SearchRequest) -> list[SearchResult]:
+    if not (req.supermemory_fallback and SUPERMEMORY_SEARCH_URL):
+        return []
+
+    headers = {"Content-Type": "application/json"}
+    if SUPERMEMORY_API_KEY:
+        headers["Authorization"] = f"Bearer {SUPERMEMORY_API_KEY}"
+
+    payload = {
+        "query": req.query,
+        "limit": req.limit,
+        "agent_id": req.agent_id,
+        "tags": req.tags,
+        "metadata_filters": req.metadata_filters,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=SUPERMEMORY_TIMEOUT_S) as client:
+            response = await client.post(SUPERMEMORY_SEARCH_URL, headers=headers, json=payload)
+            response.raise_for_status()
+            body = response.json()
+    except Exception as e:
+        logger.warning("SuperMemory fallback failed: %s", e)
+        return []
+
+    items = body.get("results", []) if isinstance(body, dict) else body
+    if not isinstance(items, list):
+        return []
+
+    now = datetime.now(timezone.utc)
+    normalized: list[SearchResult] = []
+    for item in items[: req.limit]:
+        if not isinstance(item, dict):
+            continue
+        if "memory" in item:
+            try:
+                normalized.append(SearchResult.model_validate(item))
+                continue
+            except Exception:
+                pass
+
+        memory_payload = item.get("memory") if isinstance(item.get("memory"), dict) else {}
+        content = memory_payload.get("content") or item.get("content") or item.get("text")
+        if not content:
+            continue
+
+        created_at = memory_payload.get("created_at") or item.get("created_at") or now
+        if isinstance(created_at, str):
+            created_at = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=timezone.utc)
+
+        memory = Memory(
+            id=memory_payload.get("id") or item.get("id") or uuid4(),
+            content=content,
+            memory_type=memory_payload.get("memory_type") or item.get("memory_type") or item.get("type") or MemoryType.external.value,
+            agent_id=memory_payload.get("agent_id") or item.get("agent_id") or req.agent_id or "supermemory",
+            metadata=memory_payload.get("metadata") or item.get("metadata") or {"source": "supermemory_fallback"},
+            parent_id=memory_payload.get("parent_id") or item.get("parent_id"),
+            confidence=memory_payload.get("confidence") or item.get("confidence") or 0.7,
+            access_count=memory_payload.get("access_count") or item.get("access_count") or 0,
+            decay_score=memory_payload.get("decay_score") or item.get("decay_score"),
+            tags=memory_payload.get("tags") or item.get("tags") or [],
+            created_at=created_at,
+            updated_at=memory_payload.get("updated_at") or item.get("updated_at") or created_at,
+        )
+        similarity = float(item.get("similarity") or item.get("score") or 0.5)
+        normalized.append(SearchResult(memory=memory, similarity=similarity, final_score=similarity))
+
+    return normalized
+
+
 # --- Routes ---
 
 @app.get("/health")
@@ -457,85 +560,76 @@ async def delete_memory(memory_id: UUID, _key: str = Depends(verify_api_key)):
 async def search_memories(req: SearchRequest, _key: str = Depends(verify_api_key)):
     strategy = (req.search_strategy or "hybrid").lower()
     embedding = await get_embedding(req.query) if strategy != "text" else None
-
-    filters = []
-    vector_filters = []
-    text_filters = []
-    if req.agent_id:
-        filters.append(("agent_id = ${idx}", req.agent_id))
-    if req.memory_type:
-        filters.append(("memory_type = ${idx}", req.memory_type.value))
-    if req.min_confidence > 0:
-        filters.append(("confidence >= ${idx}", req.min_confidence))
-    if req.tags:
-        filters.append(("tags @> ${idx}", req.tags))
+    keyword_limit = req.keyword_limit or candidate_limit(
+        req.limit,
+        multiplier=HYBRID_KEYWORD_MULTIPLIER,
+        maximum=HYBRID_MAX_CANDIDATES,
+    )
+    vector_limit = req.vector_rerank_limit or candidate_limit(
+        req.limit,
+        multiplier=HYBRID_VECTOR_MULTIPLIER,
+        maximum=HYBRID_MAX_CANDIDATES,
+    )
+    metadata_where, metadata_params = _build_search_filter_clause(req, start_index=2)
+    supermemory_used = False
 
     async with _tenant_conn(_key) as conn:
-        vector_params: list[Any] = []
-        text_params: list[Any] = [req.query]
-        if embedding is not None:
-            vector_params.append(str(embedding))
-
-        vec_idx = 2
-        text_idx = 2
-        for template, value in filters:
-            vector_filters.append(template.replace("{idx}", str(vec_idx)))
-            vector_params.append(value)
-            vec_idx += 1
-
-            text_filters.append(template.replace("{idx}", str(text_idx + 1)))
-            text_params.append(value)
-            text_idx += 1
-
-        vector_where = (" AND " + " AND ".join(vector_filters)) if vector_filters else ""
-        text_where = (" AND " + " AND ".join(text_filters)) if text_filters else ""
-
-        vector_rows = []
-        if embedding is not None and strategy in {"hybrid", "vector"}:
-            vec = f"vector({EMBEDDING_DIMS})"
-            await conn.execute("SET LOCAL hnsw.ef_search = 100")
-            vector_rows = await conn.fetch(
-                f"""
-                SELECT *, 1 - (embedding <=> $1::{vec}) AS similarity
-                FROM memories
-                WHERE embedding IS NOT NULL{vector_where}
-                ORDER BY embedding <=> $1::{vec}
-                LIMIT {max(req.limit * 4, 20)}
-                """,
-                *vector_params,
-            )
-
         text_rows = []
         if strategy in {"hybrid", "text"} or embedding is None:
+            text_params: list[Any] = [req.query, *metadata_params]
             text_rows = await conn.fetch(
                 f"""
                 SELECT *,
                        ts_rank_cd(to_tsvector('english', coalesce(content, '')), plainto_tsquery('english', $1)) AS text_score
                 FROM memories
-                WHERE to_tsvector('english', coalesce(content, '')) @@ plainto_tsquery('english', $1){text_where}
+                WHERE to_tsvector('english', coalesce(content, '')) @@ plainto_tsquery('english', $1){metadata_where}
                 ORDER BY text_score DESC, updated_at DESC
-                LIMIT {max(req.limit * 4, 20)}
+                LIMIT {keyword_limit}
                 """,
                 *text_params,
             )
             if not text_rows:
-                fallback_filters = ["content ILIKE $1"]
-                fallback_params: list[Any] = [f"%{req.query}%"]
-                idx = 2
-                for _template, value in filters:
-                    fallback_filters.append(_template.replace("{idx}", str(idx)))
-                    fallback_params.append(value)
-                    idx += 1
-                where = " AND ".join(fallback_filters)
+                fallback_params: list[Any] = [f"%{req.query}%", *metadata_params]
                 text_rows = await conn.fetch(
                     f"""
                     SELECT *, 0.15::float8 AS text_score
                     FROM memories
-                    WHERE {where}
+                    WHERE content ILIKE $1{metadata_where}
                     ORDER BY updated_at DESC
-                    LIMIT {max(req.limit * 4, 20)}
+                    LIMIT {keyword_limit}
                     """,
                     *fallback_params,
+                )
+
+        vector_rows = []
+        if embedding is not None and strategy in {"hybrid", "vector"}:
+            vec = f"vector({EMBEDDING_DIMS})"
+            await conn.execute("SET LOCAL hnsw.ef_search = 100")
+
+            if strategy == "hybrid" and text_rows:
+                candidate_ids = [row["id"] for row in text_rows]
+                vector_rows = await conn.fetch(
+                    f"""
+                    SELECT *, 1 - (embedding <=> $1::{vec}) AS similarity
+                    FROM memories
+                    WHERE embedding IS NOT NULL AND id = ANY($2::uuid[])
+                    ORDER BY embedding <=> $1::{vec}
+                    LIMIT {vector_limit}
+                    """,
+                    str(embedding),
+                    candidate_ids,
+                )
+            else:
+                vector_params: list[Any] = [str(embedding), *metadata_params]
+                vector_rows = await conn.fetch(
+                    f"""
+                    SELECT *, 1 - (embedding <=> $1::{vec}) AS similarity
+                    FROM memories
+                    WHERE embedding IS NOT NULL{metadata_where}
+                    ORDER BY embedding <=> $1::{vec}
+                    LIMIT {vector_limit}
+                    """,
+                    *vector_params,
                 )
 
         if embedding is None and strategy == "vector":
@@ -549,8 +643,8 @@ async def search_memories(req: SearchRequest, _key: str = Depends(verify_api_key
         else:
             fused_map = reciprocal_rank_fusion(
                 [
-                    normalize_ranked_rows(vector_rows, "similarity"),
                     normalize_ranked_rows(text_rows, "text_score"),
+                    normalize_ranked_rows(vector_rows, "similarity"),
                 ]
             )
 
@@ -558,7 +652,7 @@ async def search_memories(req: SearchRequest, _key: str = Depends(verify_api_key
         for row in text_rows:
             combined_rows.setdefault(str(row["id"]), row)
 
-        candidate_ids = list(fused_map.keys())[: max(req.limit * 4, 20)]
+        candidate_ids = list(fused_map.keys())[:vector_limit]
         graph_rows = []
         if req.graph_depth > 0 and candidate_ids:
             graph_rows = await conn.fetch(
@@ -601,18 +695,25 @@ async def search_memories(req: SearchRequest, _key: str = Depends(verify_api_key
                 temporal_weight=req.temporal_weight,
             )
             graph_boost = compute_graph_temporal_boost(memory_id, graph_by_memory.get(memory_id, []))
+            recency_boost = compute_recency_boost(row["created_at"], max_boost=req.recency_boost)
             ranked.append(
                 SearchResult(
                     memory=_row_to_memory(row),
                     similarity=similarity,
-                    final_score=blend_hybrid_score(fused_score, temporal_score, graph_boost),
+                    final_score=blend_hybrid_score(fused_score, temporal_score, graph_boost, recency_boost),
                 )
             )
 
         ranked.sort(key=lambda r: r.final_score, reverse=True)
         final = ranked[: req.limit]
 
-        if final:
+        if not final:
+            fallback_results = await _supermemory_fallback_search(req)
+            if fallback_results:
+                final = fallback_results[: req.limit]
+                supermemory_used = True
+
+        if final and not supermemory_used:
             ids = [r.memory.id for r in final]
             await conn.execute(
                 "UPDATE memories SET access_count = access_count + 1 WHERE id = ANY($1)",
@@ -636,6 +737,10 @@ async def search_memories(req: SearchRequest, _key: str = Depends(verify_api_key
                     "limit": req.limit,
                     "graph_depth": req.graph_depth,
                     "hybrid": strategy == "hybrid",
+                    "keyword_limit": keyword_limit,
+                    "vector_rerank_limit": vector_limit,
+                    "metadata_filters": req.metadata_filters,
+                    "supermemory_fallback_used": supermemory_used,
                 }),
                 emb_str,
             )
@@ -704,7 +809,9 @@ async def retrieval_status(_key: str = Depends(verify_api_key)):
     return {
         "ok": True,
         "hybrid_default": True,
+        "pipeline": "metadata-filter -> keyword-prefilter -> vector-rerank -> temporal/graph/recency",
         "hnsw_active": any("USING hnsw" in row["indexdef"] for row in indexes),
+        "supermemory_fallback_configured": bool(SUPERMEMORY_SEARCH_URL),
         "indexes": [dict(row) for row in indexes],
     }
 
