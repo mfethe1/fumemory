@@ -8,6 +8,9 @@
 
 FROM python:3.11-slim
 
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
 # System deps
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
@@ -19,9 +22,15 @@ COPY pyproject.toml .
 COPY README.md .
 COPY memu/ memu/
 
-# Install runtime deps without package install (hatch packaging is intentionally decoupled).
-RUN pip install --no-cache-dir fastapi==0.100 uvicorn>=0.20 asyncpg>=0.28 httpx>=0.24 pydantic>=2.0 nats-py>=2.7
-
+# Install only the runtime needed by boot.py and mesh connectivity.
+RUN python -m pip install --no-cache-dir \
+    "fastapi>=0.100" \
+    "uvicorn>=0.20" \
+    "asyncpg>=0.28" \
+    "httpx>=0.24" \
+    "pydantic>=2.0" \
+    "nats-py>=2.7" \
+    "PyNaCl>=1.5.0"
 
 # No host volumes. No secrets baked in. Everything comes from env vars.
 # The container is disposable — kill it, spawn a new one, hydrate from memU.

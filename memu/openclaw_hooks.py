@@ -1,7 +1,6 @@
 # memu/openclaw_hooks.py
 import sys
 import os
-import json
 import logging
 import asyncio
 import httpx
@@ -12,10 +11,12 @@ logger.setLevel(logging.INFO)
 handler = logging.StreamHandler(sys.stdout)
 formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 handler.setFormatter(formatter)
-logger.addHandler(handler)
+if not logger.handlers:
+    logger.addHandler(handler)
 
-MEMU_API_URL = os.environ.get("MEMU_API_URL", "https://fumemory-infra-production-b652.up.railway.app")
+MEMU_API_URL = os.environ.get("MEMU_API_URL", "http://127.0.0.1:8000").rstrip("/")
 MEMU_API_KEY = os.environ.get("MEMU_API_KEY", "")
+
 
 async def log_action(agent_id: str, action: str, details: dict):
     """Log an agent action to memU."""
@@ -29,19 +30,20 @@ async def log_action(agent_id: str, action: str, details: dict):
             "source": "openclaw_hook"
         }
     }
-    
+
     headers = {"X-API-Key": MEMU_API_KEY}
-    
+
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
             resp = await client.post(
-                f"{MEMU_API_URL}/memories/async", 
-                json=payload, 
+                f"{MEMU_API_URL}/memories/async",
+                json=payload,
                 headers=headers
             )
             logger.info(f"Logged action {action} for {agent_id} (status: {resp.status_code})")
     except Exception as e:
         logger.error(f"Failed to log action: {e}")
+
 
 async def log_search(agent_id: str, query: str, results_summary: str):
     """Log a web search to memU."""
@@ -55,18 +57,19 @@ async def log_search(agent_id: str, query: str, results_summary: str):
             "source": "openclaw_hook"
         }
     }
-    
+
     headers = {"X-API-Key": MEMU_API_KEY}
-    
+
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
-             await client.post(
-                f"{MEMU_API_URL}/memories/async", 
-                json=payload, 
+            await client.post(
+                f"{MEMU_API_URL}/memories/async",
+                json=payload,
                 headers=headers
             )
     except Exception as e:
         logger.error(f"Failed to log search: {e}")
+
 
 async def recall(query: str, agent_id: str):
     """Check if we already know this."""
@@ -85,6 +88,7 @@ async def recall(query: str, agent_id: str):
     except Exception:
         pass
     return None
+
 
 if __name__ == "__main__":
     if len(sys.argv) > 2:

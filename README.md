@@ -306,7 +306,7 @@ memU supports dual-instance failover via NATS:
 ```bash
 # Configure in .env
 NATS_LOCAL_URL=nats://localhost:4222
-NATS_RAILWAY_URL=nats://gondola.proxy.rlwy.net:22393
+NATS_RAILWAY_URL=nats://<railway-nats-host>:<railway-nats-port>
 ```
 
 See `docs/MULTI_MACHINE.md` for full setup.
@@ -360,8 +360,26 @@ EMBEDDING_DIMS=4096
 
 # NATS clustering
 NATS_LOCAL_URL=nats://localhost:4222
-NATS_RAILWAY_URL=nats://gondola.proxy.rlwy.net:22393
+NATS_RAILWAY_URL=nats://<railway-nats-host>:<railway-nats-port>
+
+# Temporal (only required for /memories/async and /search/async)
+TEMPORAL_HOST=<temporal-host>:7233
+TEMPORAL_TLS=false
 ```
+
+---
+
+## Railway Notes
+
+- Railway injects `PORT` for HTTP services; `memu.api` already honors it.
+- Do **not** hardcode `*.proxy.rlwy.net` hosts into committed config. Use env vars per deploy.
+- Core API boot requires `DATABASE_URL` and `MEMU_API_KEY`.
+- `NATS_RAILWAY_URL` is optional for API boot, but required for mesh features.
+- `TEMPORAL_HOST`/`TEMPORAL_TLS` are only required if you want `/memories/async` and `/search/async`.
+- Use `python scripts/verify_deployment.py --api-url <url>` for core API checks.
+- Add `--check-async` only when the Temporal service and worker are deployed and healthy.
+
+See `docs/railway-readiness.md` for the full pre-deploy checklist.
 
 ---
 
