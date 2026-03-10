@@ -245,8 +245,12 @@ class LaneLockedExecution:
 
     async def _get_lock_state(self, lane_id: str) -> dict[str, Any] | None:
         """Read lock state if present."""
-        entry = await self.lanes_kv.get(lane_id)
-        if not entry:
+        try:
+            entry = await self.lanes_kv.get(lane_id)
+        except Exception:
+            return None
+
+        if not entry or not getattr(entry, "value", None):
             return None
 
         payload = json.loads(entry.value.decode())
