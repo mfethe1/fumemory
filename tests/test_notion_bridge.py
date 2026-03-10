@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pytest
+import httpx
 
 try:
     import respx
@@ -24,7 +25,7 @@ async def test_poll_tasks_filters_unclaimed_for_agent() -> None:
         )
 
         route = respx.post("https://api.notion.com/v1/databases/task-board-id/query").mock(
-            return_value={
+            return_value=httpx.Response(200, json={
                 "results": [
                     {
                         "id": "task-1",
@@ -41,7 +42,7 @@ async def test_poll_tasks_filters_unclaimed_for_agent() -> None:
                         },
                     }
                 ]
-            }
+            })
         )
 
         result = await bridge.poll_tasks("rosie")
@@ -65,26 +66,25 @@ async def test_complete_task_continues_when_memu_returns_401() -> None:
         )
 
         respx.get("https://api.notion.com/v1/pages/task-1").mock(
-            return_value={
+            return_value=httpx.Response(200, json={
                 "id": "task-1",
                 "properties": {
                     "Title": {"title": [{"plain_text": "Patch bug"}]},
                     "Agent Notes": {"rich_text": []},
                 },
-            }
+            })
         )
 
         respx.patch("https://api.notion.com/v1/pages/task-1").mock(
-            return_value={
+            return_value=httpx.Response(200, json={
                 "id": "task-1",
                 "properties": {
                     "Status": {"select": {"name": "Done"}},
                 },
-            }
+            })
         )
         respx.post("http://api.internal:8000/memories").mock(
-            status_code=401,
-            return_value={"detail": "invalid key"},
+            return_value=httpx.Response(401, json={"detail": "invalid key"})
         )
 
         await bridge.complete_task("task-1", "rosie", "done")
@@ -103,12 +103,14 @@ async def test_claim_task_marks_task_in_progress() -> None:
         )
 
         route = respx.patch("https://api.notion.com/v1/pages/task-1").mock(
-            return_value={"id": "task-1"}
+            return_value=httpx.Response(200, json={"id": "task-1"})
         )
 
         await bridge.claim_task("task-1", "macklemore")
 
         assert route.called
         request = route.calls.last.request
-        assert request.json()["properties"]["Status"]["select"]["name"] == "In Progress"
+        import json
+        assert json.loads(request.content)["properties"]["Status"]["select"]["name"] == "In Progress"
         await bridge.close()
+
