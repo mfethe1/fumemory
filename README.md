@@ -232,6 +232,8 @@ curl -X POST http://localhost:8000/chat \
 | `/tasks/{task_id}/review` | POST | Critical completion review decision endpoint |
 | `/api/dag/{root_id}` | GET | DAG snapshot for a root prompt |
 | `/api/cluster/status` | GET | NATS cluster health |
+| `/api/gateways/status` | GET | Glass Box retained gateway mesh view |
+| `/api/v1/gateways/status` | GET | Auth-gated operational mesh status for automation / alerts |
 | `/api/halt` | POST | Emergency halt (God Mode) |
 | `/ws/swarm` | WS | Real-time event stream |
 

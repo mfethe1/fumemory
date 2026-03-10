@@ -1,17 +1,28 @@
 # memu/temporal_client.py
-import os
+from __future__ import annotations
+
 import logging
-from temporalio.client import Client
-from memu.temporal_worker.workflows import MemoryIngestionWorkflow, MemorySearchWorkflow
+import os
 
 logger = logging.getLogger(__name__)
 
+try:
+    from temporalio.client import Client
+except Exception:  # pragma: no cover - optional dependency in local/test environments
+    Client = None
+
+
 async def get_client():
+    if Client is None:
+        raise RuntimeError("temporalio is not installed")
     host = os.environ.get("TEMPORAL_HOST", "localhost:7233")
     return await Client.connect(host)
 
+
 async def store_memory_workflow(content: str, agent_id: str, metadata: dict):
     try:
+        from memu.temporal_worker.workflows import MemoryIngestionWorkflow
+
         client = await get_client()
         wf_id = f"memory-ingest-{agent_id}-{abs(hash(content))}"
         handle = await client.start_workflow(
@@ -25,8 +36,11 @@ async def store_memory_workflow(content: str, agent_id: str, metadata: dict):
         logger.error(f"Failed to start store workflow: {e}")
         return None
 
+
 async def search_memory_workflow(query: str, agent_id: str):
     try:
+        from memu.temporal_worker.workflows import MemorySearchWorkflow
+
         client = await get_client()
         wf_id = f"memory-search-{agent_id}-{abs(hash(query))}"
         return await client.execute_workflow(

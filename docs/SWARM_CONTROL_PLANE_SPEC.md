@@ -134,8 +134,9 @@ Later status writes must present the same fencing token or be rejected.
 
 ## NATS subjects
 
-- `swarm.gateway.heartbeat`
 - `swarm.gateway.register`
+- `swarm.gateway.heartbeat`
+- `swarm.gateway.status`
 - `swarm.tasks.create`
 - `swarm.tasks.claim`
 - `swarm.tasks.status`
@@ -143,6 +144,8 @@ Later status writes must present the same fencing token or be rejected.
 - `swarm.tasks.done`
 - `swarm.tasks.fail`
 - `swarm.artifacts.add`
+
+Retained mesh status lives in JetStream KV bucket `GATEWAY_STATE`; readers should prefer that for current ownership / liveness and use subjects for live fan-out.
 
 ## Quality gates
 

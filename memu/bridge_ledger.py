@@ -56,6 +56,7 @@ class BridgeLedger:
         self.lane_locks: dict[str, dict[str, Any]] = {}
         self.dlq_entries: list[dict[str, Any]] = []
         self.gateway_heartbeats: dict[str, dict[str, Any]] = {}
+        self.gateway_registry: dict[str, dict[str, Any]] = {}
 
     def process_event(self, raw: dict[str, Any]) -> InMemoryTask | None:
         """Process a raw event dict and update the projection.
@@ -72,7 +73,11 @@ class BridgeLedger:
         payload = raw.get("payload", {})
         cost = raw.get("compute_cost", 0.0) or 0.0
         source = raw.get("source_gateway", "unknown")
+        subject = raw.get("_subject", "")
         ts = raw.get("timestamp", datetime.now(timezone.utc).isoformat())
+
+        if subject.startswith("swarm.gateway.") or subject in {"swarm.discovery", "swarm.warden.heartbeat"}:
+            self._process_gateway_event(subject, raw, source, ts)
 
         if not task_id:
             # Non-task events (heartbeats, lane locks, etc.)
@@ -191,6 +196,88 @@ class BridgeLedger:
                     "timestamp": ts,
                 })
 
+    def _process_gateway_event(self, subject: str, raw: dict[str, Any], source: str, ts: str):
+        gateway_id = raw.get("gateway_id") or source
+        if gateway_id in {None, "unknown", ""}:
+            return
+
+        current = self.gateway_registry.get(gateway_id, {"gateway_id": gateway_id})
+        metadata = raw.get("metadata") or {}
+        status = raw.get("status") or current.get("status") or "online"
+        task_id = raw.get("current_task_id") or raw.get("task_id") or current.get("current_task_id")
+
+        entry = {
+            **current,
+            "gateway_id": gateway_id,
+            "status": status,
+            "current_task_id": task_id,
+            "capabilities": raw.get("capabilities", current.get("capabilities", [])),
+            "model_id": raw.get("model_id", current.get("model_id")),
+            "metadata": {**current.get("metadata", {}), **metadata},
+            "last_heartbeat_at": raw.get("last_heartbeat_at") or ts,
+            "last_subject": subject,
+            "active_nats_node": raw.get("active_nats_node", current.get("active_nats_node")),
+        }
+
+        if subject == "swarm.warden.heartbeat":
+            entry["status"] = "online"
+            entry["metadata"] = {
+                **entry["metadata"],
+                "status_note": raw.get("status_note"),
+                "progress_pct": raw.get("progress_pct", 0.0),
+            }
+
+        self.gateway_registry[gateway_id] = entry
+        self.gateway_heartbeats[gateway_id] = {
+            "gateway_id": gateway_id,
+            "last_seen": entry["last_heartbeat_at"],
+            "payload": entry,
+        }
+
+    def get_gateway_status(
+        self,
+        *,
+        stale_after_s: int = 20,
+        offline_after_s: int = 60,
+    ) -> dict[str, Any]:
+        now = datetime.now(timezone.utc)
+        gateways: list[dict[str, Any]] = []
+
+        for gateway_id, entry in sorted(self.gateway_registry.items()):
+            try:
+                last_seen = datetime.fromisoformat(entry["last_heartbeat_at"].replace("Z", "+00:00"))
+                if last_seen.tzinfo is None:
+                    last_seen = last_seen.replace(tzinfo=timezone.utc)
+            except Exception:
+                last_seen = None
+
+            age_seconds = None if last_seen is None else max((now - last_seen).total_seconds(), 0.0)
+            reported = entry.get("status", "offline")
+            effective = reported
+            if reported not in {"offline", "draining"}:
+                if age_seconds is None or age_seconds >= offline_after_s:
+                    effective = "offline"
+                elif age_seconds >= stale_after_s:
+                    effective = "degraded"
+
+            gateways.append({
+                **entry,
+                "reported_status": reported,
+                "effective_status": effective,
+                "age_seconds": None if age_seconds is None else round(age_seconds, 2),
+                "stale": effective == "degraded" and reported != "degraded",
+            })
+
+        summary = {
+            "total": len(gateways),
+            "online": sum(1 for g in gateways if g["effective_status"] == "online"),
+            "degraded": sum(1 for g in gateways if g["effective_status"] == "degraded"),
+            "offline": sum(1 for g in gateways if g["effective_status"] == "offline"),
+            "draining": sum(1 for g in gateways if g["effective_status"] == "draining"),
+            "stale_gateways": [g["gateway_id"] for g in gateways if g.get("stale")],
+        }
+        return {"generated_at": now.isoformat(), "gateways": gateways, "summary": summary}
+
     def get_dag(self, root_prompt_id: str | None = None) -> dict[str, Any]:
         """Return the full DAG or a filtered view by root prompt.
 
@@ -228,6 +315,8 @@ class BridgeLedger:
         total_budget = sum(t.compute_budget for t in self.tasks.values())
         total_spent = sum(t.compute_spent for t in self.tasks.values())
 
+        gateway_status = self.get_gateway_status()
+
         return {
             "nodes": nodes,
             "edges": edges,
@@ -237,7 +326,8 @@ class BridgeLedger:
                 "root_prompts": list(self.root_prompts),
                 "compute_budget": total_budget,
                 "compute_spent": total_spent,
-                "gateways_active": len(self.gateway_heartbeats),
+                "gateways_active": gateway_status["summary"]["online"],
+                "gateways": gateway_status["summary"],
                 "lane_locks": self.lane_locks,
                 "dlq_count": len(self.dlq_entries),
             },

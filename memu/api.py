@@ -30,6 +30,7 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 logging.getLogger("fastembed").setLevel(logging.WARNING)
 from memu.cluster import NATSClusterManager
 from memu.nats_publisher import NATSEventPublisher
+from memu.state_manager import build_gateway_status_overview
 from memu.models import (
     BulkImportRequest,
     BulkImportResponse,
@@ -396,6 +397,26 @@ async def health():
         return {"status": "healthy", "version": "0.1.0"}
     except Exception as e:
         raise HTTPException(status_code=503, detail=str(e))
+
+
+@app.get("/api/v1/gateways/status")
+async def gateway_status(_key: str = Depends(verify_api_key)):
+    if not _nats_cluster:
+        return {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "cluster": {"status": "disconnected"},
+            "summary": {"total": 0, "online": 0, "degraded": 0, "offline": 0, "draining": 0, "stale_gateways": [], "active_tasks": 0},
+            "gateways": [],
+            "alerts": [{"severity": "warning", "code": "cluster_disconnected", "message": "NATS cluster is not connected"}],
+        }
+
+    try:
+        return await build_gateway_status_overview(
+            _nats_cluster.jetstream,
+            cluster_status=_nats_cluster.status(),
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Gateway status unavailable: {exc}")
 
 
 @app.post("/memories", response_model=Memory)
