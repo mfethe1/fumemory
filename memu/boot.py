@@ -161,12 +161,11 @@ async def _summarize(client, text: str, max_tokens: int) -> str:
 
 
 async def register_with_mesh():
-    """Connect to NATS, generate signing keypair, and announce this gateway's capabilities."""
-    import nats
-
+    """Connect to NATS, generate signing keypair, and register retained gateway state."""
     from memu.cluster import NATSClusterManager
     from memu.crypto import GatewayKeyPair, get_backend
-    from memu.swarm_models import GatewayAnnounce, GatewayStatus
+    from memu.state_manager import StateManager
+    from memu.swarm_models import GatewayStatus
 
     cluster = NATSClusterManager(
         local_url=NATS_LOCAL_URL,
@@ -216,35 +215,34 @@ async def register_with_mesh():
     await nc.subscribe("swarm.advisory.suicide.*", cb=_suicide_handler)
     logger.info(f"Suicide signal listener active on swarm.advisory.suicide.{GATEWAY_ID}")
 
-    # Announce presence (include public key for signature verification)
-    announce = GatewayAnnounce(
-        gateway_id=GATEWAY_ID,
-        capabilities=[],  # Populated by the gateway's tool registry
+    state_manager = StateManager(GATEWAY_ID, cluster=cluster, role=GATEWAY_ROLE)
+    await state_manager.connect()
+    await state_manager.register_gateway(
+        capabilities=[],
         status=GatewayStatus.ONLINE,
+        current_task_id=TASK_ID,
         metadata={
             "role": GATEWAY_ROLE,
             "boot_time": datetime.now(timezone.utc).isoformat(),
             "task_id": TASK_ID,
             "public_key": keypair.public_key_hex if keypair else None,
             "crypto_backend": get_backend(),
+            "mode": "task" if TASK_ID else "warm-standby",
+            "pid": os.getpid(),
         },
     )
 
-    await nc.publish(
-        "swarm.discovery",
-        announce.model_dump_json().encode(),
-    )
-
     logger.info(f"Gateway {GATEWAY_ID} ({GATEWAY_ROLE}) registered with mesh")
-    return cluster
+    return cluster, state_manager
 
 
-async def start_heartbeat(cluster, interval_s: float = 3.0):
-    """Publish heartbeat every interval_s to prove we're alive."""
-    nc = cluster.active_connection
+async def start_heartbeat(cluster, state_manager, interval_s: float = 3.0):
+    """Publish task heartbeat every interval_s and refresh retained gateway state."""
+    from memu.swarm_models import GatewayStatus
 
     while True:
         try:
+            nc = cluster.active_connection
             await nc.publish(
                 "swarm.warden.heartbeat",
                 json.dumps({
@@ -253,6 +251,16 @@ async def start_heartbeat(cluster, interval_s: float = 3.0):
                     "progress_pct": 0.0,
                     "status_note": "running",
                 }).encode(),
+            )
+            await state_manager.update_state(
+                GatewayStatus.ONLINE,
+                current_task_id=TASK_ID,
+                metadata={
+                    "role": GATEWAY_ROLE,
+                    "status_note": "running",
+                    "mode": "task",
+                },
+                reason="task_heartbeat",
             )
             await asyncio.sleep(interval_s)
         except asyncio.CancelledError:
@@ -339,17 +347,21 @@ async def main():
         logger.info(f"  Checkpoint recovered — resuming task {TASK_ID}")
 
     # Step 2: Connect to NATS mesh
+    state_manager = None
     try:
-        cluster = await register_with_mesh()
+        cluster, state_manager = await register_with_mesh()
     except Exception as e:
         logger.error(f"Failed to connect to mesh: {e}")
         logger.info("Running in standalone mode (no mesh)")
         cluster = None
+        state_manager = None
 
-    # Step 3: Start heartbeat only for task-bearing runtime
+    # Step 3: Start retained status pulse for all gateways; task heartbeat only when executing.
     heartbeat_task = None
-    if cluster and TASK_ID:
-        heartbeat_task = asyncio.create_task(start_heartbeat(cluster))
+    if state_manager:
+        await state_manager.start_pulse()
+    if cluster and state_manager and TASK_ID:
+        heartbeat_task = asyncio.create_task(start_heartbeat(cluster, state_manager))
 
     # Step 4: Install graceful shutdown handlers (Failure Mode: SIGTERM)
     from memu.hardening import install_signal_handlers, register_shutdown_handler
@@ -358,20 +370,28 @@ async def main():
         logger.info("Graceful shutdown: releasing resources...")
         if heartbeat_task:
             heartbeat_task.cancel()
-        if cluster:
-            # Publish draining status before exit
+        if state_manager:
             try:
-                nc = cluster.active_connection
-                await nc.publish(
-                    "swarm.discovery",
-                    json.dumps({
-                        "gateway_id": GATEWAY_ID,
-                        "status": "offline",
+                await state_manager.mark_draining(
+                    current_task_id=TASK_ID,
+                    metadata={
+                        "role": GATEWAY_ROLE,
                         "reason": "graceful_shutdown",
-                    }).encode(),
+                        "uptime_s": round(time.time() - _boot_time, 2),
+                    },
+                )
+                await state_manager.mark_offline(
+                    current_task_id=TASK_ID,
+                    metadata={
+                        "role": GATEWAY_ROLE,
+                        "reason": "graceful_shutdown",
+                        "uptime_s": round(time.time() - _boot_time, 2),
+                    },
                 )
             except Exception:
                 pass
+            await state_manager.close()
+        if cluster:
             await cluster.close()
 
     register_shutdown_handler(_graceful_shutdown)
@@ -381,8 +401,8 @@ async def main():
         pass  # Signal handlers not available on all platforms
 
     # Step 5: Run the actual agent logic
-    # If TASK_ID is set, run a deterministic lane-locked smoke task and emit heartbeat stream.
-    # Otherwise, keep container available as warm standby (no NATS heartbeat).
+    # If TASK_ID is set, run a deterministic lane-locked smoke task and emit task heartbeats.
+    # Otherwise, keep container available as warm standby (retained gateway status pulse stays on).
     try:
         if TASK_ID:
             logger.info("Starting smoke task execution for %s", TASK_ID)

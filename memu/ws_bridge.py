@@ -25,6 +25,7 @@ from pydantic import BaseModel, Field
 
 from memu.cluster import NATSClusterManager
 from memu.bridge_ledger import BridgeLedger
+from memu.state_manager import build_gateway_status_overview
 from memu.swarm_models import (
     EventType,
     SwarmEvent,
@@ -38,6 +39,35 @@ logger = logging.getLogger(__name__)
 cluster: NATSClusterManager | None = None
 ledger: BridgeLedger = BridgeLedger()
 connected_clients: set[WebSocket] = set()
+
+
+async def _gateway_status_payload() -> dict[str, Any]:
+    if cluster:
+        try:
+            return await build_gateway_status_overview(
+                cluster.jetstream,
+                cluster_status=cluster.status(),
+            )
+        except Exception as exc:
+            logger.warning("Falling back to ledger gateway status view: %s", exc)
+    return {
+        "cluster": cluster.status() if cluster else {"status": "disconnected"},
+        **ledger.get_gateway_status(),
+        "alerts": [],
+    }
+
+
+async def _broadcast_gateway_status():
+    if not connected_clients:
+        return
+    payload = await _gateway_status_payload()
+    disconnected = set()
+    for client in connected_clients:
+        try:
+            await client.send_json({"type": "gateway_status", "data": payload})
+        except Exception:
+            disconnected.add(client)
+    connected_clients.difference_update(disconnected)
 
 
 @asynccontextmanager
@@ -79,12 +109,16 @@ async def ws_swarm(ws: WebSocket):
     logger.info(f"Glass Box client connected ({len(connected_clients)} total)")
 
     try:
-        # Send cluster status on connect
+        # Send cluster + gateway status on connect
         if cluster:
             await ws.send_json({
                 "type": "cluster_status",
                 "data": cluster.status(),
             })
+        await ws.send_json({
+            "type": "gateway_status",
+            "data": await _gateway_status_payload(),
+        })
 
         # Keep connection alive, receive commands from UI
         while True:
@@ -101,6 +135,10 @@ async def ws_swarm(ws: WebSocket):
                         "type": "cluster_status",
                         "data": cluster.status(),
                     })
+                await ws.send_json({
+                    "type": "gateway_status",
+                    "data": await _gateway_status_payload(),
+                })
 
     except WebSocketDisconnect:
         pass
@@ -179,6 +217,12 @@ async def cluster_status():
     return cluster.status()
 
 
+@app.get("/api/gateways/status")
+async def gateway_status():
+    """Retained cross-gateway status view for Macklemore / Glass Box."""
+    return await _gateway_status_payload()
+
+
 @app.get("/api/dag")
 async def get_dag(root_prompt_id: str | None = None):
     """Get the live DAG projection (all tasks or filtered by root prompt)."""
@@ -207,6 +251,7 @@ async def get_stats():
     dag = ledger.get_dag()
     stats = dag["stats"]
     stats["cluster"] = cluster.status() if cluster else {"status": "disconnected"}
+    stats["gateways_view"] = (await _gateway_status_payload())["summary"]
     stats["connected_clients"] = len(connected_clients)
     return stats
 
@@ -229,10 +274,11 @@ async def _nats_to_ws_bridge():
             async for msg in sub.messages:
                 try:
                     data = json.loads(msg.data.decode())
-                    
+                    data["_subject"] = msg.subject
+
                     # Always project into in-memory ledger
                     ledger.process_event(data)
-                    
+
                     if not connected_clients:
                         continue
 
@@ -247,6 +293,9 @@ async def _nats_to_ws_bridge():
                             disconnected.add(client)
 
                     connected_clients.difference_update(disconnected)
+
+                    if msg.subject.startswith("swarm.gateway.") or msg.subject in {"swarm.discovery", "swarm.warden.heartbeat"}:
+                        await _broadcast_gateway_status()
 
                 except json.JSONDecodeError:
                     logger.debug(f"Non-JSON message on {msg.subject}")

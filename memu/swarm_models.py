@@ -77,6 +77,7 @@ class GatewayStatus(str, enum.Enum):
     ONLINE = "online"
     OFFLINE = "offline"
     DEGRADED = "degraded"
+    DRAINING = "draining"
 
 
 # --- Core Event Envelope ---
