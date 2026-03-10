@@ -20,10 +20,11 @@ async def get_client() -> Any:
         raise RuntimeError("temporalio is not installed") from exc
 
     host = os.environ.get("TEMPORAL_HOST", "localhost:7233")
-    return await Client.connect(host)
+    use_tls = os.environ.get("TEMPORAL_TLS", "").lower() == "true" or ":443" in host
+    return await Client.connect(host, tls=use_tls)
 
 
-async def store_memory_workflow(content: str, agent_id: str, metadata: dict) -> str | None:
+async def store_memory_workflow(content: str, agent_id: str, metadata: dict | None) -> str | None:
     try:
         from memu.temporal_worker.workflows import MemoryIngestionWorkflow
 
@@ -31,7 +32,7 @@ async def store_memory_workflow(content: str, agent_id: str, metadata: dict) -> 
         wf_id = f"memory-ingest-{agent_id}-{_workflow_suffix(agent_id, content)}"
         handle = await client.start_workflow(
             MemoryIngestionWorkflow.run,
-            args=[content, agent_id, metadata],
+            args=[content, agent_id, metadata or {}],
             id=wf_id,
             task_queue="memu-queue",
         )
