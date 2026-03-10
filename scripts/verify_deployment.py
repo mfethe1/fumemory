@@ -1,11 +1,25 @@
-import time
-import requests
 import os
 import sys
-import json
+import time
+
+import requests
+
+
+def resolve_memu_base_url() -> str:
+    raw = (
+        os.environ.get("MEMU_API_URL")
+        or os.environ.get("RAILWAY_SERVICE_MEMU_API_URL")
+        or "https://memu-api-production.up.railway.app"
+    ).rstrip("/")
+    if not raw.startswith(("http://", "https://")):
+        raw = f"https://{raw}"
+    if raw.endswith("/api/v1/memu"):
+        return raw[: -len("/api/v1/memu")]
+    return raw
+
 
 # Configuration
-API_URL = "https://fumemory-infra-production-b652.up.railway.app"
+API_URL = resolve_memu_base_url()
 API_KEY = os.environ.get("MEMU_API_KEY")
 
 if not API_KEY:
@@ -13,7 +27,7 @@ if not API_KEY:
     try:
         with open(os.path.expanduser("~/.openclaw/secrets/memu_api_key"), "r") as f:
             API_KEY = f.read().strip()
-    except:
+    except OSError:
         print("❌ MEMU_API_KEY not found in env or secrets.")
         sys.exit(1)
 
@@ -21,6 +35,7 @@ HEADERS = {
     "X-API-Key": API_KEY,
     "Content-Type": "application/json"
 }
+
 
 def check_health():
     print(f"🏥 Checking health at {API_URL}/api/v1/memu/health...")

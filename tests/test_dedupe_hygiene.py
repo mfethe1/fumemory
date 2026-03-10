@@ -209,7 +209,7 @@ async def test_status_freshness_reports_stale_and_fresh_streams(monkeypatch):
     payload = await api.status_freshness(_key=auth)
 
     assert payload["ok"] is True
-    assert payload["streams"]["memories"]["is_stale"] is False
-    assert payload["streams"]["tasks"]["is_stale"] is True
-    assert payload["streams"]["memory_blocks"]["timestamp"] is None
+    assert payload["streams"]["memories"]["stale"] is False
+    assert payload["streams"]["tasks"]["stale"] is True
+    assert payload["streams"]["memory_blocks"]["updated_at"] is None
     assert len(conn.fetchval_calls) == 3
