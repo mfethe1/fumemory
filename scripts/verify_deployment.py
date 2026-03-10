@@ -23,9 +23,9 @@ HEADERS = {
 }
 
 def check_health():
-    print(f"🏥 Checking health at {API_URL}/health...")
+    print(f"🏥 Checking health at {API_URL}/api/v1/memu/health...")
     try:
-        resp = requests.get(f"{API_URL}/health", timeout=10)
+        resp = requests.get(f"{API_URL}/api/v1/memu/health", timeout=10)
         if resp.status_code == 200:
             print(f"✅ Healthy: {resp.json()}")
             return True
@@ -46,8 +46,7 @@ def test_async_ingest():
     }
     
     try:
-        # Hit the new async endpoint
-        resp = requests.post(f"{API_URL}/memories/async", headers=HEADERS, json=payload, timeout=10)
+        resp = requests.post(f"{API_URL}/api/v1/memu/memories/async", headers=HEADERS, json=payload, timeout=10)
         
         if resp.status_code == 200:
             data = resp.json()
@@ -107,7 +106,7 @@ def test_async_search():
     }
     
     try:
-        resp = requests.post(f"{API_URL}/search/async", headers=HEADERS, json=payload, timeout=10)
+        resp = requests.post(f"{API_URL}/api/v1/memu/search/async", headers=HEADERS, json=payload, timeout=10)
         if resp.status_code == 200:
             print("✅ Async Search Accepted.")
             return True

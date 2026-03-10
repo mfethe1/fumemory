@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 import sys
 import types
@@ -36,11 +36,13 @@ from memu.models import MemoryCreate, MemoryType, TaskStatus, TaskUpdate
 
 
 class FakeConn:
-    def __init__(self, existing_row=None, update_row=None, task_row=None):
+    def __init__(self, existing_row=None, update_row=None, task_row=None, freshness_rows=None):
         self.existing_row = existing_row
         self.update_row = update_row
         self.task_row = task_row
+        self.freshness_rows = freshness_rows or {}
         self.fetchrow_calls = []
+        self.fetchval_calls = []
 
     async def fetchrow(self, query, *params):
         self.fetchrow_calls.append((query, params))
@@ -51,6 +53,13 @@ class FakeConn:
         if "UPDATE backlog" in query:
             return self.task_row
         raise AssertionError(f"Unexpected query: {query}")
+
+    async def fetchval(self, query, *params):
+        self.fetchval_calls.append((query, params))
+        for table_name, value in self.freshness_rows.items():
+            if table_name in query:
+                return value
+        raise AssertionError(f"Unexpected fetchval query: {query}")
 
 
 @pytest.mark.asyncio
@@ -177,3 +186,30 @@ async def test_task_update_accepts_evidence_for_handoff(monkeypatch):
 
     assert task.id == task_id
     assert task.evidence.startswith("pytest")
+
+
+@pytest.mark.asyncio
+async def test_status_freshness_reports_stale_and_fresh_streams(monkeypatch):
+    now = datetime.now(timezone.utc)
+    conn = FakeConn(
+        freshness_rows={
+            "memories": now - timedelta(minutes=15),
+            "backlog": now - timedelta(hours=10),
+            "memory_blocks": None,
+        }
+    )
+
+    @asynccontextmanager
+    async def fake_tenant_conn(_auth):
+        yield conn
+
+    monkeypatch.setattr(api, "_tenant_conn", fake_tenant_conn)
+
+    auth = api.AuthContext("memu-dev-key", api.DEFAULT_TENANT_ID)
+    payload = await api.status_freshness(_key=auth)
+
+    assert payload["ok"] is True
+    assert payload["streams"]["memories"]["is_stale"] is False
+    assert payload["streams"]["tasks"]["is_stale"] is True
+    assert payload["streams"]["memory_blocks"]["timestamp"] is None
+    assert len(conn.fetchval_calls) == 3

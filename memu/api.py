@@ -14,9 +14,10 @@ from uuid import UUID
 
 import asyncpg
 import httpx
-from fastapi import Depends, FastAPI, HTTPException, Security
-from fastapi.security import APIKeyHeader
+from fastapi import Depends, FastAPI, HTTPException
 from pydantic import BaseModel
+
+from memu.auth import AuthContext, verify_api_key
 
 from memu.decay import compute_final_score, should_deduplicate
 from memu.retrieval import (
@@ -57,11 +58,8 @@ from memu.notion_bridge import create_bridge_from_env, NotionBridge
 from memu.migrations import run_migrations
 from memu.temporal_routes import router as temporal_router
 from memu.tenancy import (
-    resolve_tenant_id,
     tenant_connection,
-    tenant_transaction,
     DEFAULT_TENANT_ID,
-    SINGLE_TENANT_MODE,
 )
 
 # --- Config ---
@@ -143,34 +141,10 @@ app = FastAPI(
 
 app.include_router(temporal_router, tags=["Async Workflows"])
 
-api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
-
 # ---------------------------------------------------------------------------
 # Tenant resolution + RLS enforcement
-# Uses tenancy.py module for core logic. API key â†’ tenant_id â†’ RLS context.
+# Uses tenancy.py module for core logic. API key → tenant_id → RLS context.
 # ---------------------------------------------------------------------------
-
-
-class AuthContext(str):
-    """Authenticated request context with tenant information.
-    
-    Extends str for backward compatibility â€” existing endpoints that
-    type-hint `_key: str` will still work. Access tenant_id via .tenant_id.
-    """
-    tenant_id: UUID
-
-    def __new__(cls, api_key: str, tenant_id: UUID | None = None):
-        instance = super().__new__(cls, api_key)
-        instance.tenant_id = tenant_id or DEFAULT_TENANT_ID
-        return instance
-
-
-async def verify_api_key(key: str | None = Security(api_key_header)) -> AuthContext:
-    """Verify API key and resolve tenant context for RLS."""
-    if not key or key != MEMU_API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid API key")
-    tid = await resolve_tenant_id(pool, key) if pool else DEFAULT_TENANT_ID
-    return AuthContext(api_key=key, tenant_id=tid)
 
 
 @asynccontextmanager
@@ -492,7 +466,8 @@ def _row_to_task(row) -> Task:
 
 # --- Routes ---
 
-@app.get("/health")
+@app.get("/api/v1/memu/health", tags=["memU"])
+@app.get("/health", deprecated=True, tags=["memU"])
 async def health():
     try:
         async with pool.acquire() as conn:
@@ -502,7 +477,8 @@ async def health():
         raise HTTPException(status_code=503, detail=str(e))
 
 
-@app.post("/memories", response_model=Memory)
+@app.post("/api/v1/memu/upsert", response_model=Memory, tags=["memU"])
+@app.post("/memories", response_model=Memory, deprecated=True, tags=["memU"])
 async def create_memory(req: MemoryCreate, _key: str = Depends(verify_api_key)):
     _enforce_memory_hygiene(req)
     embedding = await get_embedding(req.content)
@@ -578,7 +554,8 @@ async def delete_memory(memory_id: UUID, _key: str = Depends(verify_api_key)):
     return {"deleted": True}
 
 
-@app.post("/search", response_model=list[SearchResult])
+@app.post("/api/v1/memu/search", response_model=list[SearchResult], tags=["memU"])
+@app.post("/search", response_model=list[SearchResult], deprecated=True, tags=["memU"])
 async def search_memories(req: SearchRequest, _key: str = Depends(verify_api_key)):
     strategy = (req.search_strategy or "hybrid").lower()
     embedding = await get_embedding(req.query) if strategy != "text" else None
@@ -781,7 +758,7 @@ async def search_memories(req: SearchRequest, _key: str = Depends(verify_api_key
     return final
 
 
-@app.get("/api/v1/memu/search")
+@app.get("/api/v1/memu/search", include_in_schema=False)
 async def memu_search_compat(
     q: str,
     agent: str | None = None,
@@ -834,7 +811,8 @@ async def retrieval_status(_key: str = Depends(verify_api_key)):
     }
 
 
-@app.get("/search-text")
+@app.get("/api/v1/memu/search-text", tags=["memU"])
+@app.get("/search-text", deprecated=True, tags=["memU"])
 async def search_text_compat(
     q: str,
     agent_id: str | None = None,
@@ -846,7 +824,8 @@ async def search_text_compat(
     return await search_text(q, agent_id=agent_id, memory_type=memory_type, limit=limit, _key=_key)
 
 
-@app.post("/search-text")
+@app.post("/api/v1/memu/search-text", tags=["memU"])
+@app.post("/search-text", deprecated=True, tags=["memU"])
 async def search_text(
     query: str,
     agent_id: str | None = None,
@@ -887,7 +866,8 @@ async def search_text(
     return [_row_to_memory(row) for row in rows]
 
 
-@app.post("/chat", response_model=ChatResponse)
+@app.post("/api/v1/memu/chat", response_model=ChatResponse, tags=["memU"])
+@app.post("/chat", response_model=ChatResponse, deprecated=True, tags=["memU"])
 async def chat(req: ChatRequest, _key: str = Depends(verify_api_key)):
     """RAG chat â€” retrieves relevant memories and generates an answer."""
     # Search for relevant context
@@ -924,7 +904,8 @@ async def chat(req: ChatRequest, _key: str = Depends(verify_api_key)):
     return ChatResponse(answer=answer, sources=[r.memory for r in search_results])
 
 
-@app.post("/memories/bulk", response_model=BulkImportResponse)
+@app.post("/api/v1/memu/bulk", response_model=BulkImportResponse, tags=["memU"])
+@app.post("/memories/bulk", response_model=BulkImportResponse, deprecated=True, tags=["memU"])
 async def bulk_import(req: BulkImportRequest, _key: str = Depends(verify_api_key)):
     """Bulk import memories from text, split by delimiter."""
     chunks = [c.strip() for c in req.content.split(req.split_on) if c.strip()]
@@ -1699,9 +1680,8 @@ class LaneMessage(BaseModel):
     state: str  # claimed, in_progress, blocked, done
 
 @app.post("/api/v1/lanes/publish")
-async def publish_lane_message(msg: LaneMessage, api_key: str = Security(api_key_header)):
+async def publish_lane_message(msg: LaneMessage, _key: str = Depends(verify_api_key)):
     """Publish a lane coordination message to NATS swarm.tasks.<lane>.* subject."""
-    verify_api_key(api_key)
     if not _nats_publisher:
         raise HTTPException(503, "NATS not connected")
 
@@ -1727,9 +1707,8 @@ async def publish_lane_message(msg: LaneMessage, api_key: str = Security(api_key
 
 
 @app.get("/api/v1/lanes/status")
-async def get_lane_status(api_key: str = Security(api_key_header)):
+async def get_lane_status(_key: str = Depends(verify_api_key)):
     """Check NATS connectivity for lane coordination."""
-    verify_api_key(api_key)
     connected = _nats_publisher is not None and _nats_publisher.cluster.active_connection is not None
     return {"ok": connected, "nats": "connected" if connected else "disconnected"}
 
@@ -1973,6 +1952,18 @@ async def list_blocks(
             *params,
         )
     return [dict(r) for r in rows]
+
+
+# --- Canonical dynamic aliases (declared late so static /api/v1/memu/* routes win) ---
+
+@app.get("/api/v1/memu/{memory_id}", response_model=Memory, tags=["memU"])
+async def get_memory_canonical(memory_id: UUID, _key: str = Depends(verify_api_key)):
+    return await get_memory(memory_id=memory_id, _key=_key)
+
+
+@app.delete("/api/v1/memu/{memory_id}", tags=["memU"])
+async def delete_memory_canonical(memory_id: UUID, _key: str = Depends(verify_api_key)):
+    return await delete_memory(memory_id=memory_id, _key=_key)
 
 
 if __name__ == "__main__":

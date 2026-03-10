@@ -180,7 +180,7 @@ Your Agents (Winnie, Rosie, Lenny, Macklemore, ...)
 ### Store a memory
 
 ```bash
-curl -X POST http://localhost:8000/memories \
+curl -X POST http://localhost:8000/api/v1/memu/upsert \
   -H "Content-Type: application/json" \
   -H "X-API-Key: your-key" \
   -d '{
@@ -197,7 +197,7 @@ curl -X POST http://localhost:8000/memories \
 ### Semantic search
 
 ```bash
-curl -X POST http://localhost:8000/search \
+curl -X POST http://localhost:8000/api/v1/memu/search \
   -H "Content-Type: application/json" \
   -H "X-API-Key: your-key" \
   -d '{
@@ -212,26 +212,35 @@ curl -X POST http://localhost:8000/search \
 ### RAG chat
 
 ```bash
-curl -X POST http://localhost:8000/chat \
+curl -X POST http://localhost:8000/api/v1/memu/chat \
   -H "Content-Type: application/json" \
-  -H "X-API-Key: your-key" \
+  -H "Authorization: Bearer your-key" \
   -d '{
     "question": "What do we know about CI/CD best practices?",
     "agent_id": null
   }'
 ```
 
+### Route stability notes
+
+- Canonical API routes live under `/api/v1/memu/*`.
+- Legacy root aliases (`/memories`, `/search`, `/search-text`, `/chat`, `/memories/bulk`, `/memories/async`, `/search/async`) still work for backward compatibility.
+- Protected endpoints accept either `X-API-Key` or `Authorization: Bearer <key>`.
+
 ### Other endpoints
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/health` | GET | Health check (DB + service status) |
-| `/memories/{id}` | GET | Retrieve a specific memory |
-| `/memories/{id}` | DELETE | Delete a memory |
-| `/memories/bulk` | POST | Bulk import from markdown/JSON |
+| `/api/v1/memu/health` | GET | Canonical health check |
+| `/health` | GET | Legacy health alias |
+| `/api/v1/memu/{memory_id}` | GET | Retrieve a specific memory |
+| `/api/v1/memu/{memory_id}` | DELETE | Delete a memory |
+| `/api/v1/memu/bulk` | POST | Bulk import from markdown/JSON |
 | `/memories/dedupe` | POST | Collapse existing duplicates by `custom_id`/content hash |
 | `/tasks/{id}` | PATCH | Update task status with proof-gated evidence on handoff/done |
 | `/api/v1/memu/status/freshness` | GET | Check freshness/staleness for memories, tasks, and memory blocks |
+| `/api/v1/memu/memories/async` | POST | Temporal async ingest |
+| `/api/v1/memu/search/async` | POST | Temporal async search |
 | `/api/dag/{root_id}` | GET | DAG snapshot for a root prompt |
 | `/api/cluster/status` | GET | NATS cluster health |
 | `/api/halt` | POST | Emergency halt (God Mode) |
