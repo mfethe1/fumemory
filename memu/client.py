@@ -83,8 +83,10 @@ class MemUClient:
         memory_type: str | MemoryType | None = None,
         temporal_weight: float = 0.3,
         min_confidence: float = 0.0,
+        search_strategy: str = "hybrid",
+        graph_depth: int = 1,
     ) -> list[SearchResult]:
-        """Semantic search over memories."""
+        """Hybrid/vector/text search over memories."""
         payload = {
             "query": query,
             "limit": limit,
@@ -92,6 +94,8 @@ class MemUClient:
             "memory_type": MemoryType(memory_type).value if memory_type else None,
             "temporal_weight": temporal_weight,
             "min_confidence": min_confidence,
+            "search_strategy": search_strategy,
+            "graph_depth": graph_depth,
         }
         r = self._client.post("/search", json=payload)
         r.raise_for_status()

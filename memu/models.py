@@ -50,6 +50,8 @@ class SearchRequest(BaseModel):
     min_confidence: float = 0.0
     temporal_weight: float = 0.3
     tags: list[str] = Field(default_factory=list, description="Filter results to memories containing ALL of these tags")
+    search_strategy: str = Field(default="hybrid", description="hybrid | vector | text")
+    graph_depth: int = Field(default=1, ge=0, le=2, description="How many graph hops to use for temporal graph boosting")
 
 
 class MemoryBlockCreate(BaseModel):

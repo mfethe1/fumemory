@@ -19,6 +19,12 @@ from fastapi.security import APIKeyHeader
 from pydantic import BaseModel
 
 from memu.decay import compute_final_score, should_deduplicate
+from memu.retrieval import (
+    blend_hybrid_score,
+    compute_graph_temporal_boost,
+    normalize_ranked_rows,
+    reciprocal_rank_fusion,
+)
 
 # --- Logging Config ---
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
@@ -449,120 +455,170 @@ async def delete_memory(memory_id: UUID, _key: str = Depends(verify_api_key)):
 
 @app.post("/search", response_model=list[SearchResult])
 async def search_memories(req: SearchRequest, _key: str = Depends(verify_api_key)):
-    embedding = await get_embedding(req.query)
-    # Graceful degradation: if embedding service is unavailable, fall back to text search
-    if embedding is None:
-        logger.warning("Embedding service unavailable for /search, falling back to text search")
-        # Delegate to text-based search as fallback
-        async with _tenant_conn(_key) as conn:
-            filters = ["content ILIKE $1"]
-            params: list[Any] = [f"%{req.query}%"]
-            idx = 2
+    strategy = (req.search_strategy or "hybrid").lower()
+    embedding = await get_embedding(req.query) if strategy != "text" else None
 
-            if req.agent_id:
-                filters.append(f"agent_id = ${idx}")
-                params.append(req.agent_id)
-                idx += 1
-            if req.memory_type:
-                filters.append(f"memory_type = ${idx}")
-                params.append(req.memory_type.value)
-                idx += 1
+    filters = []
+    vector_filters = []
+    text_filters = []
+    if req.agent_id:
+        filters.append(("agent_id = ${idx}", req.agent_id))
+    if req.memory_type:
+        filters.append(("memory_type = ${idx}", req.memory_type.value))
+    if req.min_confidence > 0:
+        filters.append(("confidence >= ${idx}", req.min_confidence))
+    if req.tags:
+        filters.append(("tags @> ${idx}", req.tags))
 
-            where = " AND ".join(filters)
-            rows = await conn.fetch(
+    async with _tenant_conn(_key) as conn:
+        vector_params: list[Any] = []
+        text_params: list[Any] = [req.query]
+        if embedding is not None:
+            vector_params.append(str(embedding))
+
+        vec_idx = 2
+        text_idx = 2
+        for template, value in filters:
+            vector_filters.append(template.replace("{idx}", str(vec_idx)))
+            vector_params.append(value)
+            vec_idx += 1
+
+            text_filters.append(template.replace("{idx}", str(text_idx + 1)))
+            text_params.append(value)
+            text_idx += 1
+
+        vector_where = (" AND " + " AND ".join(vector_filters)) if vector_filters else ""
+        text_where = (" AND " + " AND ".join(text_filters)) if text_filters else ""
+
+        vector_rows = []
+        if embedding is not None and strategy in {"hybrid", "vector"}:
+            vec = f"vector({EMBEDDING_DIMS})"
+            await conn.execute("SET LOCAL hnsw.ef_search = 100")
+            vector_rows = await conn.fetch(
                 f"""
-                SELECT *, 0.0::float8 AS similarity
+                SELECT *, 1 - (embedding <=> $1::{vec}) AS similarity
                 FROM memories
-                WHERE {where}
-                ORDER BY updated_at DESC
-                LIMIT {req.limit}
+                WHERE embedding IS NOT NULL{vector_where}
+                ORDER BY embedding <=> $1::{vec}
+                LIMIT {max(req.limit * 4, 20)}
                 """,
-                *params,
+                *vector_params,
             )
-        results = []
-        for row in rows:
-            score = compute_final_score(
-                similarity=0.5,  # neutral score for text matches
+
+        text_rows = []
+        if strategy in {"hybrid", "text"} or embedding is None:
+            text_rows = await conn.fetch(
+                f"""
+                SELECT *,
+                       ts_rank_cd(to_tsvector('english', coalesce(content, '')), plainto_tsquery('english', $1)) AS text_score
+                FROM memories
+                WHERE to_tsvector('english', coalesce(content, '')) @@ plainto_tsquery('english', $1){text_where}
+                ORDER BY text_score DESC, updated_at DESC
+                LIMIT {max(req.limit * 4, 20)}
+                """,
+                *text_params,
+            )
+            if not text_rows:
+                fallback_filters = ["content ILIKE $1"]
+                fallback_params: list[Any] = [f"%{req.query}%"]
+                idx = 2
+                for _template, value in filters:
+                    fallback_filters.append(_template.replace("{idx}", str(idx)))
+                    fallback_params.append(value)
+                    idx += 1
+                where = " AND ".join(fallback_filters)
+                text_rows = await conn.fetch(
+                    f"""
+                    SELECT *, 0.15::float8 AS text_score
+                    FROM memories
+                    WHERE {where}
+                    ORDER BY updated_at DESC
+                    LIMIT {max(req.limit * 4, 20)}
+                    """,
+                    *fallback_params,
+                )
+
+        if embedding is None and strategy == "vector":
+            logger.warning("Embedding service unavailable for /search with vector strategy; using text fallback")
+            strategy = "text"
+
+        if strategy == "vector":
+            fused_map = {str(row["id"]): 1.0 for row in vector_rows}
+        elif strategy == "text":
+            fused_map = {str(row["id"]): 1.0 for row in text_rows}
+        else:
+            fused_map = reciprocal_rank_fusion(
+                [
+                    normalize_ranked_rows(vector_rows, "similarity"),
+                    normalize_ranked_rows(text_rows, "text_score"),
+                ]
+            )
+
+        combined_rows = {str(r["id"]): r for r in vector_rows}
+        for row in text_rows:
+            combined_rows.setdefault(str(row["id"]), row)
+
+        candidate_ids = list(fused_map.keys())[: max(req.limit * 4, 20)]
+        graph_rows = []
+        if req.graph_depth > 0 and candidate_ids:
+            graph_rows = await conn.fetch(
+                """
+                SELECT
+                    CASE
+                        WHEN ml.source_id::text = ANY($1::text[]) THEN ml.source_id::text
+                        ELSE ml.target_id::text
+                    END AS memory_id,
+                    neighbor.created_at,
+                    ml.strength
+                FROM memory_links ml
+                JOIN memories neighbor
+                  ON neighbor.id = CASE
+                      WHEN ml.source_id::text = ANY($1::text[]) THEN ml.target_id
+                      ELSE ml.source_id
+                  END
+                WHERE ml.source_id::text = ANY($1::text[]) OR ml.target_id::text = ANY($1::text[])
+                ORDER BY ml.strength DESC, neighbor.created_at DESC
+                LIMIT 200
+                """,
+                candidate_ids,
+            )
+
+        graph_by_memory: dict[str, list[Any]] = {}
+        for row in graph_rows:
+            graph_by_memory.setdefault(str(row["memory_id"]), []).append(row)
+
+        ranked: list[SearchResult] = []
+        for memory_id, fused_score in fused_map.items():
+            row = combined_rows.get(memory_id)
+            if row is None:
+                continue
+            similarity = float(row.get("similarity") or row.get("text_score") or 0.0)
+            temporal_score = compute_final_score(
+                similarity=similarity if similarity > 0 else 0.35,
                 created_at=row["created_at"],
                 access_count=row["access_count"],
                 decay_rate=DECAY_RATE,
                 temporal_weight=req.temporal_weight,
             )
-            results.append(
+            graph_boost = compute_graph_temporal_boost(memory_id, graph_by_memory.get(memory_id, []))
+            ranked.append(
                 SearchResult(
                     memory=_row_to_memory(row),
-                    similarity=0.0,
-                    final_score=score,
+                    similarity=similarity,
+                    final_score=blend_hybrid_score(fused_score, temporal_score, graph_boost),
                 )
             )
-        results.sort(key=lambda r: r.final_score, reverse=True)
-        return results[: req.limit]
-    
-    filters = []
-    params: list[Any] = [str(embedding)]
-    idx = 2
 
-    if req.agent_id:
-        filters.append(f"agent_id = ${idx}")
-        params.append(req.agent_id)
-        idx += 1
-    if req.memory_type:
-        filters.append(f"memory_type = ${idx}")
-        params.append(req.memory_type.value)
-        idx += 1
-    if req.min_confidence > 0:
-        filters.append(f"confidence >= ${idx}")
-        params.append(req.min_confidence)
-        idx += 1
-    if req.tags:
-        # Filter: memory must contain ALL requested tags (array containment)
-        filters.append(f"tags @> ${idx}")
-        params.append(req.tags)
-        idx += 1
+        ranked.sort(key=lambda r: r.final_score, reverse=True)
+        final = ranked[: req.limit]
 
-    where = (" AND " + " AND ".join(filters)) if filters else ""
-    async with _tenant_conn(_key) as conn:
-        vec = f"vector({EMBEDDING_DIMS})"
-        # Set HNSW search ef for better recall on filtered queries
-        await conn.execute("SET LOCAL hnsw.ef_search = 100")
-        rows = await conn.fetch(
-            f"""
-            SELECT *, 1 - (embedding <=> $1::{vec}) AS similarity
-            FROM memories
-            WHERE embedding IS NOT NULL{where}
-            ORDER BY embedding <=> $1::{vec}
-            LIMIT {req.limit * 3}
-            """,
-            *params,
-        )
-        # Increment access counts for returned results
-        if rows:
-            ids = [r["id"] for r in rows]
+        if final:
+            ids = [r.memory.id for r in final]
             await conn.execute(
                 "UPDATE memories SET access_count = access_count + 1 WHERE id = ANY($1)",
                 ids,
             )
-    # Apply decay scoring and re-rank
-    results = []
-    for row in rows:
-        score = compute_final_score(
-            similarity=row["similarity"],
-            created_at=row["created_at"],
-            access_count=row["access_count"],
-            decay_rate=DECAY_RATE,
-            temporal_weight=req.temporal_weight,
-        )
-        results.append(
-            SearchResult(
-                memory=_row_to_memory(row),
-                similarity=row["similarity"],
-                final_score=score,
-            )
-        )
-    results.sort(key=lambda r: r.final_score, reverse=True)
-    final = results[: req.limit]
 
-    # Audit Trail: Log Search History (reuse the embedding we already computed)
     try:
         emb_str = str(embedding) if embedding else None
         async with _tenant_conn(_key) as conn:
@@ -574,21 +630,24 @@ async def search_memories(req: SearchRequest, _key: str = Depends(verify_api_key
                 req.query,
                 req.agent_id or "system",
                 len(final),
-                "vector",
-                json.dumps({"temporal_weight": req.temporal_weight, "limit": req.limit}),
-                emb_str
+                strategy,
+                json.dumps({
+                    "temporal_weight": req.temporal_weight,
+                    "limit": req.limit,
+                    "graph_depth": req.graph_depth,
+                    "hybrid": strategy == "hybrid",
+                }),
+                emb_str,
             )
     except Exception as e:
-        # Log at debug level â€” search_history logging failure is non-critical
         logger.debug(f"Failed to log search history: {e}")
 
-    # Publish search event to NATS
     if _nats_publisher:
         try:
             await _nats_publisher.publish_search_logged(
                 agent_id=req.agent_id or "unknown",
                 query=req.query,
-                source="memu_search",
+                source=f"memu_search_{strategy}",
                 result_count=len(final),
             )
         except Exception as e:
@@ -604,6 +663,8 @@ async def memu_search_compat(
     agent_id: str | None = None,
     limit: int = 10,
     memory_type: str | None = None,
+    search_strategy: str = "hybrid",
+    graph_depth: int = 1,
     _key: str = Depends(verify_api_key),
 ):
     req = SearchRequest(
@@ -611,8 +672,41 @@ async def memu_search_compat(
         limit=limit,
         agent_id=agent_id or agent,
         memory_type=_coerce_memory_type(memory_type),
+        search_strategy=search_strategy,
+        graph_depth=graph_depth,
     )
     return await search_memories(req, _key=_key)
+
+
+@app.post("/search/hybrid", response_model=list[SearchResult])
+async def hybrid_search(req: SearchRequest, _key: str = Depends(verify_api_key)):
+    req.search_strategy = "hybrid"
+    return await search_memories(req, _key=_key)
+
+
+@app.get("/api/v1/memu/retrieval/status")
+async def retrieval_status(_key: str = Depends(verify_api_key)):
+    async with _tenant_conn(_key) as conn:
+        indexes = await conn.fetch(
+            """
+            SELECT indexname, indexdef
+            FROM pg_indexes
+            WHERE schemaname = 'public'
+              AND tablename IN ('memories', 'memory_links')
+              AND (
+                    indexdef ILIKE '%USING hnsw%'
+                 OR indexdef ILIKE '%to_tsvector%'
+                 OR indexname ILIKE '%memory_links%'
+              )
+            ORDER BY tablename, indexname
+            """
+        )
+    return {
+        "ok": True,
+        "hybrid_default": True,
+        "hnsw_active": any("USING hnsw" in row["indexdef"] for row in indexes),
+        "indexes": [dict(row) for row in indexes],
+    }
 
 
 @app.get("/search-text")
