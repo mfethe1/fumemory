@@ -125,6 +125,12 @@ services:
     restart: unless-stopped
     build: .
     command: ["python", "-m", "memu.ws_bridge"]
+    environment:
+      NATS_LOCAL_URL: nats://nats:4222
+      NATS_RAILWAY_URL: ${NATS_RAILWAY_URL:-nats://nats:4222}
+    depends_on:
+      nats:
+        condition: service_healthy
 
   event-consumer:
     restart: unless-stopped

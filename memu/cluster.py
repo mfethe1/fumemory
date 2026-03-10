@@ -61,18 +61,13 @@ class NATSClusterManager:
         value = value.strip()
         if not value or value.lower() in {"none", "null", "undefined", "-", "-1"}:
             return None
-        # Ignore known placeholder hostnames that aren't valid in production envs
-        placeholder_hosts = {
-            "nats",
-            "nats.railway.internal",
-            "nats-railway.railway.internal",
-        }
+        # Preserve service-DNS hostnames like `nats` and Railway private hosts.
+        # They are valid in Docker Compose / Railway networking and are the normal
+        # way this project addresses its in-cluster NATS service.
         parsed = urlparse(value)
         host = parsed.hostname
         if not host:
             return value
-        if host in placeholder_hosts:
-            return None
         return value
 
     def __init__(
