@@ -50,6 +50,7 @@ from memu.models import (
     Task,
     TaskCreate,
     TaskStatus,
+    TaskUpdate,
 )
 
 from memu.notion_bridge import create_bridge_from_env, NotionBridge
@@ -73,6 +74,9 @@ EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
 EMBEDDING_DIMS = int(os.environ.get("EMBEDDING_DIMS", "384"))
 DEDUP_THRESHOLD = float(os.environ.get("DEDUP_THRESHOLD", "0.95"))
 DECAY_RATE = float(os.environ.get("DECAY_RATE", "0.01"))
+STATUS_FRESHNESS_MAX_AGE_MINUTES = int(os.environ.get("STATUS_FRESHNESS_MAX_AGE_MINUTES", "240"))
+SECRET_HYGIENE_ENABLED = os.environ.get("MEMU_SECRET_HYGIENE", "true").lower() in ("1", "true", "yes")
+HISTORY_HYGIENE_ENABLED = os.environ.get("MEMU_HISTORY_HYGIENE", "true").lower() in ("1", "true", "yes")
 
 # --- Globals ---
 
@@ -267,6 +271,180 @@ def content_hash(text: str) -> str:
     return hashlib.sha256(text.strip().lower().encode()).hexdigest()[:64]
 
 
+def _normalize_custom_id(custom_id: str | None) -> str | None:
+    if not custom_id:
+        return None
+    normalized = custom_id.strip()
+    return normalized or None
+
+
+def _merge_tags(existing: list[str] | None, new_tags: list[str] | None) -> list[str]:
+    merged = {tag.strip() for tag in (existing or []) + (new_tags or []) if isinstance(tag, str) and tag.strip()}
+    return sorted(merged)
+
+
+def _secret_hygiene_hits(content: str, metadata: dict[str, Any] | None = None) -> list[str]:
+    if not SECRET_HYGIENE_ENABLED:
+        return []
+
+    haystacks = [content]
+    if metadata:
+        try:
+            haystacks.append(json.dumps(metadata, sort_keys=True))
+        except Exception:
+            haystacks.append(str(metadata))
+    joined = "\n".join(haystacks)
+    lowered = joined.lower()
+
+    hits: list[str] = []
+    if "authorization: bearer " in lowered or "x-api-key" in lowered:
+        hits.append("authorization-token")
+    if any(token in lowered for token in ["api_key=", "api-key", "secret_key", "client_secret", "refresh_token", "password="]):
+        hits.append("credential-assignment")
+    if "-----begin" in lowered and "private key-----" in lowered:
+        hits.append("private-key-material")
+    if "sk-" in joined or "ghp_" in joined or "xoxb-" in joined:
+        hits.append("live-token-pattern")
+    return sorted(set(hits))
+
+
+def _history_hygiene_hits(content: str) -> list[str]:
+    if not HISTORY_HYGIENE_ENABLED:
+        return []
+
+    lowered = content.lower()
+    hits: list[str] = []
+    lines = [line.strip() for line in content.splitlines() if line.strip()]
+    if any(line.startswith(": ") and ";" in line for line in lines):
+        hits.append("bash-history-format")
+    if len(lines) >= 3 and sum(1 for line in lines if any(line.startswith(prefix) for prefix in ("cd ", "ls", "pwd", "cat ", "git ", "docker ", "kubectl ", "openclaw "))) >= 3:
+        hits.append("shell-history-noise")
+    if any(marker in lowered for marker in [".zsh_history", ".bash_history", "history | tail", "fc -ln"]):
+        hits.append("history-artifact")
+    return sorted(set(hits))
+
+
+def _enforce_memory_hygiene(req: MemoryCreate) -> None:
+    if req.allow_hygiene_bypass:
+        return
+    secret_hits = _secret_hygiene_hits(req.content, req.metadata)
+    history_hits = _history_hygiene_hits(req.content)
+    if not secret_hits and not history_hits:
+        return
+
+    detail: dict[str, Any] = {"message": "memory write blocked by hygiene guardrails"}
+    if secret_hits:
+        detail["secret_hits"] = secret_hits
+    if history_hits:
+        detail["history_hits"] = history_hits
+    raise HTTPException(status_code=422, detail=detail)
+
+
+async def _find_duplicate_candidate(conn, *, embedding: list[float] | None, c_hash: str, custom_id: str | None):
+    if custom_id:
+        existing = await conn.fetchrow(
+            "SELECT id, 1.0::float AS similarity FROM memories WHERE custom_id = $1 LIMIT 1",
+            custom_id,
+        )
+        if existing:
+            return existing
+
+    if embedding is not None:
+        vec = f"vector({EMBEDDING_DIMS})"
+        return await conn.fetchrow(
+            f"""
+            SELECT id, 1 - (embedding <=> $1::{vec}) AS similarity
+            FROM memories
+            WHERE content_hash = $2 OR (1 - (embedding <=> $1::{vec})) > $3
+            ORDER BY similarity DESC
+            LIMIT 1
+            """,
+            str(embedding),
+            c_hash,
+            DEDUP_THRESHOLD,
+        )
+
+    return await conn.fetchrow(
+        "SELECT id, 1.0::float AS similarity FROM memories WHERE content_hash = $1 LIMIT 1",
+        c_hash,
+    )
+
+
+async def _upsert_memory(conn, req: MemoryCreate, *, embedding: list[float] | None, tenant_id: UUID):
+    c_hash = content_hash(req.content)
+    custom_id = _normalize_custom_id(req.custom_id)
+    existing = await _find_duplicate_candidate(conn, embedding=embedding, c_hash=c_hash, custom_id=custom_id)
+    merged_tags = _merge_tags([], req.tags)
+
+    if existing and should_deduplicate(existing["similarity"], DEDUP_THRESHOLD):
+        return await conn.fetchrow(
+            """
+            UPDATE memories SET
+                access_count = access_count + 1,
+                duplicate_count = COALESCE(duplicate_count, 0) + 1,
+                confidence = GREATEST(confidence, $2),
+                metadata = metadata || $3::jsonb,
+                tags = ARRAY(
+                    SELECT DISTINCT tag
+                    FROM unnest(COALESCE(tags, '{}'::text[]) || $4::text[]) AS tag
+                    WHERE tag IS NOT NULL AND tag <> ''
+                    ORDER BY tag
+                ),
+                custom_id = COALESCE(custom_id, $5),
+                updated_at = NOW()
+            WHERE id = $1
+            RETURNING *
+            """,
+            existing["id"],
+            req.confidence,
+            json.dumps(req.metadata) if req.metadata else "{}",
+            merged_tags,
+            custom_id,
+        )
+
+    return await conn.fetchrow(
+        """
+        INSERT INTO memories (
+            content, embedding, memory_type, agent_id, metadata, parent_id,
+            confidence, content_hash, tenant_id, tags, custom_id
+        )
+        VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9, $10, $11)
+        RETURNING *
+        """,
+        req.content,
+        str(embedding) if embedding is not None else None,
+        req.memory_type.value,
+        req.agent_id,
+        json.dumps(req.metadata) if req.metadata else "{}",
+        req.parent_id,
+        req.confidence,
+        c_hash,
+        tenant_id,
+        merged_tags,
+        custom_id,
+    )
+
+
+async def _table_max_timestamp(conn, table_name: str) -> datetime | None:
+    try:
+        return await conn.fetchval(f"SELECT MAX(updated_at) FROM {table_name}")
+    except Exception:
+        return None
+
+
+def _freshness_payload(ts: datetime | None, *, now: datetime, stale_after_minutes: int) -> dict[str, Any]:
+    if ts is None:
+        return {"updated_at": None, "age_seconds": None, "stale": True}
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    age_seconds = max(0.0, (now - ts).total_seconds())
+    return {
+        "updated_at": ts.isoformat(),
+        "age_seconds": round(age_seconds, 3),
+        "stale": age_seconds > stale_after_minutes * 60,
+    }
+
+
 # --- Helpers ---
 
 def _row_to_memory(row) -> Memory:
@@ -288,6 +466,8 @@ def _row_to_memory(row) -> Memory:
         access_count=row["access_count"],
         decay_score=row["decay_score"],
         tags=tags,
+        custom_id=row.get("custom_id"),
+        duplicate_count=row.get("duplicate_count") or 0,
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )
@@ -324,67 +504,12 @@ async def health():
 
 @app.post("/memories", response_model=Memory)
 async def create_memory(req: MemoryCreate, _key: str = Depends(verify_api_key)):
+    _enforce_memory_hygiene(req)
     embedding = await get_embedding(req.content)
-    c_hash = content_hash(req.content)
 
     async with _tenant_conn(_key) as conn:
-        # Check for duplicates (content hash always works; vector similarity only when embedding available)
-        if embedding is not None:
-            vec = f"vector({EMBEDDING_DIMS})"
-            existing = await conn.fetchrow(
-                f"""
-                SELECT id, 1 - (embedding <=> $1::{vec}) AS similarity
-                FROM memories
-                WHERE content_hash = $2 OR (1 - (embedding <=> $1::{vec})) > $3
-                ORDER BY similarity DESC
-                LIMIT 1
-                """,
-                str(embedding),
-                c_hash,
-                DEDUP_THRESHOLD,
-            )
-        else:
-            existing = await conn.fetchrow(
-                "SELECT id, 1.0::float AS similarity FROM memories WHERE content_hash = $1 LIMIT 1",
-                c_hash,
-            )
-
-        if existing and should_deduplicate(existing["similarity"], DEDUP_THRESHOLD):
-            # Update existing memory instead of duplicating
-            row = await conn.fetchrow(
-                """
-                UPDATE memories SET
-                    access_count = access_count + 1,
-                    confidence = GREATEST(confidence, $2),
-                    metadata = metadata || $3::jsonb,
-                    updated_at = NOW()
-                WHERE id = $1
-                RETURNING *
-                """,
-                existing["id"],
-                req.confidence,
-                json.dumps(req.metadata) if req.metadata else "{}",
-            )
-        else:
-            # Include tenant_id for RLS multi-tenancy
-            tenant_id = getattr(_key, 'tenant_id', DEFAULT_TENANT_ID)
-            row = await conn.fetchrow(
-                """
-                INSERT INTO memories (content, embedding, memory_type, agent_id, metadata, parent_id, confidence, content_hash, tenant_id, tags)
-                VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9, $10)
-                RETURNING *
-                """,
-                req.content,
-                str(embedding) if embedding is not None else None,
-                req.memory_type.value,
-                req.agent_id,
-                json.dumps(req.metadata) if req.metadata else "{}",
-                req.parent_id,
-                req.confidence,
-                c_hash,
-                tenant_id,
-                req.tags or [],
-            )
+        tenant_id = getattr(_key, 'tenant_id', DEFAULT_TENANT_ID)
+        row = await _upsert_memory(conn, req, embedding=embedding, tenant_id=tenant_id)
 
     memory = _row_to_memory(row)
 
@@ -803,39 +928,153 @@ async def chat(req: ChatRequest, _key: str = Depends(verify_api_key)):
 async def bulk_import(req: BulkImportRequest, _key: str = Depends(verify_api_key)):
     """Bulk import memories from text, split by delimiter."""
     chunks = [c.strip() for c in req.content.split(req.split_on) if c.strip()]
+    custom_ids = req.custom_ids or []
+    if custom_ids and len(custom_ids) != len(chunks):
+        raise HTTPException(status_code=422, detail="custom_ids length must match chunk count")
 
     imported = 0
     dupes = 0
+    deduplicated_updated = 0
+    tenant_id = getattr(_key, 'tenant_id', DEFAULT_TENANT_ID)
 
-    for chunk in chunks:
-        try:
-            embedding = await get_embedding(chunk)
-            c_hash = content_hash(chunk)
-
-            async with _tenant_conn(_key) as conn:
-                existing = await conn.fetchrow(
-                    "SELECT id FROM memories WHERE content_hash = $1", c_hash
+    async with _tenant_conn(_key) as conn:
+        for idx, chunk in enumerate(chunks):
+            try:
+                item_req = MemoryCreate(
+                    content=chunk,
+                    memory_type=req.memory_type,
+                    agent_id=req.agent_id,
+                    custom_id=custom_ids[idx] if custom_ids else None,
+                    allow_hygiene_bypass=req.allow_hygiene_bypass,
                 )
-                if existing:
+                _enforce_memory_hygiene(item_req)
+                embedding = await get_embedding(chunk)
+                existing = await _find_duplicate_candidate(
+                    conn,
+                    embedding=embedding,
+                    c_hash=content_hash(chunk),
+                    custom_id=_normalize_custom_id(item_req.custom_id),
+                )
+                row = await _upsert_memory(conn, item_req, embedding=embedding, tenant_id=tenant_id)
+                if existing and should_deduplicate(existing["similarity"], DEDUP_THRESHOLD):
+                    deduplicated_updated += 1
                     dupes += 1
-                    continue
+                else:
+                    imported += 1
+            except HTTPException:
+                raise
+            except Exception:
+                continue
 
+    return BulkImportResponse(
+        imported=imported,
+        duplicates_skipped=dupes,
+        deduplicated_updated=deduplicated_updated,
+    )
+
+
+@app.post("/memories/dedupe")
+async def dedupe_memories(
+    dry_run: bool = False,
+    limit: int = 100,
+    _key: str = Depends(verify_api_key),
+):
+    """Collapse duplicate memories by custom_id first, then content_hash."""
+    merged_groups = 0
+    removed_ids: list[str] = []
+
+    async with _tenant_conn(_key) as conn:
+        custom_groups = await conn.fetch(
+            """
+            SELECT custom_id AS dedupe_key, array_agg(id ORDER BY updated_at DESC, created_at DESC) AS ids
+            FROM memories
+            WHERE custom_id IS NOT NULL
+            GROUP BY custom_id
+            HAVING count(*) > 1
+            LIMIT $1
+            """,
+            limit,
+        )
+        for group in custom_groups:
+            ids = list(group["ids"])
+            keeper, duplicates = ids[0], ids[1:]
+            if not duplicates:
+                continue
+            merged_groups += 1
+            removed_ids.extend(str(item) for item in duplicates)
+            if not dry_run:
                 await conn.execute(
                     """
-                    INSERT INTO memories (content, embedding, memory_type, agent_id, content_hash)
-                    VALUES ($1, $2, $3, $4, $5)
+                    UPDATE memories
+                    SET duplicate_count = COALESCE(duplicate_count, 0) + $2,
+                        access_count = access_count + $2,
+                        updated_at = NOW()
+                    WHERE id = $1
                     """,
-                    chunk,
-                    str(embedding) if embedding else None,
-                    req.memory_type.value,
-                    req.agent_id,
-                    c_hash,
+                    keeper,
+                    len(duplicates),
                 )
-                imported += 1
-        except Exception:
-            continue
+                await conn.execute("DELETE FROM memories WHERE id = ANY($1::uuid[])", duplicates)
 
-    return BulkImportResponse(imported=imported, duplicates_skipped=dupes)
+        hash_groups = await conn.fetch(
+            """
+            SELECT content_hash AS dedupe_key, array_agg(id ORDER BY updated_at DESC, created_at DESC) AS ids
+            FROM memories
+            WHERE content_hash IS NOT NULL
+            GROUP BY content_hash
+            HAVING count(*) > 1
+            LIMIT $1
+            """,
+            limit,
+        )
+        for group in hash_groups:
+            ids = [item for item in group["ids"] if str(item) not in removed_ids]
+            if len(ids) < 2:
+                continue
+            keeper, duplicates = ids[0], ids[1:]
+            merged_groups += 1
+            removed_ids.extend(str(item) for item in duplicates)
+            if not dry_run:
+                await conn.execute(
+                    """
+                    UPDATE memories
+                    SET duplicate_count = COALESCE(duplicate_count, 0) + $2,
+                        access_count = access_count + $2,
+                        updated_at = NOW()
+                    WHERE id = $1
+                    """,
+                    keeper,
+                    len(duplicates),
+                )
+                await conn.execute("DELETE FROM memories WHERE id = ANY($1::uuid[])", duplicates)
+
+    return {
+        "ok": True,
+        "dry_run": dry_run,
+        "merged_groups": merged_groups,
+        "duplicates_removed": len(removed_ids),
+        "removed_ids": removed_ids,
+    }
+
+
+@app.get("/api/v1/memu/status/freshness")
+async def status_freshness(_key: str = Depends(verify_api_key)):
+    now = datetime.now(timezone.utc)
+    async with _tenant_conn(_key) as conn:
+        memories_ts = await _table_max_timestamp(conn, "memories")
+        backlog_ts = await _table_max_timestamp(conn, "backlog")
+        blocks_ts = await _table_max_timestamp(conn, "memory_blocks")
+
+    return {
+        "ok": True,
+        "generated_at": now.isoformat(),
+        "stale_after_minutes": STATUS_FRESHNESS_MAX_AGE_MINUTES,
+        "streams": {
+            "memories": _freshness_payload(memories_ts, now=now, stale_after_minutes=STATUS_FRESHNESS_MAX_AGE_MINUTES),
+            "tasks": _freshness_payload(backlog_ts, now=now, stale_after_minutes=STATUS_FRESHNESS_MAX_AGE_MINUTES),
+            "memory_blocks": _freshness_payload(blocks_ts, now=now, stale_after_minutes=STATUS_FRESHNESS_MAX_AGE_MINUTES),
+        },
+    }
 
 
 @app.post("/tasks", response_model=Task)
@@ -877,6 +1116,37 @@ async def list_tasks(status: TaskStatus | None = None, owner: str | None = None,
     async with _tenant_conn(_key) as conn:
         rows = await conn.fetch(f"SELECT * FROM backlog{where} ORDER BY priority ASC, created_at DESC", *params)
     return [_row_to_task(row) for row in rows]
+
+
+@app.patch("/tasks/{task_id}", response_model=Task)
+async def update_task(task_id: UUID, req: TaskUpdate, _key: str = Depends(verify_api_key)):
+    handoff_target = (req.metadata or {}).get("handoff_to") if req.metadata else None
+    if (req.status in {TaskStatus.done, TaskStatus.blocked} or handoff_target) and not (req.evidence and req.evidence.strip()):
+        raise HTTPException(
+            status_code=422,
+            detail="evidence is required when marking a task done/blocked or creating a handoff",
+        )
+
+    async with _tenant_conn(_key) as conn:
+        row = await conn.fetchrow(
+            """
+            UPDATE backlog
+            SET
+                status = COALESCE($2, status),
+                evidence = COALESCE($3, evidence),
+                metadata = COALESCE(metadata, '{}'::jsonb) || $4::jsonb,
+                updated_at = NOW()
+            WHERE id = $1
+            RETURNING *
+            """,
+            task_id,
+            req.status.value if req.status else None,
+            req.evidence.strip() if req.evidence else None,
+            json.dumps(req.metadata) if req.metadata else "{}",
+        )
+    if not row:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return _row_to_task(row)
 
 
 # --- A-MEM Link Layer ---

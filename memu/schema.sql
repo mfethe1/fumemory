@@ -17,6 +17,8 @@ CREATE TABLE IF NOT EXISTS memories (
     access_count  INTEGER NOT NULL DEFAULT 0,
     decay_score   FLOAT NOT NULL DEFAULT 1.0,
     content_hash  VARCHAR(64),  -- for deduplication
+    custom_id     VARCHAR(191), -- caller-supplied idempotency key
+    duplicate_count INTEGER NOT NULL DEFAULT 0,
     created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -27,6 +29,8 @@ CREATE INDEX IF NOT EXISTS idx_memories_agent_id ON memories (agent_id);
 CREATE INDEX IF NOT EXISTS idx_memories_type ON memories (memory_type);
 CREATE INDEX IF NOT EXISTS idx_memories_parent ON memories (parent_id);
 CREATE INDEX IF NOT EXISTS idx_memories_content_hash ON memories (content_hash);
+CREATE INDEX IF NOT EXISTS idx_memories_custom_id ON memories (custom_id) WHERE custom_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_tenant_custom_id_unique ON memories (tenant_id, custom_id) WHERE custom_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_memories_created ON memories (created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_memories_decay ON memories (decay_score DESC);
 

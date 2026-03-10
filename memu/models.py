@@ -27,6 +27,8 @@ class MemoryCreate(BaseModel):
     parent_id: UUID | None = None
     confidence: float = 1.0
     tags: list[str] = Field(default_factory=list, description="Entity/topic tags for filtered retrieval")
+    custom_id: str | None = Field(default=None, description="Caller-supplied idempotency key for dedupe-safe writes")
+    allow_hygiene_bypass: bool = Field(default=False, description="Allow write even if content looks like secrets/history noise")
 
 class Memory(BaseModel):
     id: UUID
@@ -39,6 +41,8 @@ class Memory(BaseModel):
     access_count: int
     decay_score: float | None = None
     tags: list[str] = Field(default_factory=list)
+    custom_id: str | None = None
+    duplicate_count: int = 0
     created_at: datetime
     updated_at: datetime
 
@@ -110,15 +114,24 @@ class Task(BaseModel):
     created_at: datetime
     updated_at: datetime
 
+
+class TaskUpdate(BaseModel):
+    status: TaskStatus | None = None
+    evidence: str | None = Field(default=None, description="Verification artifact, log snippet, or proof URL/text")
+    metadata: dict | None = None
+
 class BulkImportRequest(BaseModel):
     content: str
     split_on: str = "\n---\n"
     memory_type: MemoryType = MemoryType.observation
     agent_id: str
+    custom_ids: list[str] | None = Field(default=None, description="Optional per-chunk custom ids for idempotent bulk imports")
+    allow_hygiene_bypass: bool = False
 
 class BulkImportResponse(BaseModel):
     imported: int
     duplicates_skipped: int
+    deduplicated_updated: int = 0
 
 class ChatRequest(BaseModel):
     question: str

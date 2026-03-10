@@ -187,9 +187,12 @@ curl -X POST http://localhost:8000/memories \
     "content": "Always run migrations before deploying",
     "memory_type": "lesson",
     "agent_id": "lenny",
+    "custom_id": "deploy-checklist:migrations",
     "metadata": {"project": "infrastructure"}
   }'
 ```
+
+`custom_id` is optional but recommended for idempotent writers. If omitted, memU falls back to content-hash/vector dedupe.
 
 ### Semantic search
 
@@ -226,10 +229,24 @@ curl -X POST http://localhost:8000/chat \
 | `/memories/{id}` | GET | Retrieve a specific memory |
 | `/memories/{id}` | DELETE | Delete a memory |
 | `/memories/bulk` | POST | Bulk import from markdown/JSON |
+| `/memories/dedupe` | POST | Collapse existing duplicates by `custom_id`/content hash |
+| `/tasks/{id}` | PATCH | Update task status with proof-gated evidence on handoff/done |
+| `/api/v1/memu/status/freshness` | GET | Check freshness/staleness for memories, tasks, and memory blocks |
 | `/api/dag/{root_id}` | GET | DAG snapshot for a root prompt |
 | `/api/cluster/status` | GET | NATS cluster health |
 | `/api/halt` | POST | Emergency halt (God Mode) |
 | `/ws/swarm` | WS | Real-time event stream |
+
+---
+
+## Operational Hygiene
+
+- **Idempotent writes**: supply `custom_id` on `/memories` or `custom_ids[]` on `/memories/bulk` to make retries safe.
+- **Fallback dedupe**: if no `custom_id` is provided, memU still dedupes by normalized content hash and near-duplicate vector similarity.
+- **Secret/history guardrails**: likely API tokens, private keys, or raw shell history are rejected with HTTP `422` unless `allow_hygiene_bypass=true` is explicitly set.
+- **Retroactive cleanup**: `POST /memories/dedupe` collapses already-stored duplicates by `custom_id` first, then content hash.
+- **Freshness checks**: `GET /api/v1/memu/status/freshness` reports staleness for memories, backlog tasks, and memory blocks.
+- **Proof-gated handoffs**: `PATCH /tasks/{id}` requires `evidence` when a task is marked `done`, `blocked`, or handed off via `metadata.handoff_to`.
 
 ---
 
@@ -328,9 +345,12 @@ EMBEDDING_BASE_URL=http://localhost:11434  # Ollama default
 EMBEDDING_MODEL=qwen3-embedding
 EMBEDDING_DIMS=4096
 
-# Decay
+# Decay + dedupe
 DECAY_RATE=0.01
 DEDUP_THRESHOLD=0.95
+STATUS_FRESHNESS_MAX_AGE_MINUTES=240
+MEMU_SECRET_HYGIENE=true
+MEMU_HISTORY_HYGIENE=true
 
 # Embedding provider for production (do NOT point to local laptop from Railway)
 # Option A: OpenAI-compatible API

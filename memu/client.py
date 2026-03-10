@@ -49,6 +49,8 @@ class MemUClient:
         metadata: dict[str, Any] | None = None,
         parent_id: str | UUID | None = None,
         confidence: float = 1.0,
+        custom_id: str | None = None,
+        allow_hygiene_bypass: bool = False,
     ) -> Memory:
         """Store a memory."""
         payload = MemoryCreate(
@@ -58,6 +60,8 @@ class MemUClient:
             metadata=metadata or {},
             parent_id=UUID(str(parent_id)) if parent_id else None,
             confidence=confidence,
+            custom_id=custom_id,
+            allow_hygiene_bypass=allow_hygiene_bypass,
         )
         r = self._client.post("/memories", json=payload.model_dump(mode="json"))
         r.raise_for_status()
@@ -125,6 +129,8 @@ class MemUClient:
         agent_id: str | None = None,
         memory_type: str | MemoryType = "fact",
         split_on: str = "\n\n",
+        custom_ids: list[str] | None = None,
+        allow_hygiene_bypass: bool = False,
     ) -> BulkImportResponse:
         """Bulk import memories from text/markdown."""
         payload = {
@@ -132,6 +138,8 @@ class MemUClient:
             "agent_id": agent_id,
             "memory_type": MemoryType(memory_type).value,
             "split_on": split_on,
+            "custom_ids": custom_ids,
+            "allow_hygiene_bypass": allow_hygiene_bypass,
         }
         r = self._client.post("/memories/bulk", json=payload)
         r.raise_for_status()
