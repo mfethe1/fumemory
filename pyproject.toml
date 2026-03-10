@@ -33,6 +33,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest", "pytest-asyncio", "ruff", "mypy", "respx"]
+temporal = ["temporalio==1.23.0"]
 
 [project.urls]
 Homepage = "https://github.com/protelynx/memu"

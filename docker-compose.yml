@@ -64,6 +64,10 @@ services:
       EMBEDDING_DIMS: ${EMBEDDING_DIMS:-4096}
       NATS_LOCAL_URL: nats://nats:4222
       NATS_RAILWAY_URL: ${NATS_RAILWAY_URL:-nats://nats:4222}
+      TEMPORAL_HOST: temporal:7233
+      TEMPORAL_NAMESPACE: ${TEMPORAL_NAMESPACE:-default}
+      TEMPORAL_TASK_QUEUE: ${TEMPORAL_TASK_QUEUE:-memu-queue}
+      GATEWAY_ID: ${GATEWAY_ID:-memu-api}
     depends_on:
       postgres:
         condition: service_healthy
@@ -95,7 +99,11 @@ services:
     command: ["python", "-m", "memu.temporal_worker.worker"]
     environment:
       TEMPORAL_HOST: temporal:7233
+      TEMPORAL_NAMESPACE: ${TEMPORAL_NAMESPACE:-default}
+      TEMPORAL_TASK_QUEUE: ${TEMPORAL_TASK_QUEUE:-memu-queue}
       DATABASE_URL: postgresql://memu:memu@postgres:5432/memu
+      GATEWAY_ID: ${TEMPORAL_GATEWAY_ID:-temporal-worker}
+      GATEWAY_ROLE: ${TEMPORAL_GATEWAY_ROLE:-temporal-worker}
     depends_on:
       temporal:
         condition: service_started

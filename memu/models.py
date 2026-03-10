@@ -4,6 +4,8 @@ from datetime import datetime
 from enum import Enum
 from typing import Any
 
+from memu.temporal_contracts import OrchestrationContext
+
 class MemoryType(str, Enum):
     # Original types (backwards compatibility)
     fact = "fact"
@@ -26,6 +28,7 @@ class MemoryCreate(BaseModel):
     metadata: dict | None = None
     parent_id: UUID | None = None
     confidence: float = 1.0
+    orchestration: OrchestrationContext | None = None
 
 class Memory(BaseModel):
     id: UUID
@@ -50,6 +53,7 @@ class SearchRequest(BaseModel):
     min_results: int = 3
     max_expansion_steps: int = 3
     lexical_fallback: bool = True
+    orchestration: OrchestrationContext | None = None
 
 class SearchResult(BaseModel):
     memory: Memory
