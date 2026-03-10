@@ -2014,6 +2014,41 @@ async def get_tenant(tenant_slug: str, _key: str = Depends(verify_api_key)):
             raise HTTPException(status_code=404, detail="Tenant not found")
         return dict(row)
 
+@app.post("/api/v1/memu/dedupe")
+async def dedupe_memories(dry_run: bool = False, _key: str = Depends(verify_api_key)):
+    """Find and remove duplicate memories based on content_hash."""
+    async with _tenant_conn(_key) as conn:
+        # Find duplicates (same content_hash, keep the oldest one)
+        rows = await conn.fetch(
+            """
+            WITH duplicates AS (
+                SELECT content_hash, MIN(created_at) as first_seen, COUNT(*) as cnt
+                FROM memories
+                GROUP BY content_hash
+                HAVING COUNT(*) > 1
+            )
+            SELECT m.id, m.content_hash, m.created_at
+            FROM memories m
+            JOIN duplicates d ON m.content_hash = d.content_hash
+            WHERE m.created_at > d.first_seen
+            """
+        )
+        
+        duplicate_ids = [r["id"] for r in rows]
+        
+        if not dry_run and duplicate_ids:
+            await conn.execute(
+                "DELETE FROM memories WHERE id = ANY($1)", 
+                duplicate_ids
+            )
+            
+    return {
+        "ok": True, 
+        "duplicates_found": len(duplicate_ids), 
+        "deleted": 0 if dry_run else len(duplicate_ids),
+        "dry_run": dry_run
+    }
+
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
