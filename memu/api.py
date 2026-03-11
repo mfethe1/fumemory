@@ -73,6 +73,9 @@ EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
 EMBEDDING_DIMS = int(os.environ.get("EMBEDDING_DIMS", "384"))
 DEDUP_THRESHOLD = float(os.environ.get("DEDUP_THRESHOLD", "0.95"))
 DECAY_RATE = float(os.environ.get("DECAY_RATE", "0.01"))
+HNSW_ITERATIVE_SCAN = os.environ.get("HNSW_ITERATIVE_SCAN", "strict_order")
+HNSW_MAX_SCAN_TUPLES = int(os.environ.get("HNSW_MAX_SCAN_TUPLES", "20000"))
+IVFFLAT_MAX_PROBES = int(os.environ.get("IVFFLAT_MAX_PROBES", "10"))
 
 # --- Globals ---
 
@@ -139,6 +142,7 @@ app = FastAPI(
 
 app.include_router(temporal_router, tags=["Async Workflows"])
 
+memu_key_header = APIKeyHeader(name="X-MemU-Key", auto_error=False)
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 # ---------------------------------------------------------------------------
@@ -161,8 +165,15 @@ class AuthContext(str):
         return instance
 
 
-async def verify_api_key(key: str | None = Security(api_key_header)) -> AuthContext:
-    """Verify API key and resolve tenant context for RLS."""
+async def verify_api_key(
+    memu_key: str | None = Security(memu_key_header),
+    legacy_key: str | None = Security(api_key_header),
+) -> AuthContext:
+    """Verify API key and resolve tenant context for RLS.
+
+    Prefer X-MemU-Key, but accept legacy X-API-Key for backward compatibility.
+    """
+    key = memu_key or legacy_key
     if not key or key != MEMU_API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
     tid = await resolve_tenant_id(pool, key) if pool else DEFAULT_TENANT_ID
@@ -386,6 +397,35 @@ def _expansion_schedule(base_limit: int, max_steps: int) -> list[int]:
     return limits
 
 
+def _ensure_memory_metadata(metadata: dict | None) -> dict[str, Any]:
+    payload = dict(metadata or {})
+    payload.setdefault("ts", datetime.now(timezone.utc).isoformat())
+    return payload
+
+
+def _extract_entities(text: str) -> set[str]:
+    return {token.lower() for token in re.findall(r"\b[A-Z][A-Za-z0-9_-]{2,}\b", text or "")}
+
+
+def _entity_overlap_score(query: str, content: str) -> float:
+    q_entities = _extract_entities(query)
+    if not q_entities:
+        return 0.0
+    c_entities = _extract_entities(content)
+    if not c_entities:
+        return 0.0
+    return len(q_entities & c_entities) / len(q_entities)
+
+
+def _parse_optional_iso(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
 # --- Routes ---
 
 @app.get("/health")
@@ -398,8 +438,14 @@ async def health():
         raise HTTPException(status_code=503, detail=str(e))
 
 
+@app.get("/api/v1/memu/health")
+async def memu_health_compat():
+    return await health()
+
+
 @app.post("/memories", response_model=Memory)
 async def create_memory(req: MemoryCreate, _key: str = Depends(verify_api_key)):
+    normalized_metadata = _ensure_memory_metadata(req.metadata)
     embedding = await get_embedding(req.content)
     c_hash = content_hash(req.content)
 
@@ -439,7 +485,7 @@ async def create_memory(req: MemoryCreate, _key: str = Depends(verify_api_key)):
                 """,
                 existing["id"],
                 req.confidence,
-                json.dumps(req.metadata) if req.metadata else "{}",
+                json.dumps(normalized_metadata),
             )
         else:
             # Include tenant_id for RLS multi-tenancy
@@ -454,7 +500,7 @@ async def create_memory(req: MemoryCreate, _key: str = Depends(verify_api_key)):
                 str(embedding) if embedding is not None else None,
                 req.memory_type.value,
                 req.agent_id,
-                json.dumps(req.metadata) if req.metadata else "{}",
+                json.dumps(normalized_metadata),
                 req.parent_id,
                 req.confidence,
                 c_hash,
@@ -471,12 +517,57 @@ async def create_memory(req: MemoryCreate, _key: str = Depends(verify_api_key)):
                 memory_id=str(memory.id),
                 content=req.content,
                 memory_type=req.memory_type.value,
-                metadata=req.metadata,
+                metadata=normalized_metadata,
             )
         except Exception as e:
             logger.warning("NATS publish failed for memory write: %s", e)
 
     return memory
+
+
+class MemUAddCompatRequest(BaseModel):
+    content: str | None = None
+    text: str | None = None
+    agent_id: str = "unknown"
+    memory_type: MemoryType = MemoryType.observation
+    metadata: dict[str, Any] | None = None
+    confidence: float = 1.0
+
+
+class MemUAddCompatResponse(BaseModel):
+    ok: bool
+    id: str | None = None
+    error_code: str | None = None
+    message: str
+
+
+@app.post("/api/v1/memu/add", response_model=MemUAddCompatResponse)
+async def memu_add_compat(req: MemUAddCompatRequest, _key: str = Depends(verify_api_key)):
+    # Contract v1.1 guardrail: require content; reject legacy text field explicitly.
+    if req.content is None and req.text is not None:
+        return MemUAddCompatResponse(
+            ok=False,
+            error_code="INVALID_PAYLOAD",
+            message="Use 'content' (string) instead of legacy 'text'.",
+        )
+    if req.content is None or not req.content.strip():
+        return MemUAddCompatResponse(
+            ok=False,
+            error_code="MISSING_CONTENT",
+            message="Missing required field: content",
+        )
+
+    memory = await create_memory(
+        MemoryCreate(
+            content=req.content,
+            agent_id=req.agent_id,
+            memory_type=req.memory_type,
+            metadata=req.metadata,
+            confidence=req.confidence,
+        ),
+        _key=_key,
+    )
+    return MemUAddCompatResponse(ok=True, id=str(memory.id), message="Memory stored")
 
 
 @app.get("/memories/search")
@@ -595,9 +686,25 @@ async def search_memories(req: SearchRequest, _key: str = Depends(verify_api_key
         filters.append(f"confidence >= ${idx}")
         params.append(req.min_confidence)
         idx += 1
+    if req.time_window_start:
+        filters.append(f"created_at >= ${idx}")
+        params.append(req.time_window_start)
+        idx += 1
+    if req.time_window_end:
+        filters.append(f"created_at <= ${idx}")
+        params.append(req.time_window_end)
+        idx += 1
 
     where = (" AND " + " AND ".join(filters)) if filters else ""
     async with _tenant_conn(_key) as conn:
+        try:
+            await conn.execute("SET LOCAL hnsw.iterative_scan = $1", HNSW_ITERATIVE_SCAN)
+            await conn.execute("SET LOCAL hnsw.max_scan_tuples = $1", HNSW_MAX_SCAN_TUPLES)
+            await conn.execute("SET LOCAL ivfflat.max_probes = $1", IVFFLAT_MAX_PROBES)
+        except Exception:
+            # Compatibility with pgvector versions that do not expose these knobs.
+            pass
+
         vec = f"vector({EMBEDDING_DIMS})"
         rows = []
         min_results = max(1, min(req.limit, req.min_results))
@@ -657,9 +764,32 @@ async def search_memories(req: SearchRequest, _key: str = Depends(verify_api_key
                 "UPDATE memories SET access_count = access_count + 1 WHERE id = ANY($1)",
                 ids,
             )
-    # Apply decay scoring and re-rank
-    results = []
+    # Apply Graphiti-inspired temporal + entity-aware re-ranking.
+    superseded_ids = {
+        str(r.get("metadata", {}).get("supersedes"))
+        for r in rows
+        if isinstance(r.get("metadata"), dict) and r.get("metadata", {}).get("supersedes")
+    }
+
+    filtered_rows = []
+    now = datetime.now(timezone.utc)
     for row in rows:
+        row_id = str(row["id"])
+        if row_id in superseded_ids:
+            continue
+        metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+        stale_after_raw = metadata.get("stale_after")
+        if isinstance(stale_after_raw, str):
+            try:
+                stale_after = _parse_optional_iso(stale_after_raw)
+                if stale_after and stale_after <= now:
+                    continue
+            except Exception:
+                pass
+        filtered_rows.append(row)
+
+    results = []
+    for row in filtered_rows:
         score = compute_final_score(
             similarity=row["similarity"],
             created_at=row["created_at"],
@@ -667,6 +797,8 @@ async def search_memories(req: SearchRequest, _key: str = Depends(verify_api_key
             decay_rate=DECAY_RATE,
             temporal_weight=req.temporal_weight,
         )
+        entity_overlap = _entity_overlap_score(req.query, row["content"])
+        score = (1 - req.entity_weight) * score + (req.entity_weight * entity_overlap)
         results.append(
             SearchResult(
                 memory=_row_to_memory(row),
@@ -730,6 +862,30 @@ async def memu_search_compat(
     return await search_memories(req, _key=_key)
 
 
+class MemUSearchCompatRequest(BaseModel):
+    query: str
+    agent_id: str | None = None
+    limit: int = 10
+    memory_type: str | None = None
+    time_window_start: str | None = None
+    time_window_end: str | None = None
+    entity_weight: float = 0.15
+
+
+@app.post("/api/v1/memu/search")
+async def memu_search_post_compat(req: MemUSearchCompatRequest, _key: str = Depends(verify_api_key)):
+    search_req = SearchRequest(
+        query=req.query,
+        limit=req.limit,
+        agent_id=req.agent_id,
+        memory_type=_coerce_memory_type(req.memory_type),
+        time_window_start=_parse_optional_iso(req.time_window_start),
+        time_window_end=_parse_optional_iso(req.time_window_end),
+        entity_weight=req.entity_weight,
+    )
+    return await search_memories(search_req, _key=_key)
+
+
 @app.get("/search-text")
 async def search_text_compat(
     q: str,
@@ -781,6 +937,24 @@ async def search_text(
         )
 
     return [_row_to_memory(row) for row in rows]
+
+
+class MemUSearchTextCompatRequest(BaseModel):
+    query: str
+    agent_id: str | None = None
+    memory_type: str | None = None
+    limit: int = 10
+
+
+@app.post("/api/v1/memu/search-text")
+async def memu_search_text_post_compat(req: MemUSearchTextCompatRequest, _key: str = Depends(verify_api_key)):
+    return await search_text(
+        query=req.query,
+        agent_id=req.agent_id,
+        memory_type=req.memory_type,
+        limit=req.limit,
+        _key=_key,
+    )
 
 
 @app.post("/chat", response_model=ChatResponse)

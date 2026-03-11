@@ -50,6 +50,10 @@ class SearchRequest(BaseModel):
     min_results: int = 3
     max_expansion_steps: int = 3
     lexical_fallback: bool = True
+    # Temporal retrieval lane (Graphiti-inspired)
+    time_window_start: datetime | None = None
+    time_window_end: datetime | None = None
+    entity_weight: float = 0.15
 
 class SearchResult(BaseModel):
     memory: Memory

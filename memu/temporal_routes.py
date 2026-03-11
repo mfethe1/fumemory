@@ -8,9 +8,14 @@ import os
 # Circular dep issue: verify_api_key is in api.py
 # Redefining minimal check here to break cycle or move dep to auth.py
 MEMU_API_KEY = os.environ.get("MEMU_API_KEY", "memu-dev-key")
+memu_key_header = APIKeyHeader(name="X-MemU-Key", auto_error=False)
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
-async def verify_api_key(key: str | None = Security(api_key_header)) -> str:
+async def verify_api_key(
+    memu_key: str | None = Security(memu_key_header),
+    legacy_key: str | None = Security(api_key_header),
+) -> str:
+    key = memu_key or legacy_key
     if not key or key != MEMU_API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
     return key
