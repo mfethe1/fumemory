@@ -142,6 +142,7 @@ app = FastAPI(
 
 app.include_router(temporal_router, tags=["Async Workflows"])
 
+memu_key_header = APIKeyHeader(name="X-MemU-Key", auto_error=False)
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 # ---------------------------------------------------------------------------
@@ -164,8 +165,15 @@ class AuthContext(str):
         return instance
 
 
-async def verify_api_key(key: str | None = Security(api_key_header)) -> AuthContext:
-    """Verify API key and resolve tenant context for RLS."""
+async def verify_api_key(
+    memu_key: str | None = Security(memu_key_header),
+    legacy_key: str | None = Security(api_key_header),
+) -> AuthContext:
+    """Verify API key and resolve tenant context for RLS.
+
+    Prefer X-MemU-Key, but accept legacy X-API-Key for backward compatibility.
+    """
+    key = memu_key or legacy_key
     if not key or key != MEMU_API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
     tid = await resolve_tenant_id(pool, key) if pool else DEFAULT_TENANT_ID
