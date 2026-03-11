@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import os
 import logging
+import re
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any, Iterable
@@ -13,6 +14,7 @@ from uuid import UUID
 import asyncpg
 from fastapi import Depends, FastAPI, HTTPException, Security
 from fastapi.security import APIKeyHeader
+from pydantic import BaseModel
 
 from memu.decay import compute_final_score, should_deduplicate
 from memu.agent_events_consumer import AgentEventsConsumer
@@ -25,6 +27,7 @@ from memu.models import (
     ChatResponse,
     Memory,
     MemoryCreate,
+    MemoryType,
     SearchRequest,
     SearchResult,
 )
@@ -134,6 +137,26 @@ def content_hash(text: str) -> str:
     return hashlib.sha256(text.strip().lower().encode()).hexdigest()[:64]
 
 
+def _ensure_memory_metadata(metadata: dict[str, Any] | None) -> dict[str, Any]:
+    payload = dict(metadata or {})
+    payload.setdefault("ts", datetime.now(timezone.utc).isoformat())
+    return payload
+
+
+def _extract_entities(text: str) -> set[str]:
+    return {token.lower() for token in re.findall(r"\b[A-Z][A-Za-z0-9_-]{2,}\b", text or "")}
+
+
+def _entity_overlap_score(query: str, content: str) -> float:
+    q_entities = _extract_entities(query)
+    if not q_entities:
+        return 0.0
+    c_entities = _extract_entities(content)
+    if not c_entities:
+        return 0.0
+    return len(q_entities & c_entities) / len(q_entities)
+
+
 # --- Routes ---
 
 @app.get("/health")
@@ -150,6 +173,11 @@ async def health():
     if state_projector_consumer:
         report["state_projector"] = await _state_projector_report()
     return report
+
+
+@app.get("/api/v1/memu/health")
+async def memu_health_compat():
+    return await health()
 
 
 @app.get("/health/report")
@@ -268,6 +296,7 @@ def _warn_if_missing_quality_tags(req: MemoryCreate) -> None:
 @app.post("/memories", response_model=Memory)
 async def create_memory(req: MemoryCreate, _key: str = Depends(verify_api_key)):
     _warn_if_missing_quality_tags(req)
+    normalized_metadata = _ensure_memory_metadata(req.metadata)
     embedding = await get_embedding(req.content)
     c_hash = content_hash(req.content)
 
@@ -300,7 +329,7 @@ async def create_memory(req: MemoryCreate, _key: str = Depends(verify_api_key)):
                 """,
                 existing["id"],
                 req.confidence,
-                str(req.metadata) if req.metadata else "{}",
+                str(normalized_metadata),
             )
         else:
             row = await conn.fetchrow(
@@ -313,13 +342,42 @@ async def create_memory(req: MemoryCreate, _key: str = Depends(verify_api_key)):
                 str(embedding),
                 req.memory_type.value,
                 req.agent_id,
-                str(req.metadata) if req.metadata else "{}",
+                str(normalized_metadata),
                 req.parent_id,
                 req.confidence,
                 c_hash,
             )
 
     return _row_to_memory(row)
+
+
+class MemUAddCompatRequest(BaseModel):
+    content: str | None = None
+    text: str | None = None
+    agent_id: str = "unknown"
+    memory_type: MemoryType = MemoryType.FACT
+    metadata: dict[str, Any] = {}
+    confidence: float = 1.0
+
+
+@app.post("/api/v1/memu/add")
+async def memu_add_compat(req: MemUAddCompatRequest, _key: str = Depends(verify_api_key)):
+    if req.content is None and req.text is not None:
+        return {"ok": False, "error_code": "INVALID_PAYLOAD", "message": "Use content instead of text"}
+    if req.content is None or not req.content.strip():
+        return {"ok": False, "error_code": "MISSING_CONTENT", "message": "Missing required field: content"}
+
+    created = await create_memory(
+        MemoryCreate(
+            content=req.content,
+            memory_type=req.memory_type,
+            agent_id=req.agent_id,
+            metadata=req.metadata,
+            confidence=req.confidence,
+        ),
+        _key=_key,
+    )
+    return {"ok": True, "id": str(created.id), "message": "Memory stored"}
 
 
 @app.get("/memories/{memory_id}", response_model=Memory)
@@ -426,6 +484,14 @@ async def search_memories(req: SearchRequest, _key: str = Depends(verify_api_key
         filters.append(f"confidence >= ${idx}")
         params.append(req.min_confidence)
         idx += 1
+    if req.time_window_start:
+        filters.append(f"created_at >= ${idx}")
+        params.append(req.time_window_start)
+        idx += 1
+    if req.time_window_end:
+        filters.append(f"created_at <= ${idx}")
+        params.append(req.time_window_end)
+        idx += 1
 
     where = (" AND " + " AND ".join(filters)) if filters else ""
 
@@ -451,9 +517,25 @@ async def search_memories(req: SearchRequest, _key: str = Depends(verify_api_key
 
     policy_rows = _apply_retrieval_safety_policy(rows)
 
-    # Apply decay scoring and re-rank
-    results = []
+    # Apply decay scoring and Graphiti-style entity overlap blend.
+    filtered_rows = []
+    now = datetime.now(timezone.utc)
     for row in policy_rows:
+        metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+        stale_after_raw = metadata.get("stale_after")
+        if isinstance(stale_after_raw, str):
+            try:
+                stale_after = datetime.fromisoformat(stale_after_raw.replace("Z", "+00:00"))
+                if stale_after.tzinfo is None:
+                    stale_after = stale_after.replace(tzinfo=timezone.utc)
+                if stale_after <= now:
+                    continue
+            except ValueError:
+                pass
+        filtered_rows.append(row)
+
+    results = []
+    for row in filtered_rows:
         score = compute_final_score(
             similarity=row["similarity"],
             created_at=row["created_at"],
@@ -462,6 +544,8 @@ async def search_memories(req: SearchRequest, _key: str = Depends(verify_api_key
             temporal_weight=req.temporal_weight,
         )
         score *= _quality_confidence_penalty(row.get("metadata"))
+        entity_overlap = _entity_overlap_score(req.query, row["content"])
+        score = (1 - req.entity_weight) * score + (req.entity_weight * entity_overlap)
         results.append(
             SearchResult(
                 memory=_row_to_memory(row),
@@ -472,6 +556,11 @@ async def search_memories(req: SearchRequest, _key: str = Depends(verify_api_key
 
     results.sort(key=lambda r: r.final_score, reverse=True)
     return results[: req.limit]
+
+
+@app.post("/api/v1/memu/search")
+async def memu_search_compat(req: SearchRequest, _key: str = Depends(verify_api_key)):
+    return await search_memories(req, _key=_key)
 
 
 @app.post("/search-text")
@@ -518,6 +607,24 @@ async def search_text(
         reverse=True,
     )
     return [_row_to_memory(row) for row in policy_rows[:limit]]
+
+
+class MemUSearchTextCompatRequest(BaseModel):
+    query: str
+    agent_id: str | None = None
+    memory_type: str | None = None
+    limit: int = 10
+
+
+@app.post("/api/v1/memu/search-text")
+async def memu_search_text_compat(req: MemUSearchTextCompatRequest, _key: str = Depends(verify_api_key)):
+    return await search_text(
+        query=req.query,
+        agent_id=req.agent_id,
+        memory_type=req.memory_type,
+        limit=req.limit,
+        _key=_key,
+    )
 
 
 @app.post("/chat", response_model=ChatResponse)

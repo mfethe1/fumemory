@@ -104,6 +104,9 @@ class SearchRequest(BaseModel):
     memory_type: MemoryType | None = None
     temporal_weight: float = Field(0.3, ge=0.0, le=1.0)
     min_confidence: float = Field(0.0, ge=0.0, le=1.0)
+    time_window_start: datetime | None = None
+    time_window_end: datetime | None = None
+    entity_weight: float = Field(0.15, ge=0.0, le=1.0)
 
 
 class SearchResult(BaseModel):
