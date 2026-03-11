@@ -59,6 +59,9 @@ if [[ "$TASK_REGISTRY_RUN_REFINER" == "1" ]]; then
 
   echo "[task-registry] running refiner"
   python3 scripts/task_refiner_agent.py "${REF_ARGS[@]}"
+  
+  echo "[task-registry] running project manager"
+  python3 scripts/task_project_manager.py "${REF_ARGS[@]}"
 fi
 
 echo "[task-registry] cycle complete"
