@@ -2188,6 +2188,68 @@ async def get_tenant(tenant_slug: str, _key: str = Depends(verify_api_key)):
             raise HTTPException(status_code=404, detail="Tenant not found")
         return dict(row)
 
+class DedupeResponse(BaseModel):
+    deleted_count: int
+    merged_access_count: int
+    dry_run: bool
+
+@app.post("/api/v1/memu/dedupe", response_model=DedupeResponse)
+async def dedupe_memories(
+    dry_run: bool = False,
+    _key: str = Depends(verify_api_key),
+):
+    """Find and merge identical memories by content_hash to reduce context bloat."""
+    async with _tenant_conn(_key) as conn:
+        rows = await conn.fetch('''
+            SELECT content_hash, array_agg(id ORDER BY created_at ASC) as ids, sum(access_count) as total_access
+            FROM memories
+            GROUP BY content_hash
+            HAVING count(id) > 1
+        ''')
+        
+        deleted = 0
+        merged = 0
+        
+        for row in rows:
+            ids = row['ids']
+            keep_id = ids[0]
+            drop_ids = ids[1:]
+            total_access = row['total_access']
+            
+            if not dry_run:
+                # Add access_count to the kept id
+                await conn.execute('UPDATE memories SET access_count = $1, updated_at = NOW() WHERE id = $2', total_access, keep_id)
+                # Relink any memory_links pointing to drop_ids to keep_id
+                await conn.execute('UPDATE memory_links SET source_id = $1 WHERE source_id = ANY($2) AND source_id != $1', keep_id, drop_ids)
+                await conn.execute('UPDATE memory_links SET target_id = $1 WHERE target_id = ANY($2) AND target_id != $1', keep_id, drop_ids)
+                # Delete the redundant ones
+                await conn.execute('DELETE FROM memories WHERE id = ANY($1)', drop_ids)
+                
+            deleted += len(drop_ids)
+            merged += total_access
+            
+    return DedupeResponse(deleted_count=deleted, merged_access_count=merged, dry_run=dry_run)
+
+class HygieneCleanupResponse(BaseModel):
+    deleted_history_count: int
+    dry_run: bool
+
+@app.post("/api/v1/memu/hygiene/cleanup", response_model=HygieneCleanupResponse)
+async def history_cleanup(
+    days_old: int = 30,
+    dry_run: bool = False,
+    _key: str = Depends(verify_api_key),
+):
+    """Periodic cleanup of old search history and stale logs for operational hygiene."""
+    async with _tenant_conn(_key) as conn:
+        if dry_run:
+            val = await conn.fetchval("SELECT count(*) FROM search_history WHERE created_at < NOW() - INTERVAL '1 day' * $1", days_old)
+            return HygieneCleanupResponse(deleted_history_count=val or 0, dry_run=True)
+        
+        res = await conn.execute("DELETE FROM search_history WHERE created_at < NOW() - INTERVAL '1 day' * $1", days_old)
+        deleted = int(res.split()[1]) if res.startswith("DELETE") else 0
+        return HygieneCleanupResponse(deleted_history_count=deleted, dry_run=False)
+
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
