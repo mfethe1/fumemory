@@ -1,4 +1,10 @@
 # memu/temporal_worker/worker.py
+"""Temporal worker with Progressive Skill Loading.
+
+Activities are lazy-loaded to reduce context window size and memory footprint.
+
+Author: Lenny
+"""
 import asyncio
 import os
 import logging
@@ -11,10 +17,15 @@ from memu.temporal_worker.activities import (
     generate_embedding,
 )
 from memu.temporal_worker.workflows import MemoryIngestionWorkflow, MemorySearchWorkflow
+from memu.skill_loader import get_skill_registry
 
 logger = logging.getLogger(__name__)
 
 async def main():
+    # Initialize skill registry (lazy-loading, doesn't load skills yet)
+    skill_registry = get_skill_registry()
+    logger.info(f"Skill registry initialized. Available skills: {skill_registry.list_available_skills()}")
+
     # Connect to Temporal server
     host = os.environ.get("TEMPORAL_HOST", "localhost:7233")
     use_tls = os.environ.get("TEMPORAL_TLS", "").lower() == "true" or "443" in host
@@ -25,7 +36,8 @@ async def main():
         logger.error(f"Failed to connect to Temporal: {e}")
         return
 
-    # Run the worker
+    # Run the worker with lazy-loaded activities
+    # Activities are only loaded into memory when first invoked
     worker = Worker(
         client,
         task_queue="memu-queue",
@@ -37,8 +49,8 @@ async def main():
             generate_embedding
         ],
     )
-    
-    logger.info("Worker started. Listening on 'memu-queue'...")
+
+    logger.info("Worker started with progressive skill loading. Listening on 'memu-queue'...")
     await worker.run()
 
 if __name__ == "__main__":

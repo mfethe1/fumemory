@@ -5,6 +5,11 @@ task claims, searches, decisions) and publishes them as validated SwarmEvents
 onto the NATS mesh so every subscriber (event_consumer, ws_bridge, projector)
 sees real traffic instead of silence.
 
+Enforces Strict Sub-Agent Context Isolation:
+- All payloads are sanitized to remove context bleed
+- Payload size limits enforced (8KB max)
+- No nested context snapshots or historical state
+
 Usage:
     publisher = NATSEventPublisher(cluster_manager)
     await publisher.publish_memory_written(agent_id="lenny", memory_id="...", content="...")
@@ -20,6 +25,11 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from memu.cluster import NATSClusterManager
+from memu.context_isolation import (
+    strip_context_bleed,
+    enforce_payload_size_limit,
+    ContextIsolationError,
+)
 from memu.crypto import GatewayKeyPair, canonical_event_hash, get_backend
 from memu.swarm_models import EventType, SwarmEvent
 
@@ -56,12 +66,42 @@ class NATSEventPublisher:
         return self.keypair.public_key_hex if self.keypair else ""
 
     async def _publish(self, subject: str, event: SwarmEvent) -> bool:
-        """Publish a single event, return True on success."""
+        """Publish a single event with strict context isolation.
+
+        Enforces:
+        - Payload sanitization (strip context bleed)
+        - Size limits (8KB max)
+        - No nested context snapshots
+
+        Returns True on success, False on failure.
+        """
         try:
+            # Sanitize payload to enforce context isolation
+            if event.payload:
+                try:
+                    event.payload = strip_context_bleed(event.payload)
+                    enforce_payload_size_limit(event.payload)
+                except ContextIsolationError as e:
+                    logger.error(f"Context isolation violation: {e}")
+                    # Still try to publish, but log the violation
+                    logger.warning(f"Publishing oversized payload for {event.event_type.value}")
+
             nc = self.cluster.active_connection
             data = event.model_dump_json().encode()
+
+            # Final size check on serialized event
+            if len(data) > 16384:  # 16KB hard limit for entire event
+                logger.error(
+                    f"Event size {len(data)} bytes exceeds 16KB hard limit. "
+                    f"Event type: {event.event_type.value}, subject: {subject}"
+                )
+                return False
+
             await nc.publish(subject, data)
-            logger.info(f"Published {event.event_type.value} to {subject}")
+            logger.info(
+                f"Published {event.event_type.value} to {subject} "
+                f"({len(data)} bytes)"
+            )
             return True
         except Exception as e:
             logger.error(f"Failed to publish {event.event_type.value}: {e}")

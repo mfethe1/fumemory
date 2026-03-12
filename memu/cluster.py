@@ -195,10 +195,36 @@ class NATSClusterManager:
         self._monitor_task = asyncio.create_task(self._health_monitor())
 
     async def _connect_node(self, node: ClusterNode, url: str):
-        """Connect to a single NATS node with error handling."""
+        """Connect to a single NATS node with error handling.
+
+        Enforces IPv4 preference to avoid IPv6/IPv4 connection issues.
+        """
         health = self._health[node]
 
         try:
+            # Parse URL to extract host and port for IPv4 resolution
+            from urllib.parse import urlparse
+            parsed = urlparse(url)
+            host = parsed.hostname or "localhost"
+            port = parsed.port or 4222
+
+            # Resolve to IPv4 explicitly to avoid IPv6 connection issues
+            import socket
+            try:
+                # Try to resolve to IPv4 first
+                addr_info = socket.getaddrinfo(
+                    host, port,
+                    socket.AF_INET,  # Force IPv4
+                    socket.SOCK_STREAM
+                )
+                if addr_info:
+                    ipv4_host = addr_info[0][4][0]
+                    # Reconstruct URL with IPv4 address
+                    url = f"nats://{ipv4_host}:{port}"
+                    logger.debug(f"Resolved {host} to IPv4: {ipv4_host}")
+            except socket.gaierror as e:
+                logger.warning(f"IPv4 resolution failed for {host}, using original URL: {e}")
+
             connect_opts: dict[str, Any] = {
                 "servers": [url],
                 "connect_timeout": 5,
@@ -206,6 +232,8 @@ class NATSClusterManager:
                 "max_reconnect_attempts": 2,  # bounded reconnects for bootstrap reliability
                 "ping_interval": 10,
                 "max_outstanding_pings": 3,
+                "allow_reconnect": True,
+                "max_reconnect_attempts": 10,
             }
 
             if self.auth_token:
