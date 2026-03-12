@@ -70,7 +70,7 @@ MEMU_API_KEY = os.environ.get("MEMU_API_KEY", "memu-dev-key")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 EMBEDDING_BASE_URL = os.environ.get("EMBEDDING_BASE_URL", "")
 EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
-EMBEDDING_DIMS = int(os.environ.get("EMBEDDING_DIMS", "384"))
+EMBEDDING_DIMS = int(os.environ.get("EMBEDDING_DIMS", "4096"))
 DEDUP_THRESHOLD = float(os.environ.get("DEDUP_THRESHOLD", "0.95"))
 DECAY_RATE = float(os.environ.get("DECAY_RATE", "0.01"))
 
@@ -462,6 +462,49 @@ async def create_memory(req: MemoryCreate, _key: str = Depends(verify_api_key)):
             )
 
     memory = _row_to_memory(row)
+
+    # Process Graph-Lite relationships if provided
+    if req.relationships:
+        async with _tenant_conn(_key) as conn:
+            for rel in req.relationships:
+                try:
+                    # If target_memory_id is provided, create a direct link
+                    if rel.target_memory_id:
+                        await conn.execute(
+                            """
+                            INSERT INTO memory_links (source_id, target_id, relationship, strength, metadata)
+                            VALUES ($1, $2, $3, $4, $5::jsonb)
+                            ON CONFLICT (source_id, target_id, relationship)
+                            DO UPDATE SET strength = LEAST(1.0, memory_links.strength + 0.1), last_accessed = NOW()
+                            """,
+                            memory.id,
+                            rel.target_memory_id,
+                            rel.relationship_type,
+                            rel.strength,
+                            json.dumps({"entity": rel.entity}),
+                        )
+                    else:
+                        # Store entity reference in metadata for future linking
+                        # This allows semantic search to find related memories later
+                        await conn.execute(
+                            """
+                            UPDATE memories
+                            SET metadata = metadata || $2::jsonb
+                            WHERE id = $1
+                            """,
+                            memory.id,
+                            json.dumps({
+                                "entities": [
+                                    {
+                                        "name": rel.entity,
+                                        "relationship_type": rel.relationship_type,
+                                        "strength": rel.strength
+                                    }
+                                ]
+                            }),
+                        )
+                except Exception as e:
+                    logger.warning(f"Failed to create relationship link: {e}")
 
     # Publish NATS event for every memory write
     if _nats_publisher:

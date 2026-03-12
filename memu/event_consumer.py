@@ -7,6 +7,7 @@ structured logs and optional file-backed evidence.
 Behavior:
 - Prefer local NATS (NATS_LOCAL_URL)
 - Fallback to Railways NATS (NATS_RAILWAY_URL)
+- IPv4-first connection strategy to avoid IPv6/IPv4 issues
 - Subscribe to wildcard subjects under swarm.*
 - Print parsed events continuously and keep lightweight counters.
 """
@@ -17,8 +18,10 @@ import asyncio
 import json
 import logging
 import os
+import socket
 from collections import defaultdict
 from datetime import datetime, timezone
+from urllib.parse import urlparse
 
 import nats
 
@@ -47,19 +50,51 @@ def _safe_decode(payload: bytes) -> dict | str:
             return str(payload)
 
 
+def _resolve_to_ipv4(url: str) -> str:
+    """Resolve NATS URL to IPv4 address to avoid IPv6/IPv4 connection issues."""
+    try:
+        parsed = urlparse(url)
+        host = parsed.hostname or "localhost"
+        port = parsed.port or 4222
+
+        # Try IPv4 resolution
+        try:
+            addr_info = socket.getaddrinfo(
+                host, port,
+                socket.AF_INET,  # Force IPv4
+                socket.SOCK_STREAM
+            )
+            if addr_info:
+                ipv4_host = addr_info[0][4][0]
+                resolved_url = f"nats://{ipv4_host}:{port}"
+                logger.debug(f"Resolved {host} to IPv4: {ipv4_host}")
+                return resolved_url
+        except socket.gaierror as e:
+            logger.warning(f"IPv4 resolution failed for {host}: {e}")
+    except Exception as e:
+        logger.warning(f"URL parsing failed: {e}")
+
+    return url
+
+
 async def _connect_with_fallback():
+    """Connect to NATS with IPv4-first fallback strategy."""
     last_error = None
 
     for url in (NATS_LOCAL_URL, NATS_RAILWAY_URL):
         if not url:
             continue
+
+        # Resolve to IPv4 first
+        resolved_url = _resolve_to_ipv4(url)
+
         try:
-            nc = await nats.connect(url)
-            logger.info("Connected to NATS: %s", url)
-            return nc, url
+            nc = await nats.connect(resolved_url)
+            logger.info("Connected to NATS: %s (resolved from %s)", resolved_url, url)
+            return nc, resolved_url
         except Exception as exc:
             last_error = exc
-            logger.warning("NATS connect failed (%s): %s", url, exc)
+            logger.warning("NATS connect failed (%s): %s", resolved_url, exc)
             continue
 
     raise RuntimeError(f"NATS unavailable on all endpoints (local/railway). Last: {last_error}")

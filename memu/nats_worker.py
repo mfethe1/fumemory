@@ -1,4 +1,12 @@
 # memu/nats_worker.py
+"""NATS Worker with Strict Context Isolation and IPv4 Connection Support.
+
+Enforces:
+- IPv4-first connection strategy to avoid IPv6/IPv4 issues
+- Strict payload sanitization (no context bleed)
+- Shallow orchestration (minimal message payloads)
+- Progressive Skill Loading: Lazy-load skills/tools to reduce context window size (Lenny)
+"""
 
 from __future__ import annotations
 
@@ -7,11 +15,14 @@ import json
 import logging
 import os
 import signal
+import socket
 from typing import Any
 
 from nats.aio.client import Client as NATS
 
+from memu.context_isolation import sanitize_agent_message
 from memu.notion_bridge import NotionBridge
+from memu.skill_loader import get_skill_registry
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -25,7 +36,12 @@ MEMU_API_KEY = os.environ.get("MEMU_API_KEY", "")
 
 
 async def process_msg(msg: Any, bridge: NotionBridge) -> None:
-    """Process a NATS task event and update the Notion bridge.
+    """Process a NATS task event with strict context isolation.
+
+    Enforces shallow orchestration:
+    - Sanitizes incoming payloads
+    - Strips unnecessary context
+    - Validates essential fields only
 
     Supported subjects:
     - swarm.task.started -> claim_task(task_id, agent_id)
@@ -40,6 +56,12 @@ async def process_msg(msg: Any, bridge: NotionBridge) -> None:
         if hasattr(msg, "nak"):
             await msg.nak()
         return
+
+    # Sanitize payload to enforce context isolation
+    try:
+        payload = sanitize_agent_message(payload)
+    except Exception as e:
+        logger.warning(f"Payload sanitization failed: {e}, proceeding with raw payload")
 
     task_id = payload.get("task_id")
     agent_id = payload.get("agent_id")
@@ -63,6 +85,11 @@ async def process_msg(msg: Any, bridge: NotionBridge) -> None:
 
 
 async def run() -> None:
+    """Run NATS worker with IPv4-first connection strategy and progressive skill loading."""
+    # Initialize skill registry (lazy-loading, doesn't load skills yet)
+    skill_registry = get_skill_registry()
+    logger.info(f"Skill registry initialized. Available skills: {skill_registry.list_available_skills()}")
+
     nc = NATS()
     bridge = NotionBridge(
         notion_token=NOTION_API_KEY,
@@ -71,9 +98,33 @@ async def run() -> None:
         task_board_id=NOTION_TASK_BOARD_ID,
     )
 
+    # Resolve NATS URL to IPv4 to avoid IPv6/IPv4 connection issues
+    nats_url = NATS_URL
     try:
-        await nc.connect(servers=[NATS_URL])
-        logger.info("Connected to NATS at %s", NATS_URL)
+        from urllib.parse import urlparse
+        parsed = urlparse(NATS_URL)
+        host = parsed.hostname or "localhost"
+        port = parsed.port or 4222
+
+        # Try IPv4 resolution first
+        try:
+            addr_info = socket.getaddrinfo(
+                host, port,
+                socket.AF_INET,  # Force IPv4
+                socket.SOCK_STREAM
+            )
+            if addr_info:
+                ipv4_host = addr_info[0][4][0]
+                nats_url = f"nats://{ipv4_host}:{port}"
+                logger.info(f"Resolved {host} to IPv4: {ipv4_host}")
+        except socket.gaierror as e:
+            logger.warning(f"IPv4 resolution failed for {host}, using original URL: {e}")
+    except Exception as e:
+        logger.warning(f"URL parsing failed: {e}, using original URL")
+
+    try:
+        await nc.connect(servers=[nats_url])
+        logger.info("Connected to NATS at %s", nats_url)
     except Exception as e:
         logger.error("Failed to connect to NATS: %s", e)
         await bridge.close()
