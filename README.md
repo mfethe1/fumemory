@@ -382,6 +382,7 @@ TEMPORAL_TLS=false
 - `TEMPORAL_HOST`/`TEMPORAL_TLS` are only required if you want `/memories/async` and `/search/async`.
 - Use `python scripts/verify_deployment.py --api-url <url>` for core API checks.
 - Add `--check-async` only when the Temporal service and worker are deployed and healthy.
+- For local/CI evidence on NATS lane locking, run `./scripts/verify_nats_lane_lock.sh` (JetStream-backed) or `./scripts/verify_baseline.sh`.
 
 See `docs/railway-readiness.md` for the full pre-deploy checklist.
 

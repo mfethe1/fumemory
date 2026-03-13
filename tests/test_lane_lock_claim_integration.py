@@ -28,7 +28,6 @@ def _load_lane_modules():
     )
 
 
-@pytest.mark.skip(reason="Hangs locally without JetStream enabled NATS server")
 def test_lane_lock_contention_and_stale_recovery():
     asyncio.run(_test_lane_lock_contention_and_stale_recovery())
 
@@ -74,6 +73,11 @@ async def _test_lane_lock_contention_and_stale_recovery():
         pytest.skip(f"NATS unavailable at {NATS_URL}")
 
     js = nc.jetstream()
+    try:
+        await js.account_info()
+    except Exception as exc:
+        pytest.skip(f"JetStream unavailable at {NATS_URL}: {exc}")
+
     lanes_kv, fencing_kv = await ensure_kv_buckets(js)
 
     lane = f"integration-lane-{uuid4()}"

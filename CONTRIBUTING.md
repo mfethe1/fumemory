@@ -7,9 +7,10 @@ Thanks for wanting to help make AI memory free for everyone.
 1. Fork the repo
 2. Create a feature branch (`git checkout -b feature/your-feature`)
 3. Make your changes
-4. Run tests: `pytest`
-5. Run linting: `ruff check .`
-6. Open a PR
+4. Run the evidence-gated baseline verifier: `./scripts/verify_baseline.sh`
+5. For quick local iteration, `pytest` is fine, but the lane-lock/NATS path is only considered covered when `./scripts/verify_nats_lane_lock.sh` passes.
+6. Run linting: `ruff check .`
+7. Open a PR
 
 ## What we need help with
 
