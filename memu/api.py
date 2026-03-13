@@ -1,4 +1,4 @@
-﻿"""memU API â€” FastAPI application."""
+"""memU API â€” FastAPI application."""
 
 from __future__ import annotations
 from datetime import datetime, timezone, timedelta
@@ -9,7 +9,7 @@ from memu.web_search_ingest import ingest_web_search
 import os
 import logging
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Any, Optional
 from uuid import UUID
 import re
 
@@ -1394,6 +1394,187 @@ async def get_links(memory_id: UUID, _key: str = Depends(verify_api_key)):
         )
         return {"ok": True, "links": [dict(r) for r in rows], "count": len(rows)}
 
+
+
+# --- Entity Invalidation (Superseding) ---
+# Matches Zep's entity supersession capability for temporal knowledge graphs
+
+class SupersedeRequest(BaseModel):
+    """Request to supersede an entity (mark as invalidated by a newer version)."""
+    superseded_memory_id: UUID  # The old memory being superseded
+    superseding_memory_id: UUID  # The new memory that supersedes it
+    relationship: str = "supersedes"  # Default relationship type
+    strength: float = 1.0  # Superseding relationships are strong by default
+    metadata: Optional[dict[str, Any]] = None
+
+class SupersedeResponse(BaseModel):
+    """Response from a supersession operation."""
+    ok: bool
+    superseded_memory_id: UUID
+    superseding_memory_id: UUID
+    link_id: UUID
+    message: str
+
+@app.post("/api/v1/memu/supersede", response_model=SupersedeResponse)
+async def supersede_entity(req: SupersedeRequest, _key: str = Depends(verify_api_key)):
+    """
+    Supersede an entity (like Zep's entity invalidation).
+    
+    This does two things:
+    1. Sets valid_to on the superseded memory to NOW() (marks it as historical)
+    2. Creates a 'supersedes' link between the new and old memory
+    
+    The superseded memory remains in the database but is excluded from
+    temporal queries that filter for valid_to IS NULL.
+    """
+    async with _tenant_conn(_key) as conn:
+        async with conn.transaction():
+            # Step 1: Mark the old memory as superseded (set valid_to)
+            old_memory = await conn.fetchrow(
+                """
+                UPDATE memories
+                SET valid_to = NOW()
+                WHERE id = $1 AND valid_to IS NULL
+                RETURNING id, content, valid_to
+                """,
+                req.superseded_memory_id,
+            )
+            if not old_memory:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Memory {req.superseded_memory_id} not found or already superseded"
+                )
+
+            # Step 2: Verify the superseding memory exists and is current
+            new_memory = await conn.fetchrow(
+                """
+                SELECT id, content FROM memories
+                WHERE id = $1 AND valid_to IS NULL
+                """,
+                req.superseding_memory_id,
+            )
+            if not new_memory:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Superseding memory {req.superseding_memory_id} not found or already superseded"
+                )
+
+            # Step 3: Create the supersedes link
+            link = await conn.fetchrow(
+                """
+                INSERT INTO memory_links (source_id, target_id, relationship, strength, metadata)
+                VALUES ($1, $2, $3, $4, $5)
+                ON CONFLICT (source_id, target_id, relationship) DO NOTHING
+                RETURNING id
+                """,
+                req.superseding_memory_id,  # source (the new one)
+                req.superseded_memory_id,    # target (the old one)
+                req.relationship,
+                req.strength,
+                req.metadata or {},
+            )
+
+            # If link already existed, fetch it
+            if not link:
+                link = await conn.fetchrow(
+                    "SELECT id FROM memory_links WHERE source_id = $1 AND target_id = $2",
+                    req.superseding_memory_id, req.superseded_memory_id
+                )
+
+    return SupersedeResponse(
+        ok=True,
+        superseded_memory_id=req.superseded_memory_id,
+        superseding_memory_id=req.superseding_memory_id,
+        link_id=link["id"],
+        message=f"Memory {req.superseded_memory_id} superseded by {req.superseding_memory_id}"
+    )
+
+@app.get("/api/v1/memu/superseded/{memory_id}")
+async def get_superseded_history(memory_id: UUID, _key: str = Depends(verify_api_key)):
+    """
+    Get the history of a memory that has been superseded.
+    Returns the chain of supersession if this memory was superseded by others.
+    """
+    async with _tenant_conn(_key) as conn:
+        # Find all memories that this memory supersedes (it is the source)
+        supersedes = await conn.fetch(
+            """
+            SELECT ml.id as link_id, ml.created_at as superseded_at,
+                   m.id, m.content, m.memory_type, m.agent_id, m.created_at
+            FROM memory_links ml
+            JOIN memories m ON m.id = ml.target_id
+            WHERE ml.source_id = $1 AND ml.relationship = 'supersedes'
+            ORDER BY ml.created_at DESC
+            """,
+            memory_id,
+        )
+
+        # Find what this memory was superseded by (it is the target)
+        superseded_by = await conn.fetchrow(
+            """
+            SELECT ml.id as link_id, ml.source_id, ml.created_at as superseded_at,
+                   m.content, m.memory_type, m.agent_id
+            FROM memory_links ml
+            JOIN memories m ON m.id = ml.source_id
+            WHERE ml.target_id = $1 AND ml.relationship = 'supersedes'
+            ORDER BY ml.created_at DESC
+            LIMIT 1
+            """,
+            memory_id,
+        )
+
+    return {
+        "ok": True,
+        "memory_id": memory_id,
+        "superseded_by": dict(superseded_by) if superseded_by else None,
+        "supersedes": [dict(s) for s in supersedes],
+        "supersedes_count": len(supersedes),
+    }
+
+@app.get("/api/v1/memu/entities/current")
+async def get_current_entities(
+    agent_id: str = None,
+    memory_type: str = None,
+    limit: int = 100,
+    _key: str = Depends(verify_api_key),
+):
+    """
+    Get current (non-superseded) entities, similar to Zep's entity retrieval.
+    Only returns memories where valid_to IS NULL.
+    """
+    async with _tenant_conn(_key) as conn:
+        filters = ["valid_to IS NULL"]
+        params: list[Any] = []
+        idx = 1
+
+        if agent_id:
+            filters.append(f"agent_id = ${idx}")
+            params.append(agent_id)
+            idx += 1
+        if memory_type:
+            filters.append(f"memory_type = ${idx}")
+            params.append(memory_type)
+            idx += 1
+
+        where = " AND ".join(filters)
+        params.append(limit)
+
+        rows = await conn.fetch(
+            f"""
+            SELECT id, content, memory_type, agent_id, created_at, updated_at, metadata
+            FROM memories
+            WHERE {where}
+            ORDER BY created_at DESC
+            LIMIT ${idx}
+            """,
+            *params,
+        )
+
+    return {
+        "ok": True,
+        "entities": [dict(r) for r in rows],
+        "count": len(rows),
+    }
 
 # --- Temporal Queries ---
 
