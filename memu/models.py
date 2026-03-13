@@ -2,7 +2,7 @@ from pydantic import BaseModel, Field
 from uuid import UUID
 from datetime import datetime
 from enum import Enum
-from typing import Any
+from typing import Any, Optional
 
 class MemoryType(str, Enum):
     # Original types (backwards compatibility)
@@ -19,13 +19,21 @@ class MemoryType(str, Enum):
     user_action = "user_action"
     external = "external"
 
+class Relationship(BaseModel):
+    """Graph-Lite entity/relationship tag for memory connections."""
+    entity: str = Field(..., description="Entity name or ID being referenced")
+    relationship_type: str = Field(..., description="Type of relationship (e.g., 'similar', 'extends', 'caused_by', 'related')")
+    target_memory_id: Optional[UUID] = Field(None, description="Optional: UUID of target memory if known")
+    strength: float = Field(0.5, ge=0.0, le=1.0, description="Relationship strength (0.0-1.0)")
+
 class MemoryCreate(BaseModel):
     content: str
     memory_type: MemoryType = MemoryType.observation
     agent_id: str
-    metadata: dict | None = None
-    parent_id: UUID | None = None
+    metadata: Optional[dict] = None
+    parent_id: Optional[UUID] = None
     confidence: float = 1.0
+    relationships: list[Relationship] = Field(default_factory=list, description="Graph-Lite entity/relationship tags")
 
 class Memory(BaseModel):
     id: UUID
@@ -33,18 +41,18 @@ class Memory(BaseModel):
     memory_type: str
     agent_id: str
     metadata: dict
-    parent_id: UUID | None
+    parent_id: Optional[UUID]
     confidence: float
     access_count: int
-    decay_score: float | None = None
+    decay_score: Optional[float] = None
     created_at: datetime
     updated_at: datetime
 
 class SearchRequest(BaseModel):
     query: str
     limit: int = 10
-    agent_id: str | None = None
-    memory_type: MemoryType | None = None
+    agent_id: Optional[str] = None
+    memory_type: Optional[MemoryType] = None
     min_confidence: float = 0.0
     temporal_weight: float = 0.3
     min_results: int = 3
@@ -90,60 +98,60 @@ class RefineStatus(str, Enum):
 class TaskCreate(BaseModel):
     task: str
     priority: Priority
-    owner_id: str | None = None
-    lane: str | None = None
-    metadata: dict | None = None
-    dependency_id: UUID | None = None
+    owner_id: Optional[str] = None
+    lane: Optional[str] = None
+    metadata: Optional[dict] = None
+    dependency_id: Optional[UUID] = None
 
     # Extended registry metadata
     risk_score: int = Field(25, ge=0, le=100)
-    source: str | None = None
-    source_ref: str | None = None
-    project: str | None = None
-    completion_criteria: str | None = None
-    menu_bucket: str | None = None
+    source: Optional[str] = None
+    source_ref: Optional[str] = None
+    project: Optional[str] = None
+    completion_criteria: Optional[str] = None
+    menu_bucket: Optional[str] = None
 
 class Task(BaseModel):
     id: UUID
     task: str
     priority: str
     status: str
-    owner_id: str | None
-    lane: str | None
+    owner_id: Optional[str]
+    lane: Optional[str]
     metadata: dict
-    evidence: str | None
-    dependency_id: UUID | None
+    evidence: Optional[str]
+    dependency_id: Optional[UUID]
 
     # Extended registry fields
     risk_score: int
-    source: str | None
-    source_ref: str | None
-    project: str | None
-    completion_criteria: str | None
+    source: Optional[str]
+    source_ref: Optional[str]
+    project: Optional[str]
+    completion_criteria: Optional[str]
     review_status: str
-    reviewer_id: str | None
-    reviewed_at: datetime | None
-    review_notes: str | None
+    reviewer_id: Optional[str]
+    reviewed_at: Optional[datetime]
+    review_notes: Optional[str]
     retry_count: int
     refine_status: str
-    refined_at: datetime | None
-    source_fingerprint: str | None
-    menu_bucket: str | None
+    refined_at: Optional[datetime]
+    source_fingerprint: Optional[str]
+    menu_bucket: Optional[str]
 
     created_at: datetime
     updated_at: datetime
 
 class TaskUpdate(BaseModel):
-    status: TaskStatus | None = None
-    owner_id: str | None = None
-    lane: str | None = None
-    priority: Priority | None = None
-    risk_score: int | None = Field(None, ge=0, le=100)
-    completion_criteria: str | None = None
-    review_status: TaskReviewStatus | None = None
-    reviewer_id: str | None = None
-    metadata: dict | None = None
-    evidence: str | None = None
+    status: Optional[TaskStatus] = None
+    owner_id: Optional[str] = None
+    lane: Optional[str] = None
+    priority: Optional[Priority] = None
+    risk_score: Optional[int] = Field(None, ge=0, le=100)
+    completion_criteria: Optional[str] = None
+    review_status: Optional[TaskReviewStatus] = None
+    reviewer_id: Optional[str] = None
+    metadata: Optional[dict] = None
+    evidence: Optional[str] = None
 
 class TaskReviewResult(str, Enum):
     approve = "approve"
@@ -168,7 +176,7 @@ class BulkImportResponse(BaseModel):
 
 class ChatRequest(BaseModel):
     question: str
-    agent_id: str | None = None
+    agent_id: Optional[str] = None
     context_limit: int = 5
 
 class ChatResponse(BaseModel):
@@ -179,23 +187,23 @@ class ChatResponse(BaseModel):
 class GatewayLeaseAcquireRequest(BaseModel):
     lease_key: str = Field(min_length=1, max_length=255)
     gateway_id: str = Field(min_length=1, max_length=128)
-    backup_gateway: str | None = Field(default=None, max_length=128)
+    backup_gateway: Optional[str] = Field(default=None, max_length=128)
     ttl_seconds: int = Field(default=120, ge=5, le=3600)
-    last_message_id: str | None = None
-    context_digest: str | None = None
-    task_state: dict[str, Any] | None = None
-    metadata: dict[str, Any] | None = None
+    last_message_id: Optional[str] = None
+    context_digest: Optional[str] = None
+    task_state: Optional[dict[str, Any]] = None
+    metadata: Optional[dict[str, Any]] = None
 
 
 class GatewayLeaseRenewRequest(BaseModel):
     lease_key: str = Field(min_length=1, max_length=255)
     gateway_id: str = Field(min_length=1, max_length=128)
     ttl_seconds: int = Field(default=120, ge=5, le=3600)
-    last_message_id: str | None = None
-    last_reply_id: str | None = None
-    context_digest: str | None = None
-    task_state: dict[str, Any] | None = None
-    metadata: dict[str, Any] | None = None
+    last_message_id: Optional[str] = None
+    last_reply_id: Optional[str] = None
+    context_digest: Optional[str] = None
+    task_state: Optional[dict[str, Any]] = None
+    metadata: Optional[dict[str, Any]] = None
 
 
 class GatewayLeaseReleaseRequest(BaseModel):
@@ -206,11 +214,11 @@ class GatewayLeaseReleaseRequest(BaseModel):
 class GatewayLease(BaseModel):
     lease_key: str
     owner_gateway: str
-    backup_gateway: str | None = None
+    backup_gateway: Optional[str] = None
     lease_expires_at: datetime
-    last_message_id: str | None = None
-    last_reply_id: str | None = None
-    context_digest: str | None = None
+    last_message_id: Optional[str] = None
+    last_reply_id: Optional[str] = None
+    context_digest: Optional[str] = None
     task_state: dict[str, Any]
     metadata: dict[str, Any]
     version: int

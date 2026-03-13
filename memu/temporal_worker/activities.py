@@ -7,7 +7,8 @@ import asyncpg
 from temporalio import activity
 import httpx
 
-# Local cache for FastEmbed fallback (kept module-private for worker determinism)
+# Progressive Skill Loading: Lazy-load FastEmbed only when needed
+# This reduces initial memory footprint and context window size
 _fastembed_model: Any | None = None
 
 
@@ -19,7 +20,7 @@ def get_db_url():
 
 EMBEDDING_BASE_URL = os.environ.get("EMBEDDING_BASE_URL", "")
 EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
-EMBEDDING_DIMS = int(os.environ.get("EMBEDDING_DIMS", "384"))
+EMBEDDING_DIMS = int(os.environ.get("EMBEDDING_DIMS", "4096"))
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 
 
