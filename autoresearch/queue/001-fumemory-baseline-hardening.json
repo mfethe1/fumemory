@@ -1,0 +1,37 @@
+{
+  "target_id": "fumemory-baseline-hardening",
+  "kind": "repo-reliability-loop",
+  "priority": 90,
+  "status": "queued",
+  "requested_by": "lenny",
+  "requested_at": "2026-03-13T21:20:00Z",
+  "goal": "Improve fumemory incrementally without destabilizing the repo, starting with NATS reliability, memU contract alignment, and loop quality.",
+  "concurrency_group": "fumemory-autoresearch",
+  "max_parallel": 1,
+  "repo": {
+    "path": ".",
+    "branch": "lenny/fumemory-baseline-hardening"
+  },
+  "scoring": {
+    "reliability": 4,
+    "contract_alignment": 3,
+    "loop_quality": 3
+  },
+  "verification": {
+    "commands": [
+      "python3 -m pytest -q tests/test_auth_header_contract.py tests/test_cluster_startup_assumptions.py tests/test_memu_auto_write_nats_fallback.py",
+      "python3 -m compileall memu scripts"
+    ]
+  },
+  "outputs": {
+    "ledger_path": "autoresearch/ledger/experiments.jsonl",
+    "backlog_path": "BACKLOG_AUTO.md",
+    "report_dir": "reports/autoresearch"
+  },
+  "next_hypotheses": [
+    "Make NATS degraded-mode behavior easier to verify and reason about.",
+    "Keep auth-header compatibility explicit across docs/tests/runtime.",
+    "Bridge repeated findings into actionable backlog items with evidence."
+  ],
+  "rollback_rule": "Revert any iteration that fails verification or lowers the current NATS/auth baseline."
+}
