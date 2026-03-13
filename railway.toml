@@ -1,0 +1,15 @@
+# railway.toml — memU API service
+# Deploy via: railway up (from repo root)
+# This config targets the main API container.
+
+"$schema" = "https://railway.com/railway.schema.json"
+
+[build]
+dockerfilePath = "Dockerfile"
+
+[deploy]
+startCommand = "python -m memu.api"
+healthcheckPath = "/health"
+healthcheckTimeout = 30
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10
