@@ -182,7 +182,7 @@ Your Agents (Winnie, Rosie, Lenny, Macklemore, ...)
 ```bash
 curl -X POST http://localhost:8000/memories \
   -H "Content-Type: application/json" \
-  -H "X-API-Key: your-key" \
+  -H "X-MemU-Key: your-key" \
   -d '{
     "content": "Always run migrations before deploying",
     "memory_type": "lesson",
@@ -196,7 +196,7 @@ curl -X POST http://localhost:8000/memories \
 ```bash
 curl -X POST http://localhost:8000/search \
   -H "Content-Type: application/json" \
-  -H "X-API-Key: your-key" \
+  -H "X-MemU-Key: your-key" \
   -d '{
     "query": "deployment mistakes",
     "limit": 10,
@@ -211,12 +211,14 @@ curl -X POST http://localhost:8000/search \
 ```bash
 curl -X POST http://localhost:8000/chat \
   -H "Content-Type: application/json" \
-  -H "X-API-Key: your-key" \
+  -H "X-MemU-Key: your-key" \
   -d '{
     "question": "What do we know about CI/CD best practices?",
     "agent_id": null
   }'
 ```
+
+Legacy `X-API-Key` remains supported for backward compatibility, but `X-MemU-Key` is the canonical auth header.
 
 ### Other endpoints
 
