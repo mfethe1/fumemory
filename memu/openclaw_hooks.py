@@ -14,7 +14,8 @@ handler.setFormatter(formatter)
 if not logger.handlers:
     logger.addHandler(handler)
 
-MEMU_API_URL = os.environ.get("MEMU_API_URL", "http://127.0.0.1:8000").rstrip("/")
+MEMU_API_URL = os.environ.get("MEMU_API_URL") or os.environ.get("MEMU_BASE_URL") or "http://127.0.0.1:8000"
+MEMU_API_URL = MEMU_API_URL.rstrip("/")
 MEMU_API_KEY = os.environ.get("MEMU_API_KEY", "")
 
 
@@ -31,7 +32,7 @@ async def log_action(agent_id: str, action: str, details: dict):
         }
     }
 
-    headers = {"X-API-Key": MEMU_API_KEY}
+    headers = {"X-MemU-Key": MEMU_API_KEY}
 
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
@@ -58,7 +59,7 @@ async def log_search(agent_id: str, query: str, results_summary: str):
         }
     }
 
-    headers = {"X-API-Key": MEMU_API_KEY}
+    headers = {"X-MemU-Key": MEMU_API_KEY}
 
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
@@ -73,7 +74,7 @@ async def log_search(agent_id: str, query: str, results_summary: str):
 
 async def recall(query: str, agent_id: str):
     """Check if we already know this."""
-    headers = {"X-API-Key": MEMU_API_KEY}
+    headers = {"X-MemU-Key": MEMU_API_KEY}
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.post(

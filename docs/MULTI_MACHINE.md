@@ -25,10 +25,10 @@ FuMemory works across machines using [Tailscale](https://tailscale.com) (free me
 2. Host Ollama on your GPU machine (set `OLLAMA_HOST=0.0.0.0`)
 3. Pull embedding model: `ollama pull qwen3-embedding`
 4. Deploy memU API pointing to Ollama's Tailscale IP
-5. Agents connect via `MEMU_BASE_URL=http://<api-ip>:8100`
+5. Agents connect via `MEMU_API_URL=http://<api-ip>:8100` (older helpers may still accept `MEMU_BASE_URL`)
 
 ## Security
 
 - Tailscale traffic is encrypted end-to-end
-- `x-api-key` header for application-layer auth
+- `X-MemU-Key` is the canonical application-layer auth header (`X-API-Key` remains a legacy fallback)
 - Never expose Ollama or Postgres to public internet

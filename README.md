@@ -337,6 +337,8 @@ DATABASE_URL=postgresql://memu:memu@localhost:5432/memu
 
 # Auth
 MEMU_API_KEY=your-secret-key
+MEMU_API_URL=http://127.0.0.1:8000  # scripts/hooks target this base URL
+# Legacy alias still accepted by some older helpers: MEMU_BASE_URL
 
 # Embeddings (any OpenAI-compatible endpoint)
 OPENAI_API_KEY=          # optional, for OpenAI
