@@ -26,6 +26,8 @@ class MemoryCreate(BaseModel):
     metadata: dict | None = None
     parent_id: UUID | None = None
     confidence: float = 1.0
+    supersedes: UUID | None = None
+    invalidates: list[UUID] = Field(default_factory=list)
 
 class Memory(BaseModel):
     id: UUID
