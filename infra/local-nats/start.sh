@@ -38,4 +38,6 @@ echo "   Port:   4222"
 echo "   Monitor: http://localhost:8222"
 echo ""
 
-exec "$BINARY" --config "$CONF_FILE"
+# Override store_dir for local shell runs so the same config file works in both
+# docker-compose (/data/jetstream volume mount) and direct local startup.
+exec "$BINARY" --config "$CONF_FILE" --jetstream --store_dir "$DATA_DIR/jetstream"

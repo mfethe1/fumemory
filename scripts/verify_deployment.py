@@ -23,7 +23,12 @@ import urllib.request
 
 
 def _default_api_url() -> str:
-    return (os.environ.get("MEMU_VERIFY_BASE_URL") or os.environ.get("MEMU_API_URL") or "http://127.0.0.1:8000").rstrip("/")
+    return (
+        os.environ.get("MEMU_VERIFY_BASE_URL")
+        or os.environ.get("MEMU_API_URL")
+        or os.environ.get("MEMU_BASE_URL")
+        or "http://127.0.0.1:8000"
+    ).rstrip("/")
 
 
 def _resolve_api_key(explicit: str | None) -> str:
@@ -46,7 +51,7 @@ def _resolve_api_key(explicit: str | None) -> str:
 def _request(method: str, url: str, *, api_key: str | None = None, json_body: dict | None = None, timeout: int = 15):
     headers = {"Content-Type": "application/json"}
     if api_key:
-        headers["X-API-Key"] = api_key
+        headers["X-MemU-Key"] = api_key
     data = None if json_body is None else json.dumps(json_body).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:

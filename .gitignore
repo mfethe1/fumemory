@@ -11,5 +11,9 @@ node_modules/
 infra/local-nats/data/
 infra/local-nats/nats-server
 infra/local-nats/nats-server.exe
+infra/local-nats/*.log
+infra/local-nats/*.pid
+.state/
+.local-nats*
 ui/node_modules/
 ui/dist/

@@ -182,7 +182,7 @@ Your Agents (Winnie, Rosie, Lenny, Macklemore, ...)
 ```bash
 curl -X POST http://localhost:8000/memories \
   -H "Content-Type: application/json" \
-  -H "X-API-Key: your-key" \
+  -H "X-MemU-Key: your-key" \
   -d '{
     "content": "Always run migrations before deploying",
     "memory_type": "lesson",
@@ -196,7 +196,7 @@ curl -X POST http://localhost:8000/memories \
 ```bash
 curl -X POST http://localhost:8000/search \
   -H "Content-Type: application/json" \
-  -H "X-API-Key: your-key" \
+  -H "X-MemU-Key: your-key" \
   -d '{
     "query": "deployment mistakes",
     "limit": 10,
@@ -211,12 +211,14 @@ curl -X POST http://localhost:8000/search \
 ```bash
 curl -X POST http://localhost:8000/chat \
   -H "Content-Type: application/json" \
-  -H "X-API-Key: your-key" \
+  -H "X-MemU-Key: your-key" \
   -d '{
     "question": "What do we know about CI/CD best practices?",
     "agent_id": null
   }'
 ```
+
+Legacy `X-API-Key` remains supported for backward compatibility, but `X-MemU-Key` is the canonical auth header.
 
 ### Other endpoints
 
@@ -335,6 +337,8 @@ DATABASE_URL=postgresql://memu:memu@localhost:5432/memu
 
 # Auth
 MEMU_API_KEY=your-secret-key
+MEMU_API_URL=http://127.0.0.1:8000  # scripts/hooks target this base URL
+# Legacy alias still accepted by some older helpers: MEMU_BASE_URL
 
 # Embeddings (any OpenAI-compatible endpoint)
 OPENAI_API_KEY=          # optional, for OpenAI
@@ -378,6 +382,7 @@ TEMPORAL_TLS=false
 - `TEMPORAL_HOST`/`TEMPORAL_TLS` are only required if you want `/memories/async` and `/search/async`.
 - Use `python scripts/verify_deployment.py --api-url <url>` for core API checks.
 - Add `--check-async` only when the Temporal service and worker are deployed and healthy.
+- For local/CI evidence on NATS lane locking, run `./scripts/verify_nats_lane_lock.sh` (JetStream-backed) or `./scripts/verify_baseline.sh`.
 
 See `docs/railway-readiness.md` for the full pre-deploy checklist.
 
