@@ -1,17 +1,17 @@
-"""
-Integration test for Graph-Lite API endpoints.
+"""Manual integration script for Graph-Lite API endpoints.
 
-Tests the full flow:
-1. POST /memories with relationships array
-2. Verify relationship links are created
-3. Query related memories via graph traversal
+This talks to a live memU API and is not suitable for default unit/CI execution.
+Run it directly against a running stack when you want end-to-end graph-lite proof.
 """
 
 import asyncio
 import httpx
 import os
 import sys
+import pytest
 from uuid import uuid4
+
+pytestmark = pytest.mark.skip(reason="manual integration script; requires live memU API")
 
 # Configuration
 API_BASE_URL = os.environ.get("MEMU_API_URL", "http://localhost:8000")
