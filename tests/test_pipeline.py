@@ -1,14 +1,22 @@
-"""Send test events through the full pipeline: NATS → Bridge → Glass Box"""
+"""Manual smoke helper for sending events through the pipeline.
+
+This file lives under tests/ for convenience/history, but it is not an automated
+pytest test and must never run network side effects at import time.
+"""
 import asyncio
 import json
+import os
 import uuid
 from datetime import datetime, timezone
 
 import nats
 
 
+NATS_URL = os.environ.get("NATS_URL", "nats://127.0.0.1:4222")
+
+
 async def send_test_events():
-    nc = await nats.connect("nats://100.76.63.58:4222")
+    nc = await nats.connect(NATS_URL)
 
     root_id = str(uuid.uuid4())
     task1_id = str(uuid.uuid4())
@@ -103,7 +111,8 @@ async def send_test_events():
         await asyncio.sleep(0.3)
 
     await nc.drain()
-    print(f"\nSent {len(events)} events. Open http://localhost:3001 to see the Glass Box!")
+    print(f"\nSent {len(events)} events to {NATS_URL}. Open http://localhost:3001 to see the Glass Box!")
 
 
-asyncio.run(send_test_events())
+if __name__ == "__main__":
+    asyncio.run(send_test_events())
