@@ -403,6 +403,156 @@ def _ensure_memory_metadata(metadata: dict | None) -> dict[str, Any]:
     return payload
 
 
+def _record_value(row: Any, key: str, default: Any = None) -> Any:
+    if isinstance(row, dict):
+        return row.get(key, default)
+    try:
+        return row[key]
+    except Exception:
+        return default
+
+
+def _coerce_uuid_list(values: Any) -> list[UUID]:
+    if values is None:
+        return []
+    if not isinstance(values, (list, tuple, set)):
+        values = [values]
+
+    seen: set[UUID] = set()
+    normalized: list[UUID] = []
+    for value in values:
+        if value in (None, ""):
+            continue
+        try:
+            parsed = value if isinstance(value, UUID) else UUID(str(value))
+        except (TypeError, ValueError):
+            continue
+        if parsed not in seen:
+            seen.add(parsed)
+            normalized.append(parsed)
+    return normalized
+
+
+def _extract_superseding_targets(
+    metadata: dict[str, Any] | None,
+    supersedes: UUID | None = None,
+    invalidates: list[UUID] | None = None,
+) -> list[UUID]:
+    payload = metadata or {}
+    targets: list[UUID] = []
+    if supersedes is not None:
+        targets.append(supersedes)
+    if invalidates:
+        targets.extend(invalidates)
+    targets.extend(_coerce_uuid_list(payload.get("supersedes")))
+    targets.extend(_coerce_uuid_list(payload.get("invalidates")))
+    targets.extend(_coerce_uuid_list(payload.get("invalidated_ids")))
+    return _coerce_uuid_list(targets)
+
+
+def _apply_superseding_metadata(metadata: dict[str, Any], superseded_ids: list[UUID]) -> dict[str, Any]:
+    payload = dict(metadata)
+    if not superseded_ids:
+        return payload
+
+    serialized = [str(value) for value in superseded_ids]
+    payload["supersedes"] = serialized[0] if len(serialized) == 1 else serialized
+    payload["invalidates"] = serialized
+    return payload
+
+
+def _collect_invalidated_ids(rows: list[Any]) -> set[str]:
+    invalidated_ids: set[str] = set()
+    for row in rows:
+        metadata = _record_value(row, "metadata", {})
+        if not isinstance(metadata, dict):
+            continue
+        for key in ("supersedes", "invalidates", "invalidated_ids"):
+            invalidated_ids.update(str(value) for value in _coerce_uuid_list(metadata.get(key)))
+    return invalidated_ids
+
+
+def _is_current_memory_row(row: Any, now: datetime | None = None) -> bool:
+    current_time = now or datetime.now(timezone.utc)
+
+    valid_to = _record_value(row, "valid_to")
+    if isinstance(valid_to, str):
+        try:
+            valid_to = _parse_optional_iso(valid_to)
+        except Exception:
+            valid_to = None
+    if valid_to is not None and valid_to <= current_time:
+        return False
+
+    metadata = _record_value(row, "metadata", {})
+    if not isinstance(metadata, dict):
+        return True
+
+    stale_after_raw = metadata.get("stale_after")
+    if isinstance(stale_after_raw, str):
+        try:
+            stale_after = _parse_optional_iso(stale_after_raw)
+            if stale_after and stale_after <= current_time:
+                return False
+        except Exception:
+            pass
+
+    if metadata.get("invalidated_by") and metadata.get("invalidated_at"):
+        return False
+
+    return True
+
+
+def _filter_current_search_rows(rows: list[Any], now: datetime | None = None) -> list[Any]:
+    invalidated_ids = _collect_invalidated_ids(rows)
+    filtered_rows: list[Any] = []
+    for row in rows:
+        row_id = _record_value(row, "id")
+        if row_id is not None and str(row_id) in invalidated_ids:
+            continue
+        if not _is_current_memory_row(row, now=now):
+            continue
+        filtered_rows.append(row)
+    return filtered_rows
+
+
+async def _apply_superseding_operations(conn: Any, new_memory_id: UUID, superseded_ids: list[UUID]) -> None:
+    if not superseded_ids:
+        return
+
+    now = datetime.now(timezone.utc)
+    await conn.execute(
+        """
+        UPDATE memories
+        SET valid_to = COALESCE(valid_to, $2),
+            metadata = COALESCE(metadata, '{}'::jsonb)
+                || jsonb_build_object('invalidated_by', $1::text, 'invalidated_at', $2::text),
+            updated_at = NOW()
+        WHERE id = ANY($3::uuid[])
+          AND id <> $1
+          AND (valid_to IS NULL OR valid_to > $2)
+        """,
+        new_memory_id,
+        now,
+        superseded_ids,
+    )
+    await conn.execute(
+        """
+        INSERT INTO memory_links (source_id, target_id, relationship, strength, metadata)
+        SELECT $1, superseded_id, 'supersedes', 1.0, jsonb_build_object('temporal', true)
+        FROM unnest($2::uuid[]) AS superseded_id
+        WHERE superseded_id <> $1
+        ON CONFLICT (source_id, target_id, relationship)
+        DO UPDATE SET
+            strength = GREATEST(memory_links.strength, EXCLUDED.strength),
+            metadata = memory_links.metadata || EXCLUDED.metadata,
+            last_accessed = NOW()
+        """,
+        new_memory_id,
+        superseded_ids,
+    )
+
+
 def _extract_entities(text: str) -> set[str]:
     return {token.lower() for token in re.findall(r"\b[A-Z][A-Za-z0-9_-]{2,}\b", text or "")}
 
@@ -446,6 +596,12 @@ async def memu_health_compat():
 @app.post("/memories", response_model=Memory)
 async def create_memory(req: MemoryCreate, _key: str = Depends(verify_api_key)):
     normalized_metadata = _ensure_memory_metadata(req.metadata)
+    superseded_ids = _extract_superseding_targets(
+        normalized_metadata,
+        supersedes=req.supersedes,
+        invalidates=req.invalidates,
+    )
+    normalized_metadata = _apply_superseding_metadata(normalized_metadata, superseded_ids)
     embedding = await get_embedding(req.content)
     c_hash = content_hash(req.content)
 
@@ -506,6 +662,9 @@ async def create_memory(req: MemoryCreate, _key: str = Depends(verify_api_key)):
                 c_hash,
                 tenant_id,
             )
+
+        superseded_ids = [value for value in superseded_ids if value != row["id"]]
+        await _apply_superseding_operations(conn, row["id"], superseded_ids)
 
     memory = _row_to_memory(row)
 
@@ -670,7 +829,7 @@ async def search_memories(req: SearchRequest, _key: str = Depends(verify_api_key
         logger.warning("Embedding service unavailable for /search, falling back to text search")
         # Delegate to text-based search as fallback
         async with _tenant_conn(_key) as conn:
-            filters = ["content ILIKE $1"]
+            filters = ["content ILIKE $1", "valid_to IS NULL"]
             params: list[Any] = [f"%{req.query}%"]
             idx = 2
 
@@ -713,7 +872,7 @@ async def search_memories(req: SearchRequest, _key: str = Depends(verify_api_key
         results.sort(key=lambda r: r.final_score, reverse=True)
         return results[: req.limit]
     
-    filters = []
+    filters = ["valid_to IS NULL"]
     params: list[Any] = [str(embedding)]
     idx = 2
 
@@ -767,7 +926,7 @@ async def search_memories(req: SearchRequest, _key: str = Depends(verify_api_key
 
         # Optional lexical tie-breaker for filtered misses.
         if req.lexical_fallback and len(rows) < min_results:
-            lexical_filters = ["content ILIKE $1"]
+            lexical_filters = ["content ILIKE $1", "valid_to IS NULL"]
             lexical_params: list[Any] = [f"%{req.query}%"]
             lidx = 2
             if req.agent_id:
@@ -808,28 +967,7 @@ async def search_memories(req: SearchRequest, _key: str = Depends(verify_api_key
                 ids,
             )
     # Apply Graphiti-inspired temporal + entity-aware re-ranking.
-    superseded_ids = {
-        str(r.get("metadata", {}).get("supersedes"))
-        for r in rows
-        if isinstance(r.get("metadata"), dict) and r.get("metadata", {}).get("supersedes")
-    }
-
-    filtered_rows = []
-    now = datetime.now(timezone.utc)
-    for row in rows:
-        row_id = str(row["id"])
-        if row_id in superseded_ids:
-            continue
-        metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
-        stale_after_raw = metadata.get("stale_after")
-        if isinstance(stale_after_raw, str):
-            try:
-                stale_after = _parse_optional_iso(stale_after_raw)
-                if stale_after and stale_after <= now:
-                    continue
-            except Exception:
-                pass
-        filtered_rows.append(row)
+    filtered_rows = _filter_current_search_rows(rows)
 
     results = []
     for row in filtered_rows:

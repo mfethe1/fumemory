@@ -34,6 +34,8 @@ class MemoryCreate(BaseModel):
     parent_id: Optional[UUID] = None
     confidence: float = 1.0
     relationships: list[Relationship] = Field(default_factory=list, description="Graph-Lite entity/relationship tags")
+    supersedes: UUID | None = None
+    invalidates: list[UUID] = Field(default_factory=list)
 
 class Memory(BaseModel):
     id: UUID
