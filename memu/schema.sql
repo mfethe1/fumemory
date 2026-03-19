@@ -21,7 +21,10 @@ CREATE TABLE IF NOT EXISTS memories (
 );
 
 -- Indexes
-CREATE INDEX IF NOT EXISTS idx_memories_embedding ON memories USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
+-- pgvector ANN indexes on dense 4096-dim vectors exceed direct HNSW/IVFFlat limits here.
+-- Use binary quantization for the candidate index, then rerank with exact cosine distance in queries.
+CREATE INDEX IF NOT EXISTS idx_memories_embedding_bit_hnsw
+    ON memories USING hnsw (((binary_quantize(embedding))::bit(4096)) bit_hamming_ops);
 CREATE INDEX IF NOT EXISTS idx_memories_agent_id ON memories (agent_id);
 CREATE INDEX IF NOT EXISTS idx_memories_type ON memories (memory_type);
 CREATE INDEX IF NOT EXISTS idx_memories_parent ON memories (parent_id);

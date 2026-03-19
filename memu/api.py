@@ -525,11 +525,18 @@ async def search_memories(req: SearchRequest, _key: str = Depends(verify_api_key
     where = (" AND " + " AND ".join(filters)) if filters else ""
 
     async with pool.acquire() as conn:
+        candidate_limit = max(req.limit * 8, 32)
         rows = await conn.fetch(
             f"""
+            WITH candidates AS (
+                SELECT *
+                FROM memories
+                WHERE embedding IS NOT NULL{where}
+                ORDER BY ((binary_quantize(embedding))::bit(4096)) <~> ((binary_quantize($1::vector))::bit(4096))
+                LIMIT {candidate_limit}
+            )
             SELECT *, 1 - (embedding <=> $1::vector) AS similarity
-            FROM memories
-            WHERE embedding IS NOT NULL{where}
+            FROM candidates
             ORDER BY embedding <=> $1::vector
             LIMIT {req.limit * 3}
             """,

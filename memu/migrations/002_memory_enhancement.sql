@@ -2,11 +2,12 @@
 -- Adds: HNSW index, BM25/tsvector, cluster hierarchy (RAPTOR), summary layer
 -- Safe to run multiple times (IF NOT EXISTS throughout)
 
--- 1. HNSW index — faster ANN than IVFFlat, no training needed, better recall
+-- 1. HNSW candidate index — use binary quantization for 4096-dim embeddings, then rerank exactly
 DROP INDEX IF EXISTS idx_memories_embedding;
-CREATE INDEX IF NOT EXISTS idx_memories_embedding_hnsw
-    ON memories USING hnsw (embedding vector_cosine_ops)
-    WITH (m = 16, ef_construction = 64);
+DROP INDEX IF EXISTS idx_memories_embedding_hnsw;
+DROP INDEX IF EXISTS idx_memories_embedding_halfvec;
+CREATE INDEX IF NOT EXISTS idx_memories_embedding_bit_hnsw
+    ON memories USING hnsw (((binary_quantize(embedding))::bit(4096)) bit_hamming_ops);
 
 -- 2. Full-text search column — enables BM25-style ranking via ts_rank
 ALTER TABLE memories ADD COLUMN IF NOT EXISTS content_tsv tsvector
@@ -30,7 +31,8 @@ CREATE TABLE IF NOT EXISTS memory_clusters (
 );
 
 CREATE INDEX IF NOT EXISTS idx_clusters_level    ON memory_clusters (level);
-CREATE INDEX IF NOT EXISTS idx_clusters_embedding ON memory_clusters USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 64);
+CREATE INDEX IF NOT EXISTS idx_clusters_embedding_bit_hnsw
+    ON memory_clusters USING hnsw (((binary_quantize(embedding))::bit(4096)) bit_hamming_ops);
 CREATE INDEX IF NOT EXISTS idx_clusters_tsv      ON memory_clusters USING GIN (summary_tsv);
 CREATE INDEX IF NOT EXISTS idx_clusters_parent   ON memory_clusters (parent_id);
 CREATE INDEX IF NOT EXISTS idx_clusters_scope    ON memory_clusters (agent_scope);
