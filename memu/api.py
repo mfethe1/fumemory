@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import logging
 import re
@@ -357,7 +358,7 @@ async def create_memory(req: MemoryCreate, _key: str = Depends(verify_api_key)):
                 """,
                 existing["id"],
                 req.confidence,
-                str(normalized_metadata),
+                json.dumps(normalized_metadata),
             )
         else:
             row = await conn.fetchrow(
@@ -370,7 +371,7 @@ async def create_memory(req: MemoryCreate, _key: str = Depends(verify_api_key)):
                 str(embedding),
                 req.memory_type.value,
                 req.agent_id,
-                str(normalized_metadata),
+                json.dumps(normalized_metadata),
                 req.parent_id,
                 req.confidence,
                 c_hash,
