@@ -62,6 +62,34 @@ async def lifespan(app: FastAPI):
 
     pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=10)
 
+    # Run schema migration 002 (idempotent — IF NOT EXISTS throughout)
+    try:
+        migration_path = os.path.join(os.path.dirname(__file__), "migrations", "002_memory_enhancement.sql")
+        if os.path.exists(migration_path):
+            with open(migration_path) as f:
+                migration_sql = f.read()
+            async with pool.acquire() as conn:
+                # Run statement by statement to handle partial failures gracefully
+                for stmt in migration_sql.split(";"):
+                    stmt = stmt.strip()
+                    if stmt and not stmt.startswith("--"):
+                        try:
+                            await conn.execute(stmt)
+                        except Exception as stmt_err:
+                            logger.warning("Migration stmt skipped: %s — %s", stmt[:80], stmt_err)
+            logger.info("Schema migration 002 applied (idempotent)")
+    except Exception as e:
+        logger.warning("Migration 002 failed (non-fatal): %s", e)
+
+    # Wire enhanced search router
+    try:
+        from memu.search_enhanced import router as enhanced_router, configure as configure_enhanced
+        configure_enhanced(pool, get_embedding, verify_api_key)
+        app.include_router(enhanced_router)
+        logger.info("Enhanced search endpoints registered (/search/hybrid, /search/raptor, /search/grep)")
+    except Exception as e:
+        logger.warning("Enhanced search router failed to load (non-fatal): %s", e)
+
     if ENABLE_AGENT_EVENTS_CONSUMER:
         try:
             agent_events_consumer = AgentEventsConsumer()
