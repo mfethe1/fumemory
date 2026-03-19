@@ -2612,6 +2612,279 @@ async def history_cleanup(
         deleted = int(res.split()[1]) if res.startswith("DELETE") else 0
         return HygieneCleanupResponse(deleted_history_count=deleted, dry_run=False)
 
+# ===========================================================================
+# Memory Agent API endpoints (migration 014)
+# ===========================================================================
+
+from memu.concept_search import (
+    fts_search,
+    trgm_search,
+    concept_lookup,
+    concept_search_memories,
+    hybrid_search as _hybrid_search_core,
+    rrf_fuse,
+)
+
+
+class HybridSearchRequest(BaseModel):
+    query: str
+    limit: int = 10
+    agent_id: str | None = None
+    use_fts: bool = True
+    use_concepts: bool = True
+    temporal_weight: float = 0.3
+    rrf_k: int = 60
+
+
+class CompactionResult(BaseModel):
+    id: str
+    summary: str
+    agent_id: str | None
+    compaction_level: int
+    concept_tags: list[str]
+    source_count: int
+    created_at: datetime
+
+
+class AgentRunRequest(BaseModel):
+    run_type: str = "full"    # 'compact', 'index', 'distill', 'full'
+    model: str | None = None
+
+
+@app.get("/compactions", summary="List memory compaction nodes")
+async def list_compactions(
+    agent_id: str | None = None,
+    level: int | None = None,
+    limit: int = 50,
+    _key: str = Depends(verify_api_key),
+):
+    """List all hierarchical compaction/summary nodes. Non-destructive — originals unchanged."""
+    filters = []
+    params: list[Any] = []
+    idx = 1
+    if agent_id:
+        filters.append(f"agent_id = ${idx}")
+        params.append(agent_id)
+        idx += 1
+    if level is not None:
+        filters.append(f"compaction_level = ${idx}")
+        params.append(level)
+        idx += 1
+    where = ("WHERE " + " AND ".join(filters)) if filters else ""
+    try:
+        async with _tenant_conn(_key) as conn:
+            rows = await conn.fetch(
+                f"""
+                SELECT id, summary, agent_id, compaction_level, concept_tags,
+                       array_length(source_memory_ids, 1) AS source_count, created_at
+                FROM memory_compactions
+                {where}
+                ORDER BY created_at DESC
+                LIMIT {limit}
+                """,
+                *params,
+            )
+        return [
+            {
+                "id": str(r["id"]),
+                "summary": r["summary"],
+                "agent_id": r["agent_id"],
+                "compaction_level": r["compaction_level"],
+                "concept_tags": list(r["concept_tags"] or []),
+                "source_count": r["source_count"] or 0,
+                "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+            }
+            for r in rows
+        ]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Compactions query failed: {e}")
+
+
+@app.get("/concepts", summary="List top concepts from concept index")
+async def list_concepts(limit: int = 50, _key: str = Depends(verify_api_key)):
+    """List most frequent concepts extracted from memory corpus."""
+    try:
+        async with _tenant_conn(_key) as conn:
+            rows = await conn.fetch(
+                """
+                SELECT concept, frequency, array_length(memory_ids, 1) AS memory_count, last_seen
+                FROM memory_concept_index
+                ORDER BY frequency DESC
+                LIMIT $1
+                """,
+                limit,
+            )
+        return [
+            {
+                "concept": r["concept"],
+                "frequency": r["frequency"],
+                "memory_count": r["memory_count"] or 0,
+                "last_seen": r["last_seen"].isoformat() if r["last_seen"] else None,
+            }
+            for r in rows
+        ]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Concepts query failed: {e}")
+
+
+@app.get("/concepts/search", summary="Fast concept-based grep (no embedding needed)")
+async def search_concepts(
+    q: str,
+    agent_id: str | None = None,
+    limit: int = 20,
+    _key: str = Depends(verify_api_key),
+):
+    """
+    O(1) concept-based memory lookup — find memories by keyword/concept without embedding.
+    Backed by pg_trgm index for fuzzy matching.
+    """
+    try:
+        async with _tenant_conn(_key) as conn:
+            concept_entries = await concept_lookup(conn, q, limit=10)
+            memories = await concept_search_memories(conn, q, limit=limit, agent_id=agent_id)
+        return {
+            "query": q,
+            "matched_concepts": [c["concept"] for c in concept_entries],
+            "memories": [
+                {
+                    "id": str(m["id"]),
+                    "content": m["content"],
+                    "agent_id": m.get("agent_id"),
+                    "memory_type": m.get("memory_type"),
+                    "score": m.get("concept_score", 0.9),
+                }
+                for m in memories
+            ],
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Concept search failed: {e}")
+
+
+@app.post("/memories/hybrid-search", summary="RRF fusion: vector + FTS + concept results")
+async def hybrid_search_endpoint(req: HybridSearchRequest, _key: str = Depends(verify_api_key)):
+    """
+    Hybrid retrieval using Reciprocal Rank Fusion over three channels:
+    1. Vector similarity (existing /search pipeline)
+    2. Full-text search (tsvector)
+    3. Concept index lookup
+
+    Returns a single fused, re-ranked result list.
+    """
+    # Step 1: vector results
+    embedding = await get_embedding(req.query)
+    vector_results = []
+    if embedding:
+        filters = []
+        params: list[Any] = [str(embedding)]
+        idx = 2
+        if req.agent_id:
+            filters.append(f"agent_id = ${idx}")
+            params.append(req.agent_id)
+            idx += 1
+        where = (" AND " + " AND ".join(filters)) if filters else ""
+        try:
+            async with _tenant_conn(_key) as conn:
+                rows = await conn.fetch(
+                    f"""
+                    SELECT id, content, agent_id, memory_type, metadata,
+                           1 - (embedding <=> $1::vector({EMBEDDING_DIMS})) AS similarity,
+                           created_at, access_count, confidence, decay_score
+                    FROM memories
+                    WHERE embedding IS NOT NULL AND valid_to IS NULL{where}
+                    ORDER BY embedding <=> $1::vector({EMBEDDING_DIMS})
+                    LIMIT {req.limit * 2}
+                    """,
+                    *params,
+                )
+                vector_results = [dict(r) for r in rows]
+        except Exception as e:
+            logger.warning("Hybrid vector search failed: %s", e)
+
+    # Step 2 & 3: FTS + concept via RRF
+    async with _tenant_conn(_key) as conn:
+        fused = await _hybrid_search_core(
+            conn,
+            req.query,
+            vector_results=vector_results,
+            limit=req.limit,
+            agent_id=req.agent_id,
+            use_fts=req.use_fts,
+            use_concepts=req.use_concepts,
+            rrf_k=req.rrf_k,
+        )
+
+    return [
+        {
+            "id": str(m["id"]),
+            "content": m["content"],
+            "agent_id": m.get("agent_id"),
+            "memory_type": m.get("memory_type"),
+            "rrf_score": m.get("rrf_score", 0.0),
+            "similarity": m.get("similarity", 0.0),
+        }
+        for m in fused[:req.limit]
+    ]
+
+
+@app.post("/agent/run", summary="Trigger a memory agent run")
+async def trigger_agent_run(req: AgentRunRequest, _key: str = Depends(verify_api_key)):
+    """
+    Trigger a memory agent run asynchronously.
+    run_type: 'compact' | 'index' | 'distill' | 'full'
+    """
+    import subprocess, sys
+
+    cmd = [sys.executable, "-m", "memu.memory_agent", f"--{req.run_type}"]
+    if req.model:
+        cmd += ["--model", req.model]
+
+    try:
+        # Fire and forget — don't wait for completion
+        proc = subprocess.Popen(
+            cmd,
+            cwd=os.path.dirname(os.path.dirname(__file__)),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return {"status": "started", "run_type": req.run_type, "pid": proc.pid}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to start agent: {e}")
+
+
+@app.get("/agent/runs", summary="List recent memory agent runs")
+async def list_agent_runs(limit: int = 20, _key: str = Depends(verify_api_key)):
+    """Show recent memory agent run history with stats."""
+    try:
+        async with _tenant_conn(_key) as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id, run_type, status, memories_processed, compactions_created,
+                       concepts_indexed, model_used, started_at, finished_at, error
+                FROM memory_agent_runs
+                ORDER BY started_at DESC
+                LIMIT $1
+                """,
+                limit,
+            )
+        return [
+            {
+                "id": str(r["id"]),
+                "run_type": r["run_type"],
+                "status": r["status"],
+                "memories_processed": r["memories_processed"],
+                "compactions_created": r["compactions_created"],
+                "concepts_indexed": r["concepts_indexed"],
+                "model_used": r["model_used"],
+                "started_at": r["started_at"].isoformat() if r["started_at"] else None,
+                "finished_at": r["finished_at"].isoformat() if r["finished_at"] else None,
+                "error": r["error"],
+            }
+            for r in rows
+        ]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Agent runs query failed: {e}")
+
+
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
