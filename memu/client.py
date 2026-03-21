@@ -29,6 +29,7 @@ class MemUClient:
     def __init__(self, base_url: str, api_key: str, timeout: float = 30.0):
         self.base_url = base_url.rstrip("/")
         self._client = httpx.Client(
+            transport=httpx.HTTPTransport(retries=3),
             base_url=self.base_url,
             headers={"X-API-Key": api_key, "Content-Type": "application/json"},
             timeout=timeout,
