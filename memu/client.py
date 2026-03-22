@@ -26,12 +26,14 @@ class MemUClient:
         results = client.search("sky color")
     """
 
-    def __init__(self, base_url: str, api_key: str, timeout: float = 30.0):
+    def __init__(self, base_url: str, api_key: str, timeout: float = 30.0, max_retries: int = 3):
         self.base_url = base_url.rstrip("/")
+        transport = httpx.HTTPTransport(retries=max_retries)
         self._client = httpx.Client(
             base_url=self.base_url,
             headers={"X-API-Key": api_key, "Content-Type": "application/json"},
             timeout=timeout,
+            transport=transport,
         )
 
     def health(self) -> dict:
