@@ -409,6 +409,36 @@ async def memu_add_compat(req: MemUAddCompatRequest, _key: str = Depends(verify_
     return {"ok": True, "id": str(created.id), "message": "Memory stored"}
 
 
+
+@app.get("/memories/recent", response_model=list[Memory])
+async def get_recent_memories(
+    limit: int = 10,
+    agent_id: str | None = None,
+    memory_type: str | None = None,
+    _key: str = Depends(verify_api_key)
+):
+    query = "SELECT * FROM memories "
+    conditions = []
+    args = []
+    
+    if agent_id:
+        args.append(agent_id)
+        conditions.append(f"agent_id = ${len(args)}")
+    if memory_type:
+        args.append(memory_type)
+        conditions.append(f"memory_type = ${len(args)}")
+        
+    if conditions:
+        query += "WHERE " + " AND ".join(conditions)
+        
+    args.append(limit)
+    query += f" ORDER BY created_at DESC LIMIT ${len(args)}"
+    
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(query, *args)
+        
+    return [_row_to_memory(row) for row in rows]
+
 @app.get("/memories/{memory_id}", response_model=Memory)
 async def get_memory(memory_id: UUID, _key: str = Depends(verify_api_key)):
     async with pool.acquire() as conn:

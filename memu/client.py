@@ -63,6 +63,19 @@ class MemUClient:
         r.raise_for_status()
         return Memory.model_validate(r.json())
 
+
+    def get_recent(
+        self, limit: int = 10, agent_id: str | None = None, memory_type: str | None = None
+    ) -> list[Memory]:
+        params = {"limit": limit}
+        if agent_id:
+            params["agent_id"] = agent_id
+        if memory_type:
+            params["memory_type"] = memory_type
+        r = self._client.get("/memories/recent", params=params)
+        r.raise_for_status()
+        return [Memory.model_validate(item) for item in r.json()]
+
     def get(self, memory_id: str | UUID) -> Memory:
         """Get a specific memory by ID."""
         r = self._client.get(f"/memories/{memory_id}")
@@ -193,6 +206,19 @@ class AsyncMemUClient:
         r = await self._client.post("/memories", json=payload.model_dump(mode="json"))
         r.raise_for_status()
         return Memory.model_validate(r.json())
+
+
+    async def get_recent(
+        self, limit: int = 10, agent_id: str | None = None, memory_type: str | None = None
+    ) -> list[Memory]:
+        params = {"limit": limit}
+        if agent_id:
+            params["agent_id"] = agent_id
+        if memory_type:
+            params["memory_type"] = memory_type
+        r = await self._client.get("/memories/recent", params=params)
+        r.raise_for_status()
+        return [Memory.model_validate(item) for item in r.json()]
 
     async def get(self, memory_id: str | UUID) -> Memory:
         """Get a specific memory by ID."""
