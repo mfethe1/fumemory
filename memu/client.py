@@ -76,6 +76,12 @@ class MemUClient:
         r.raise_for_status()
         return [Memory.model_validate(item) for item in r.json()]
 
+    def get_stats(self) -> dict:
+        """Get total memory counts by agent and type."""
+        r = self._client.get("/api/v1/memu/stats")
+        r.raise_for_status()
+        return r.json()
+
     def get(self, memory_id: str | UUID) -> Memory:
         """Get a specific memory by ID."""
         r = self._client.get(f"/memories/{memory_id}")

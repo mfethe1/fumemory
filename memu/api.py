@@ -825,6 +825,20 @@ async def get_recent_memories(
         
     return [_row_to_memory(row) for row in rows]
 
+
+@app.get("/api/v1/memu/stats")
+async def get_stats(_key: str = Depends(verify_api_key)):
+    async with pool.acquire() as conn:
+        total = await conn.fetchval("SELECT COUNT(*) FROM memories")
+        by_type_rows = await conn.fetch("SELECT memory_type, COUNT(*) FROM memories GROUP BY memory_type")
+        by_agent_rows = await conn.fetch("SELECT agent_id, COUNT(*) FROM memories GROUP BY agent_id")
+    
+    return {
+        "total": total,
+        "by_type": {row["memory_type"]: row["count"] for row in by_type_rows},
+        "by_agent": {row["agent_id"]: row["count"] for row in by_agent_rows}
+    }
+
 @app.get("/memories/{memory_id}", response_model=Memory)
 async def get_memory(memory_id: UUID, _key: str = Depends(verify_api_key)):
     async with _tenant_conn(_key) as conn:
