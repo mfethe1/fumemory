@@ -148,6 +148,18 @@ class MemUClient:
         r.raise_for_status()
         return ChatResponse.model_validate(r.json())
 
+    def summarize(
+        self,
+        topic: str,
+        *,
+        agent_id: str | None = None,
+        context_limit: int = 20,
+    ) -> str:
+        """Helper to get a concise summary of memories related to a topic."""
+        prompt = f"Summarize everything we know about '{topic}'. Be concise and use bullet points. Ignore irrelevant context."
+        resp = self.chat(prompt, agent_id=agent_id, context_limit=context_limit)
+        return resp.answer
+
     def bulk_import(
         self,
         content: str,
