@@ -118,6 +118,19 @@ class MemUClient:
         r.raise_for_status()
         return [SearchResult.model_validate(item) for item in r.json()]
 
+
+    def format_for_prompt(self, memories: list[Memory]) -> str:
+        """Format a list of memories into a prompt-ready string."""
+        if not memories:
+            return ""
+        output = ["<retrieved_memories>"]
+        for m in memories:
+            source = f"agent={m.agent_id}" if m.agent_id else "system"
+            output.append(f"  <memory id=\"{m.id}\" source=\"{source}\" type=\"{m.memory_type.value}\">")
+            output.append(f"    {m.content.strip()}")
+            output.append("  </memory>")
+        output.append("</retrieved_memories>")
+        return "\n".join(output)
     def chat(
         self,
         question: str,
