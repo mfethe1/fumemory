@@ -36,6 +36,13 @@ class MemUClient:
             transport=transport,
         )
 
+    def ping(self) -> bool:
+        """Quickly test if the server is responsive."""
+        try:
+            return self.health().get("status") == "healthy" or self.health().get("ok") is True
+        except Exception:
+            return False
+
     def health(self) -> dict:
         """Check if the server is healthy."""
         r = self._client.get("/health")
