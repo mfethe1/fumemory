@@ -20,7 +20,7 @@ from typing import Any, Callable, Coroutine
 
 import asyncpg
 
-from nats.js import JetStreamContext
+from nats.js import JetStreamContext, api as js_api
 from memu.backlog_projection import infer_lane
 from memu.cluster import NATSClusterManager
 
@@ -123,8 +123,15 @@ class StateProjectorConsumer:
             durable=self.consumer_name,
             stream=self.stream,
             manual_ack=True,
-            ack_wait=STATE_EVENTS_ACK_WAIT_SECONDS,
-            max_ack_pending=STATE_EVENTS_MAX_ACK_PENDING,
+            config=js_api.ConsumerConfig(
+                durable_name=self.consumer_name,
+                ack_wait=STATE_EVENTS_ACK_WAIT_SECONDS,
+                max_ack_pending=STATE_EVENTS_MAX_ACK_PENDING,
+                ack_policy="explicit",
+                replay_policy="original",
+                deliver_policy="all",
+                filter_subject=self.subject,
+            ),
         )
 
         self._task = asyncio.create_task(self._consume())
@@ -181,20 +188,10 @@ class StateProjectorConsumer:
             return
         except Exception:
             logger.info(
-                "Creating durable consumer %s on %s", self.consumer_name, self.stream
+                "Durable consumer %s on %s will be created/bound during subscribe",
+                self.consumer_name,
+                self.stream,
             )
-
-        await self._js.add_consumer(
-            stream=self.stream,
-            durable=self.consumer_name,
-            ack_wait=STATE_EVENTS_ACK_WAIT_SECONDS,
-            max_ack_pending=STATE_EVENTS_MAX_ACK_PENDING,
-            ack_policy="explicit",
-            # Replay original sequence to support guaranteed post-restart replay
-            replay_policy="original",
-            deliver_policy="all",
-            filter_subject=self.subject,
-        )
 
     async def _consume(self):
         try:

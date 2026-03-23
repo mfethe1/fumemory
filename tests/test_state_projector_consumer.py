@@ -145,10 +145,7 @@ async def test_state_projector_creates_durable_consumer_with_replay_policy():
 
     assert fake_js.stream_info_called == 1
     assert fake_js.consumer_info_called == 1
-    assert len(fake_js.added_consumers) == 1
-    assert fake_js.added_consumers[0]["durable"] == "STATE_PROJECTOR"
-    assert fake_js.added_consumers[0]["replay_policy"] == "original"
-    assert fake_js.added_consumers[0]["ack_policy"] == "explicit"
+    assert fake_js.added_consumers == []
 
 
 @pytest.mark.asyncio

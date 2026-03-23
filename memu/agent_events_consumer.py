@@ -14,7 +14,7 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-from nats.js import JetStreamContext
+from nats.js import JetStreamContext, api as js_api
 from memu.cluster import NATSClusterManager
 
 logger = logging.getLogger(__name__)
@@ -96,8 +96,14 @@ class AgentEventsConsumer:
             durable=self.consumer_name,
             stream=self.stream,
             manual_ack=True,
-            ack_wait=ACK_WAIT_SECONDS,
-            max_ack_pending=MAX_ACK_PENDING,
+            config=js_api.ConsumerConfig(
+                durable_name=self.consumer_name,
+                ack_wait=ACK_WAIT_SECONDS,
+                max_ack_pending=MAX_ACK_PENDING,
+                ack_policy="explicit",
+                replay_policy="instant",
+                filter_subject=self.subject,
+            ),
         )
 
         self._task = asyncio.create_task(self._consume())
@@ -130,18 +136,63 @@ class AgentEventsConsumer:
             return
 
         try:
-            await self._js.stream_info(self.stream)
-            return
+            info = await self._js.stream_info(self.stream)
         except Exception:
             logger.info("Creating AGENT_EVENTS stream: %s", self.stream)
+            await self._js.add_stream(
+                name=self.stream,
+                subjects=[self.subject],
+                max_age=60 * 60 * 24 * 7,
+                max_msgs=1_000_000,
+                retention="limits",
+                storage="file",
+                description="Durable session event stream for agent adoption metrics",
+            )
+            return
 
-        await self._js.add_stream(
-            name=self.stream,
-            subjects=[self.stream],
-            max_age=60 * 60 * 24 * 7,
-            max_msgs=1_000_000,
-            retention="limits",
-            storage="file",
+        config = getattr(info, "config", None)
+        subjects = list(getattr(config, "subjects", []) or [])
+        if self.subject in subjects:
+            return
+
+        subjects.append(self.subject)
+        logger.warning(
+            "AGENT_EVENTS stream %s missing subject %s — reconciling subjects=%s",
+            self.stream,
+            self.subject,
+            subjects,
+        )
+
+        if config is None:
+            await self._js.update_stream(name=self.stream, subjects=subjects)
+            return
+
+        await self._js.update_stream(
+            config=js_api.StreamConfig(
+                name=getattr(config, "name", self.stream),
+                description=getattr(config, "description", None),
+                subjects=subjects,
+                retention=getattr(config, "retention", None),
+                max_consumers=getattr(config, "max_consumers", None),
+                max_msgs=getattr(config, "max_msgs", None),
+                max_bytes=getattr(config, "max_bytes", None),
+                discard=getattr(config, "discard", None),
+                max_age=getattr(config, "max_age", None),
+                max_msgs_per_subject=getattr(config, "max_msgs_per_subject", None),
+                max_msg_size=getattr(config, "max_msg_size", None),
+                storage=getattr(config, "storage", None),
+                num_replicas=getattr(config, "num_replicas", None),
+                duplicate_window=getattr(config, "duplicate_window", None),
+                sealed=getattr(config, "sealed", None),
+                deny_delete=getattr(config, "deny_delete", None),
+                deny_purge=getattr(config, "deny_purge", None),
+                allow_rollup_hdrs=getattr(config, "allow_rollup_hdrs", None),
+                allow_direct=getattr(config, "allow_direct", None),
+                mirror_direct=getattr(config, "mirror_direct", None),
+                compression=getattr(config, "compression", None),
+                allow_msg_ttl=getattr(config, "allow_msg_ttl", None),
+                metadata=getattr(config, "metadata", None),
+            )
         )
 
     async def _ensure_consumer(self) -> None:
@@ -153,17 +204,10 @@ class AgentEventsConsumer:
             return
         except Exception:
             logger.info(
-                "Creating durable consumer %s on %s", self.consumer_name, self.stream
+                "Durable consumer %s on %s will be created/bound during subscribe",
+                self.consumer_name,
+                self.stream,
             )
-
-        await self._js.add_consumer(
-            stream=self.stream,
-            durable=self.consumer_name,
-            ack_wait=ACK_WAIT_SECONDS,
-            max_ack_pending=MAX_ACK_PENDING,
-            ack_policy="explicit",
-            replay_policy="instant",
-        )
 
     async def _consume(self):
         try:
@@ -183,20 +227,26 @@ class AgentEventsConsumer:
 
         try:
             _ = json.loads(msg.data.decode())
-            await self._ack(msg)
-            self.metrics.acked_count += 1
-            self.metrics.last_processed_ts = time.time()
         except Exception as exc:
             self.metrics.failure_count += 1
             self.metrics.last_error = str(exc)
             self.metrics.last_error_ts = time.time()
             await self._nak(msg)
+            return
 
-    async def _ack(self, msg: Any) -> None:
+        acked = await self._ack(msg)
+        if acked:
+            self.metrics.acked_count += 1
+            self.metrics.last_processed_ts = time.time()
+        else:
+            await self._nak(msg)
+
+    async def _ack(self, msg: Any) -> bool:
         try:
             result = msg.ack()
             if inspect.isawaitable(result):
                 await result
+            return True
         except Exception as exc:
             self.metrics.failure_count += 1
             self.metrics.last_error = str(exc)
@@ -205,9 +255,9 @@ class AgentEventsConsumer:
                 result = msg.ack_sync()
                 if inspect.isawaitable(result):
                     await result
+                return True
             except Exception:
-                # caller handles metrics as failure
-                pass
+                return False
 
     async def _nak(self, msg: Any) -> None:
         try:

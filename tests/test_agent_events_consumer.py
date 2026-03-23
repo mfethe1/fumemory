@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -15,14 +16,75 @@ class _FakeNatsConnection:
         self.is_connected = connected
 
 
+class _FakeStreamConfig:
+    def __init__(self, subjects: list[str] | None = None):
+        self.name = "AGENT_EVENTS"
+        self.description = "existing"
+        self.subjects = subjects or []
+        self.retention = "limits"
+        self.max_consumers = -1
+        self.max_msgs = 1000
+        self.max_bytes = -1
+        self.discard = "old"
+        self.max_age = 60
+        self.max_msgs_per_subject = -1
+        self.max_msg_size = -1
+        self.storage = "file"
+        self.num_replicas = 1
+        self.duplicate_window = 120
+        self.sealed = False
+        self.deny_delete = False
+        self.deny_purge = False
+        self.allow_rollup_hdrs = False
+        self.allow_direct = True
+        self.mirror_direct = False
+        self.compression = "none"
+        self.allow_msg_ttl = False
+        self.metadata = {"_nats.req.level": "0"}
+
+
+class _FakeJS:
+    def __init__(self, subjects: list[str] | None = None, stream_missing: bool = True):
+        self.stream_missing = stream_missing
+        self.config = _FakeStreamConfig(subjects)
+        self.add_stream_calls: list[dict[str, Any]] = []
+        self.update_stream_calls: list[Any] = []
+        self.add_consumer_calls: list[dict[str, Any]] = []
+
+    async def stream_info(self, _stream_name):
+        if self.stream_missing:
+            raise RuntimeError("missing")
+        return SimpleNamespace(config=self.config)
+
+    async def add_stream(self, **kwargs):
+        self.add_stream_calls.append(kwargs)
+        self.config = _FakeStreamConfig(kwargs.get("subjects", []))
+        self.stream_missing = False
+
+    async def update_stream(self, config=None, **kwargs):
+        self.update_stream_calls.append(config or kwargs)
+        if config is not None:
+            self.config = config
+        elif "subjects" in kwargs:
+            self.config.subjects = kwargs["subjects"]
+        self.stream_missing = False
+
+    async def consumer_info(self, _stream_name, _consumer_name):
+        raise RuntimeError("missing")
+
+    async def add_consumer(self, **kwargs):
+        self.add_consumer_calls.append(kwargs)
+
+
 class _FakeManager:
-    def __init__(self):
+    def __init__(self, js: _FakeJS | None = None):
         self._status = {
             "active_node": "local",
             "nodes": {"local": {"connected": True, "url": "nats://localhost"}},
         }
         self.active_node = SimpleNamespace(value="local")
         self.active_connection = _FakeNatsConnection()
+        self.js = js or _FakeJS()
 
     async def connect(self):
         return None
@@ -32,6 +94,10 @@ class _FakeManager:
 
     def status(self):
         return self._status
+
+    @property
+    def jetstream(self):
+        return self.js
 
 
 class _FakeMsg:
@@ -76,6 +142,31 @@ class _FakeAcquire:
 class _FakePool:
     def acquire(self):
         return _FakeAcquire()
+
+
+@pytest.mark.asyncio
+async def test_agent_events_consumer_creates_stream_with_subject_and_filtered_consumer():
+    fake_js = _FakeJS(stream_missing=True)
+    consumer = AgentEventsConsumer(cluster_manager=_FakeManager(fake_js))
+    consumer._js = fake_js
+
+    await consumer._ensure_stream()
+    await consumer._ensure_consumer()
+
+    assert fake_js.add_stream_calls[0]["subjects"] == [consumer.subject]
+    assert fake_js.add_consumer_calls == []
+
+
+@pytest.mark.asyncio
+async def test_agent_events_consumer_reconciles_existing_stream_subject_drift():
+    fake_js = _FakeJS(subjects=["events.>", "agent.>", "swarm.events"], stream_missing=False)
+    consumer = AgentEventsConsumer(cluster_manager=_FakeManager(fake_js))
+    consumer._js = fake_js
+
+    await consumer._ensure_stream()
+
+    assert len(fake_js.update_stream_calls) == 1
+    assert consumer.subject in fake_js.config.subjects
 
 
 @pytest.mark.asyncio
