@@ -15,8 +15,10 @@ described in M1 of the agent backlog.
 
 Environment variables:
     NATS_LOCAL_URL          Local NATS URL      (default: nats://localhost:4222)
-    NATS_RAILWAY_URL        Railway NATS URL    (default: nats://nats.railway.internal:4222)
-    NATS_AUTH_TOKEN         Optional auth token
+    NATS_RAILWAY_URL        Railway NATS URL    (required outside Railway)
+    NATS_RAILWAY_AUTH_TOKEN Optional Railway auth token
+    NATS_LOCAL_AUTH_TOKEN   Optional local auth token
+    NATS_AUTH_TOKEN         Back-compat fallback for Railway auth
     AGENT_EVENTS_SUBJECT    NATS subject name   (default: AGENT_EVENTS)
     SESSION_BUS_EMIT        Set "false" to disable all publishes (e.g. in tests)
 """
@@ -26,7 +28,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import time
 from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID, uuid4

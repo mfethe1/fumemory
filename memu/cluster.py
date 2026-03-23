@@ -6,10 +6,15 @@ Fallback: Railway NATS instance (redundant, survives local outages)
 Gateways connect to both. If local dies, traffic seamlessly
 routes to Railway. When local recovers, it becomes primary again.
 
+Outside Railway, ``NATS_RAILWAY_URL`` must be explicitly configured.
+We refuse to silently fall back to the Railway-internal hostname because
+that only resolves inside Railway's private network and otherwise causes
+slow, misleading bootstrap failures on laptops and remote hosts.
+
 Usage:
     manager = NATSClusterManager(
         local_url="nats://localhost:4222",
-        railway_url="nats://nats.railway.internal:4222",
+        railway_url="nats://maglev.proxy.rlwy.net:55041",
     )
     async with manager:
         js = manager.jetstream
@@ -25,13 +30,23 @@ import os
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable, Coroutine
+from typing import Any, Callable
 
 import nats
 from nats.aio.client import Client as NATSClient
 from nats.js import JetStreamContext
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_LOCAL_URL = "nats://localhost:4222"
+DEFAULT_RAILWAY_INTERNAL_URL = "nats://nats.railway.internal:4222"
+RAILWAY_RUNTIME_ENV_VARS = (
+    "RAILWAY_ENVIRONMENT",
+    "RAILWAY_PROJECT_ID",
+    "RAILWAY_SERVICE_ID",
+    "RAILWAY_REPLICA_ID",
+    "RAILWAY_PUBLIC_DOMAIN",
+)
 
 
 class ClusterNode(str, Enum):
@@ -68,15 +83,16 @@ class NATSClusterManager:
         failover_threshold_ms: float = 500.0,
         auth_token: str | None = None,
     ):
-        self.local_url = local_url or os.environ.get(
-            "NATS_LOCAL_URL", "nats://localhost:4222"
-        )
-        self.railway_url = railway_url or os.environ.get(
-            "NATS_RAILWAY_URL", "nats://nats.railway.internal:4222"
-        )
+        self.local_url = local_url or os.environ.get("NATS_LOCAL_URL", DEFAULT_LOCAL_URL)
+        self.railway_url = self._resolve_railway_url(railway_url)
         self.ping_interval_s = ping_interval_s
         self.failover_threshold_ms = failover_threshold_ms
-        self.auth_token = auth_token or os.environ.get("NATS_AUTH_TOKEN")
+        self._railway_auth_token = (
+            auth_token
+            or os.environ.get("NATS_RAILWAY_AUTH_TOKEN")
+            or os.environ.get("NATS_AUTH_TOKEN")
+        )
+        self._local_auth_token = os.environ.get("NATS_LOCAL_AUTH_TOKEN")
 
         self._connections: dict[ClusterNode, NATSClient] = {}
         self._jetstreams: dict[ClusterNode, JetStreamContext] = {}
@@ -87,6 +103,32 @@ class NATSClusterManager:
         self._active_node: ClusterNode = ClusterNode.LOCAL
         self._monitor_task: asyncio.Task | None = None
         self._on_failover_callbacks: list[Callable] = []
+
+    @staticmethod
+    def _in_railway_runtime() -> bool:
+        return any(os.environ.get(name) for name in RAILWAY_RUNTIME_ENV_VARS)
+
+    @classmethod
+    def _resolve_railway_url(cls, railway_url: str | None) -> str:
+        if railway_url:
+            return railway_url
+
+        env_url = os.environ.get("NATS_RAILWAY_URL")
+        if env_url:
+            return env_url
+
+        if cls._in_railway_runtime():
+            return DEFAULT_RAILWAY_INTERNAL_URL
+
+        raise ValueError(
+            "NATS_RAILWAY_URL must be set outside Railway. Refusing to use "
+            f"internal-only fallback {DEFAULT_RAILWAY_INTERNAL_URL!r}."
+        )
+
+    def _token_for_node(self, node: ClusterNode) -> str | None:
+        if node == ClusterNode.LOCAL:
+            return self._local_auth_token
+        return self._railway_auth_token
 
     async def __aenter__(self):
         await self.connect()
@@ -150,9 +192,7 @@ class NATSClusterManager:
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        connected = sum(
-            1 for r in results if not isinstance(r, Exception)
-        )
+        connected = sum(1 for r in results if not isinstance(r, Exception))
 
         if connected == 0:
             raise ConnectionError(
@@ -189,8 +229,9 @@ class NATSClusterManager:
                 "max_outstanding_pings": 3,
             }
 
-            if self.auth_token:
-                connect_opts["token"] = self.auth_token
+            token = self._token_for_node(node)
+            if token:
+                connect_opts["token"] = token
 
             # Error callbacks
             async def on_error(e):
@@ -288,7 +329,6 @@ class NATSClusterManager:
 
                 # Auto-recovery: if local is back and healthier, switch back
                 local_h = self._health[ClusterNode.LOCAL]
-                railway_h = self._health[ClusterNode.RAILWAY]
 
                 if (
                     self._active_node == ClusterNode.RAILWAY

@@ -9,7 +9,7 @@ Environment Variables (injected by the Warden):
     GATEWAY_ROLE     - Agent role (e.g., 'winnie', 'rosie', 'lenny', 'mack')
     TASK_ID          - If resuming a specific task (optional)
     NATS_LOCAL_URL   - Primary NATS instance
-    NATS_RAILWAY_URL - Fallback NATS instance
+    NATS_RAILWAY_URL - Fallback Railway NATS instance (required outside Railway)
     MEMU_API_URL     - memU API endpoint
     MEMU_API_KEY     - memU authentication key
     WARDEN_SECRET    - HMAC secret for signing Warden requests
@@ -24,7 +24,6 @@ import os
 import sys
 import time
 from datetime import datetime, timezone
-from uuid import UUID
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +33,7 @@ GATEWAY_ID = os.environ.get("GATEWAY_ID", f"gw-{os.getpid()}")
 GATEWAY_ROLE = os.environ.get("GATEWAY_ROLE", "generic")
 TASK_ID = os.environ.get("TASK_ID")
 NATS_LOCAL_URL = os.environ.get("NATS_LOCAL_URL", "nats://localhost:4222")
-NATS_RAILWAY_URL = os.environ.get("NATS_RAILWAY_URL", "nats://nats.railway.internal:4222")
+NATS_RAILWAY_URL = os.environ.get("NATS_RAILWAY_URL")
 MEMU_API_URL = os.environ.get("MEMU_API_URL", "http://localhost:8000")
 MEMU_API_KEY = os.environ.get("MEMU_API_KEY", "memu-dev-key")
 MAX_HYDRATION_TOKENS = int(os.environ.get("MAX_HYDRATION_TOKENS", "8000"))
@@ -162,8 +161,6 @@ async def _summarize(client, text: str, max_tokens: int) -> str:
 
 async def register_with_mesh():
     """Connect to NATS and announce this gateway's capabilities."""
-    import nats
-
     from memu.cluster import NATSClusterManager
     from memu.swarm_models import GatewayAnnounce, GatewayStatus
 
@@ -304,7 +301,7 @@ async def main():
         format=f"%(asctime)s [{GATEWAY_ID}] %(levelname)s %(message)s",
     )
 
-    logger.info(f"=== Gateway Boot ===")
+    logger.info("=== Gateway Boot ===")
     logger.info(f"  ID:   {GATEWAY_ID}")
     logger.info(f"  Role: {GATEWAY_ROLE}")
     logger.info(f"  Task: {TASK_ID or 'none (warm standby)'}")

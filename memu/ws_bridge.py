@@ -20,8 +20,8 @@ from contextlib import asynccontextmanager
 from typing import Any
 from uuid import UUID
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
-from pydantic import BaseModel, Field
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from pydantic import BaseModel
 
 from memu.cluster import NATSClusterManager
 from memu.bridge_ledger import BridgeLedger

@@ -11,6 +11,8 @@ FROM python:3.11-slim
 # System deps
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
+    jq \
+    netcat-openbsd \
     && rm -rf /var/lib/apt/lists/*
 
 # App
@@ -20,7 +22,13 @@ COPY README.md .
 COPY memu/ memu/
 
 # Install runtime deps without package install (hatch packaging is intentionally decoupled).
-RUN pip install --no-cache-dir fastapi==0.100 uvicorn>=0.20 asyncpg>=0.28 httpx>=0.24 pydantic>=2.0 nats-py>=2.7
+RUN pip install --no-cache-dir \
+    'fastapi>=0.111' \
+    'uvicorn>=0.29' \
+    'asyncpg>=0.29' \
+    'httpx>=0.27' \
+    'pydantic>=2.7' \
+    'nats-py>=2.7'
 
 # Health check via NATS heartbeat (the Warden monitors this)
 HEALTHCHECK --interval=10s --timeout=3s --retries=3 \

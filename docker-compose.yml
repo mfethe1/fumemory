@@ -42,6 +42,7 @@ services:
       OPENAI_API_KEY: ${OPENAI_API_KEY}
       NATS_LOCAL_URL: nats://nats:4222
       NATS_RAILWAY_URL: ${NATS_RAILWAY_URL:-nats://nats:4222}
+      NATS_RAILWAY_AUTH_TOKEN: ${NATS_RAILWAY_AUTH_TOKEN:-}
     depends_on:
       postgres:
         condition: service_healthy
@@ -56,6 +57,7 @@ services:
     environment:
       NATS_LOCAL_URL: nats://nats:4222
       NATS_RAILWAY_URL: ${NATS_RAILWAY_URL:-nats://nats:4222}
+      NATS_RAILWAY_AUTH_TOKEN: ${NATS_RAILWAY_AUTH_TOKEN:-}
     depends_on:
       nats:
         condition: service_healthy
@@ -67,6 +69,7 @@ services:
     environment:
       NATS_LOCAL_URL: nats://nats:4222
       NATS_RAILWAY_URL: ${NATS_RAILWAY_URL:-nats://nats:4222}
+      NATS_RAILWAY_AUTH_TOKEN: ${NATS_RAILWAY_AUTH_TOKEN:-}
       MEMU_API_URL: http://api:8000
       MEMU_API_KEY: ${MEMU_API_KEY:-memu-dev-key}
       SUMMARY_INTERVAL: ${SUMMARY_INTERVAL:-30}

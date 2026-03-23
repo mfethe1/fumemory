@@ -106,6 +106,7 @@ The repo also includes coordination/runtime modules used in multi-agent setups:
 - `bridge_ledger.py` — append-only event ledger
 - `ws_bridge.py` — websocket/NATS bridge path
 - `cluster.py`, `boot.py`, `hardening.py` — startup + reliability pieces
+- `docs/RAILWAY_NATS_WS_BRIDGE.md` — Railway NATS auth + ws_bridge deployment runbook
 
 ---
 
