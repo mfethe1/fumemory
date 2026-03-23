@@ -126,7 +126,7 @@ class MemUClient:
         output = ["<retrieved_memories>"]
         for m in memories:
             source = f"agent={m.agent_id}" if m.agent_id else "system"
-            output.append(f"  <memory id=\"{m.id}\" source=\"{source}\" type=\"{m.memory_type.value}\">")
+            output.append(f'  <memory id="{m.id}" source="{source}" type="{m.memory_type.value if hasattr(m.memory_type, "value") else m.memory_type}" confidence="{m.confidence}" created_at="{m.created_at.isoformat() if hasattr(m, "created_at") and m.created_at else ""}">')
             output.append(f"    {m.content.strip()}")
             output.append("  </memory>")
         output.append("</retrieved_memories>")
