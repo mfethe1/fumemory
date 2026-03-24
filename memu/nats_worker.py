@@ -175,9 +175,11 @@ async def run() -> None:
             if hasattr(msg, "nak"):
                 await msg.nak()
 
-    await nc.subscribe("swarm.task.started", cb=message_handler)
-    await nc.subscribe("swarm.task.completed", cb=message_handler)
-    await nc.subscribe("swarm.task.failed", cb=message_handler)
+    # Queue group ensures only ONE worker pod processes each task event,
+    # preventing duplicate LLM calls and DB writes during horizontal scaling.
+    await nc.subscribe("swarm.task.started", cb=message_handler, queue="memu-worker-group")
+    await nc.subscribe("swarm.task.completed", cb=message_handler, queue="memu-worker-group")
+    await nc.subscribe("swarm.task.failed", cb=message_handler, queue="memu-worker-group")
 
     logger.info("Listening for swarm task messages...")
 

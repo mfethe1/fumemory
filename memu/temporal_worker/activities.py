@@ -122,6 +122,7 @@ async def generate_embedding(text: str) -> list[float] | None:
 @activity.defn
 async def store_memory(content: str, agent_id: str, metadata: dict, embedding: list[float] | None) -> str:
     """Store memory and return ID."""
+    # One-shot connection — acceptable for Temporal activity isolation
     conn = await asyncpg.connect(get_db_url())
     try:
         row = await conn.fetchrow(
@@ -143,6 +144,7 @@ async def store_memory(content: str, agent_id: str, metadata: dict, embedding: l
 @activity.defn
 async def search_memory(query: str, agent_id: str, embedding: list[float] | None) -> list:
     """Execute search query."""
+    # One-shot connection — acceptable for Temporal activity isolation
     conn = await asyncpg.connect(get_db_url())
     try:
         if embedding:
@@ -171,6 +173,7 @@ async def search_memory(query: str, agent_id: str, embedding: list[float] | None
 @activity.defn
 async def log_audit(action_type: str, agent_id: str, details: dict):
     """Log structured audit event."""
+    # One-shot connection — acceptable for Temporal activity isolation
     conn = await asyncpg.connect(get_db_url())
     try:
         await conn.execute(
@@ -198,6 +201,7 @@ LLM_MODEL = os.environ.get("PROFILER_LLM_MODEL", "gpt-4o-mini")
 @activity.defn
 async def fetch_recent_episodes(agent_id: str, hours: int) -> list[dict]:
     """Fetch episodic memories from the last N hours."""
+    # One-shot connection — acceptable for Temporal activity isolation
     conn = await asyncpg.connect(get_db_url())
     try:
         rows = await conn.fetch(
@@ -289,6 +293,7 @@ async def store_dream_rule(agent_id: str, rule_text: str, source_episode_ids: li
     """
     idempotency_key = _dream_idempotency_key(agent_id, source_episode_ids)
 
+    # One-shot connection — acceptable for Temporal activity isolation
     conn = await asyncpg.connect(get_db_url())
     try:
         # Generate embedding for the rule
@@ -367,6 +372,7 @@ async def mark_episodes_consolidated(episode_ids: list[str]) -> int:
     """Mark source episodes as non-searchable (retain provenance, exclude from RAG)."""
     if not episode_ids:
         return 0
+    # One-shot connection — acceptable for Temporal activity isolation
     conn = await asyncpg.connect(get_db_url())
     try:
         # Filter out None/empty IDs

@@ -8,6 +8,7 @@ import json
 from memu.web_search_ingest import ingest_web_search
 import os
 import logging
+import signal
 from contextlib import asynccontextmanager
 from typing import Any, Optional
 from uuid import UUID
@@ -15,7 +16,8 @@ import re
 
 import asyncpg
 import httpx
-from fastapi import Depends, FastAPI, HTTPException, Security
+from fastapi import Depends, FastAPI, HTTPException, Request, Security
+from fastapi.responses import JSONResponse
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel
 
@@ -92,13 +94,23 @@ _nats_publisher: NATSEventPublisher | None = None
 _core_memory_mgr: CoreMemoryManager | None = None
 _implicit_profiler: Any = None  # ImplicitProfiler (lazy import)
 _semantic_router: SemanticRouter | None = None
+is_shutting_down: bool = False  # Set True on SIGTERM; triggers 503 for new requests
 logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global pool, _fastembed_model, _nats_cluster, _nats_publisher
-    pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=10)
+    # Conservative pool size: allows 4 pods × 5 = 20 total connections during
+    # rolling deploys. statement_cache_size=0 for PgBouncer compatibility.
+    pool = await asyncpg.create_pool(
+        DATABASE_URL,
+        min_size=1,
+        max_size=5,
+        command_timeout=10,
+        max_inactive_connection_lifetime=30,
+        statement_cache_size=0,
+    )
     
     # Run DB migrations
     try:
@@ -170,15 +182,34 @@ async def lifespan(app: FastAPI):
         _semantic_router = None
 
     yield
+
+    # --- Shutdown (triggered by SIGTERM / SIGINT) ---
+    logger.info("SIGTERM received — beginning graceful shutdown")
+    global is_shutting_down
+    is_shutting_down = True
+
+    # Release PostgreSQL gateway leases so other pods are not blocked
+    if pool:
+        try:
+            from memu.lane_lock import release_all_my_leases
+            await release_all_my_leases(pool)
+        except Exception as exc:
+            logger.warning("Lease release during shutdown failed: %s", exc)
+
     if _implicit_profiler:
         try:
             await _implicit_profiler.stop()
         except Exception:
             pass
     if _nats_cluster:
+        try:
+            await _nats_cluster.active_connection.drain()
+        except Exception:
+            pass
         await _nats_cluster.close()
     if pool:
         await pool.close()
+    logger.info("Graceful shutdown complete")
 
 
 app = FastAPI(
@@ -189,6 +220,22 @@ app = FastAPI(
 )
 
 app.include_router(temporal_router, tags=["Async Workflows"])
+
+
+@app.middleware("http")
+async def shutdown_guard(request: Request, call_next):
+    """Return 503 for new requests when the pod is draining (SIGTERM received).
+
+    This prevents the load balancer from routing new traffic to a dying pod
+    during Railway rolling deploys.
+    """
+    if is_shutting_down:
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "Server is shutting down"},
+        )
+    return await call_next(request)
+
 
 memu_key_header = APIKeyHeader(name="X-MemU-Key", auto_error=False)
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)

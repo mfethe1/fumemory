@@ -222,6 +222,9 @@ async def _nats_to_ws_bridge():
                 continue
 
             nc = cluster.active_connection
+            # Fan-out: every gateway pod must receive broadcasts to check local WS connections.
+            # Intentionally NO queue group — if we used queue="...", only one pod would
+            # receive each message, and users connected to other pods would never see it.
             sub = await nc.subscribe("swarm.>")  # Wildcard: all swarm subjects
 
             logger.info("NATS → WebSocket bridge active")

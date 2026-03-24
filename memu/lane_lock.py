@@ -22,6 +22,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import socket
 from datetime import datetime, timezone, timedelta
 from typing import Any, Callable, Coroutine
 from uuid import UUID
@@ -610,3 +612,41 @@ class FencingTokenError(Exception):
 class RPCError(Exception):
     """Raised when a mesh RPC call fails or times out."""
     pass
+
+
+# ---------------------------------------------------------------------------
+# SIGTERM Lease Cleanup
+# ---------------------------------------------------------------------------
+
+
+def _container_id() -> str:
+    """Return a stable identifier for this container/replica."""
+    return os.environ.get("RAILWAY_REPLICA_ID", socket.gethostname())
+
+
+async def release_all_my_leases(pool: Any) -> int:
+    """Release all gateway_topic_leases owned by this container.
+
+    Called during SIGTERM graceful shutdown to prevent lease deadlocks
+    that would block other pods until TTL expiry.
+
+    Args:
+        pool: asyncpg connection pool.
+
+    Returns:
+        Number of leases released.
+    """
+    container = _container_id()
+    try:
+        async with pool.acquire() as conn:
+            result = await conn.execute(
+                "DELETE FROM gateway_topic_leases WHERE owner_gateway = $1",
+                container,
+            )
+            # asyncpg returns "DELETE N"
+            count = int(result.split()[-1]) if result else 0
+            logger.info("Released %d leases for container %s", count, container)
+            return count
+    except Exception as exc:
+        logger.error("Failed to release leases for %s: %s", container, exc)
+        return 0

@@ -9,7 +9,10 @@
 FROM python:3.11-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    HUGGINGFACE_HUB_CACHE=/data/cache/huggingface \
+    SENTENCE_TRANSFORMERS_HOME=/data/cache/sentence_transformers \
+    TRANSFORMERS_CACHE=/data/cache/transformers
 
 # System deps
 RUN apt-get update && apt-get install -y --no-install-recommends \

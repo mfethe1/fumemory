@@ -81,7 +81,8 @@ class ImplicitProfiler:
         """Subscribe to swarm.chat.* and begin processing."""
         self._running = True
         nc = self._cluster.active_connection
-        self._subscription = await nc.subscribe("swarm.chat.*", cb=self._on_message)
+        # Queue group: only one worker pod extracts preferences per chat batch
+        self._subscription = await nc.subscribe("swarm.chat.*", cb=self._on_message, queue="memu-worker-group")
         logger.info("ImplicitProfiler started — listening on swarm.chat.*")
 
     async def stop(self) -> None:

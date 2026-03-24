@@ -11,7 +11,10 @@
     "restartPolicyMaxRetries": 10,
     "healthcheckPath": "/health",
     "healthcheckPort": 8000,
-    "startCommand": "python -m memu.api"
+    "startCommand": "python -m memu.api",
+    "volumes": {
+      "/data/cache": {}
+    }
   },
   "env": {
     "MEMU_API_KEY": {

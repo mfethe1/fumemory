@@ -99,7 +99,8 @@ class ContradictionEngine:
     async def start(self, nc: Any) -> None:
         """Subscribe to memu.events.ingested."""
         self._running = True
-        self._subscription = await nc.subscribe("memu.events.ingested", cb=self._on_ingested)
+        # Queue group: only one worker pod processes each ingestion event
+        self._subscription = await nc.subscribe("memu.events.ingested", cb=self._on_ingested, queue="memu-worker-group")
         logger.info("ContradictionEngine started — listening on memu.events.ingested")
 
     async def stop(self) -> None:
@@ -275,7 +276,8 @@ class SubconsciousStream:
     async def start(self, nc: Any) -> None:
         """Subscribe to memu.subconscious and start TTL eviction loop."""
         self._running = True
-        self._subscription = await nc.subscribe("memu.subconscious", cb=self._on_broadcast)
+        # Queue group: only one worker pod processes each broadcast
+        self._subscription = await nc.subscribe("memu.subconscious", cb=self._on_broadcast, queue="memu-worker-group")
         self._eviction_task = asyncio.create_task(self._eviction_loop())
         logger.info("SubconsciousStream started — listening on memu.subconscious")
 
