@@ -73,6 +73,8 @@ def _row_to_dict(row) -> dict:
 # --- Endpoints ---
 
 @router.post("/search/hybrid")
+@router.post("/search/recall")
+@router.post("/api/v1/memu/search/recall")
 async def hybrid_search_endpoint(
     req: HybridSearchRequest,
     _key: str = Depends(lambda: _verify_key_fn),
