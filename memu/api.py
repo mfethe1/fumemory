@@ -99,7 +99,7 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global pool, _fastembed_model, _nats_cluster, _nats_publisher
+    global pool, _fastembed_model, _nats_cluster, _nats_publisher, _core_memory_mgr, _implicit_profiler
     # Conservative pool size: allows 4 pods × 5 = 20 total connections during
     # rolling deploys. statement_cache_size=0 for PgBouncer compatibility.
     pool = await asyncpg.create_pool(
