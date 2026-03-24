@@ -510,6 +510,111 @@ async def gdpr_delete_graph_memory(tenant_id: str, user_id: str) -> bool:
         return False
 
 
+# ---------------------------------------------------------------------------
+# Graph Healing Activities (Asynchronous Entity Deduplication)
+# ---------------------------------------------------------------------------
+
+
+@activity.defn
+async def detect_duplicate_graph_nodes(tenant_id: str) -> list[dict]:
+    """Query the tenant's AGE graph for all entity nodes, group by vector
+    similarity (> 0.94), and return clusters of likely-duplicate entities.
+
+    Each cluster is a list of ``{"name": str, "id": str}`` dicts representing
+    graph nodes that an LLM should verify as identical entities.
+
+    This is the *detection* phase only — no mutations are performed.
+    """
+    graph_name = f"tenant_{tenant_id}" if tenant_id else "memu_default"
+    SIMILARITY_THRESHOLD = 0.94
+    clusters: list[dict] = []
+
+    try:
+        conn = await asyncpg.connect(get_db_url())
+        try:
+            # Load AGE extension and set search path
+            await conn.execute("LOAD 'age';")
+            await conn.execute("SET search_path = ag_catalog, '$user', public;")
+
+            # Fetch all entity nodes from the tenant graph
+            try:
+                rows = await conn.fetch(
+                    f"SELECT * FROM ag_catalog.cypher('{graph_name}', "
+                    f"$$ MATCH (n) RETURN n.id AS id, n.name AS name $$) "
+                    f"AS (id agtype, name agtype);"
+                )
+            except Exception:
+                activity.logger.info(
+                    "Graph '%s' does not exist or has no nodes — skipping healing",
+                    graph_name,
+                )
+                return []
+
+            if len(rows) < 2:
+                return []
+
+            # Build node list with embeddings from the memories table
+            # For each node name, find its embedding in the memories table
+            nodes: list[dict] = []
+            for row in rows:
+                name = str(row["name"]).strip('"') if row["name"] else None
+                node_id = str(row["id"]).strip('"') if row["id"] else None
+                if name and node_id:
+                    # Look up embedding from memories table by content similarity
+                    emb_row = await conn.fetchrow(
+                        "SELECT embedding FROM memories "
+                        "WHERE content ILIKE $1 AND embedding IS NOT NULL LIMIT 1",
+                        f"%{name[:50]}%",
+                    )
+                    embedding = None
+                    if emb_row and emb_row["embedding"]:
+                        emb = emb_row["embedding"]
+                        if isinstance(emb, str):
+                            try:
+                                import json as _json
+                                embedding = _json.loads(emb.replace("(", "[").replace(")", "]"))
+                            except Exception:
+                                pass
+                    nodes.append({"id": node_id, "name": name, "embedding": embedding})
+
+            # Greedy clustering by cosine similarity > threshold
+            from memu.memory_agent import cosine_similarity
+
+            clustered_ids: set[str] = set()
+            for i, node_a in enumerate(nodes):
+                if node_a["id"] in clustered_ids or not node_a.get("embedding"):
+                    continue
+                cluster = [{"id": node_a["id"], "name": node_a["name"]}]
+                clustered_ids.add(node_a["id"])
+
+                for node_b in nodes[i + 1:]:
+                    if node_b["id"] in clustered_ids or not node_b.get("embedding"):
+                        continue
+                    sim = cosine_similarity(node_a["embedding"], node_b["embedding"])
+                    if sim > SIMILARITY_THRESHOLD:
+                        cluster.append({"id": node_b["id"], "name": node_b["name"]})
+                        clustered_ids.add(node_b["id"])
+
+                if len(cluster) >= 2:
+                    clusters.append({
+                        "tenant_id": tenant_id,
+                        "graph_name": graph_name,
+                        "nodes": cluster,
+                        "count": len(cluster),
+                    })
+
+            activity.logger.info(
+                "Graph healing: found %d duplicate clusters in graph '%s'",
+                len(clusters), graph_name,
+            )
+        finally:
+            await conn.close()
+    except Exception as e:
+        activity.logger.error("Graph healing detection failed for %s: %s", tenant_id, e)
+
+    return clusters
+
+
 # Export for worker registration
 GenerateEmbeddingActivity = generate_embedding
 StoreMemoryActivity = store_memory
@@ -523,3 +628,4 @@ InjectProspectiveMemoryActivity = inject_prospective_memory
 GDPRDeleteKVMemoryActivity = gdpr_delete_kv_memory
 GDPRDeleteVectorMemoryActivity = gdpr_delete_vector_memory
 GDPRDeleteGraphMemoryActivity = gdpr_delete_graph_memory
+DetectDuplicateGraphNodesActivity = detect_duplicate_graph_nodes

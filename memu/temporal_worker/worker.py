@@ -18,11 +18,13 @@ from memu.temporal_worker.activities import (
     gdpr_delete_kv_memory,
     gdpr_delete_vector_memory,
     gdpr_delete_graph_memory,
+    detect_duplicate_graph_nodes,
 )
 from memu.temporal_worker.workflows import (
     MemoryIngestionWorkflow,
     MemorySearchWorkflow,
     GDPRScrubWorkflow,
+    GraphHealingWorkflow,
 )
 from memu.skill_loader import get_skill_registry
 
@@ -48,7 +50,7 @@ async def main():
     worker = Worker(
         client,
         task_queue="memu-queue",
-        workflows=[MemoryIngestionWorkflow, MemorySearchWorkflow, GDPRScrubWorkflow],
+        workflows=[MemoryIngestionWorkflow, MemorySearchWorkflow, GDPRScrubWorkflow, GraphHealingWorkflow],
         activities=[
             store_memory,
             search_memory,
@@ -57,6 +59,7 @@ async def main():
             gdpr_delete_kv_memory,
             gdpr_delete_vector_memory,
             gdpr_delete_graph_memory,
+            detect_duplicate_graph_nodes,
         ],
     )
 

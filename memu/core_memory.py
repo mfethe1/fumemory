@@ -296,8 +296,24 @@ class CoreMemoryManager:
         Raises:
             PermissionError: If caller violates write-access rules.
             CASConflictError: If CAS fails after MAX_CAS_RETRIES.
-            ValueError: If content exceeds token budget.
+            ValueError: If content exceeds token budget or is quarantined.
         """
+        # Cognitive Firewall — sanitize all writes against prompt injection
+        try:
+            from memu.memory_agent import sanitize_memory_payload
+            is_safe, matched = sanitize_memory_payload(content)
+            if not is_safe:
+                logger.warning(
+                    "Cognitive Firewall BLOCKED write to %s/%s — "
+                    "quarantined pattern: '%s'",
+                    agent_id, block.value, matched,
+                )
+                raise ValueError(
+                    f"Content quarantined: prompt injection detected (pattern: {matched})"
+                )
+        except ImportError:
+            pass  # memory_agent not available — skip firewall
+
         # Permission enforcement
         if caller == "agent" and block not in AGENT_WRITABLE_BLOCKS:
             raise PermissionError(

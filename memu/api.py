@@ -621,6 +621,35 @@ def _entity_overlap_score(query: str, content: str) -> float:
     return len(q_entities & c_entities) / len(q_entities)
 
 
+def _rerank_lost_in_middle(results: list) -> list:
+    """'Pre-Frontal Cortex' re-ranking to mitigate LLM 'Lost in the Middle' bias.
+
+    LLMs naturally attend more strongly to items at the very top and very bottom
+    of their context window, and tend to ignore the middle. This re-arranges the
+    result list so that:
+      - Top 20% most salient items → placed at the VERY TOP
+      - Next 20% most salient items → placed at the VERY BOTTOM
+      - Remaining 60%               → placed in the MIDDLE
+
+    The input list must already be sorted by ``final_score`` descending.
+    """
+    n = len(results)
+    if n <= 2:
+        return results  # nothing to re-arrange
+
+    top_count = max(1, n // 5)       # 20%
+    bottom_count = max(1, n // 5)    # 20%
+    # Ensure we don't over-allocate for very small lists
+    if top_count + bottom_count >= n:
+        return results
+
+    top = results[:top_count]
+    bottom = results[top_count:top_count + bottom_count]
+    middle = results[top_count + bottom_count:]
+
+    return top + middle + bottom
+
+
 def _parse_optional_iso(value: str | None) -> datetime | None:
     if not value:
         return None
@@ -650,6 +679,8 @@ async def memu_health_compat():
 @app.post("/memories", response_model=Memory)
 async def create_memory(req: MemoryCreate, _key: str = Depends(verify_api_key)):
     normalized_metadata = _ensure_memory_metadata(req.metadata)
+    # ABAC: persist allowed_roles in metadata for vector-level access control
+    normalized_metadata["allowed_roles"] = req.allowed_roles or ["*"]
     superseded_ids = _extract_superseding_targets(
         normalized_metadata,
         supersedes=req.supersedes,
@@ -996,6 +1027,17 @@ async def search_memories(req: SearchRequest, _key: str = Depends(verify_api_key
         params.append(req.time_window_end)
         idx += 1
 
+    # ABAC: hard WHERE clause — filter by agent_roles BEFORE ANN similarity
+    # Uses JSONB array overlap (&&) to intersect caller roles with allowed_roles.
+    # Memories with '*' in allowed_roles are accessible to all agents.
+    if req.agent_roles:
+        filters.append(
+            f"(metadata->'allowed_roles' @> '\"*\"'::jsonb "
+            f"OR metadata->'allowed_roles' && ${idx}::jsonb)"
+        )
+        params.append(json.dumps(req.agent_roles))
+        idx += 1
+
     where = (" AND " + " AND ".join(filters)) if filters else ""
     async with _tenant_conn(_key) as conn:
         try:
@@ -1089,6 +1131,10 @@ async def search_memories(req: SearchRequest, _key: str = Depends(verify_api_key
         )
     results.sort(key=lambda r: r.final_score, reverse=True)
     final = results[: req.limit]
+
+    # "Pre-Frontal Cortex" re-ranking: mitigate LLM "Lost in the Middle" bias.
+    # Top 20% → top, next 20% → bottom, remaining 60% → middle.
+    final = _rerank_lost_in_middle(final)
 
     # Audit Trail: Log Search History (reuse the embedding we already computed)
     try:

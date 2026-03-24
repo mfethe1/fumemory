@@ -39,6 +39,7 @@ class MemoryCreate(BaseModel):
     supersedes: UUID | None = None
     invalidates: list[UUID] = Field(default_factory=list)
     salience_score: float = Field(0.5, ge=0.0, le=1.0, description="Salience: 0.0=routine, 1.0=critical")
+    allowed_roles: list[str] = Field(default_factory=lambda: ["*"], description="ABAC: roles that may access this memory. ['*'] = unrestricted.")
 
 class Memory(BaseModel):
     id: UUID
@@ -69,6 +70,7 @@ class SearchRequest(BaseModel):
     time_window_start: datetime | None = None
     time_window_end: datetime | None = None
     entity_weight: float = 0.15
+    agent_roles: list[str] | None = Field(None, description="ABAC: caller's roles for access filtering. None = no filtering.")
 
 class SearchResult(BaseModel):
     memory: Memory

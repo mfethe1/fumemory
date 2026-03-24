@@ -199,3 +199,49 @@ class GDPRScrubWorkflow:
             "vector_rows_deleted": rows_deleted,
             "graph_deleted": graph_ok,
         }
+
+
+@workflow.defn
+class GraphHealingWorkflow:
+    """Asynchronous Graph Healing — detects and flags duplicate entities.
+
+    Scheduled to run weekly per tenant. Queries the tenant's Apache AGE graph
+    for all entity nodes, groups them by vector similarity (> 0.94), and
+    returns clusters of likely-duplicate entities for downstream LLM verification.
+
+    This is the *detection scaffold* only — the complex Cypher merge step
+    is deferred to a future iteration once the detection accuracy is validated.
+    """
+
+    @workflow.run
+    async def run(self, tenant_id: str) -> dict:
+        # 1. Detect duplicate node clusters via vector similarity
+        clusters = await workflow.execute_activity(
+            "detect_duplicate_graph_nodes",
+            args=[tenant_id],
+            start_to_close_timeout=timedelta(seconds=120),
+        )
+
+        if not clusters:
+            return {
+                "status": "clean",
+                "tenant_id": tenant_id,
+                "clusters_found": 0,
+            }
+
+        # 2. Log audit trail for review
+        await workflow.execute_activity(
+            "log_audit",
+            args=["GRAPH_HEALING_SCAN", f"tenant:{tenant_id}", {
+                "clusters_found": len(clusters),
+                "sample_cluster": clusters[0] if clusters else None,
+            }],
+            start_to_close_timeout=timedelta(seconds=30),
+        )
+
+        return {
+            "status": "duplicates_detected",
+            "tenant_id": tenant_id,
+            "clusters_found": len(clusters),
+            "clusters": clusters,
+        }

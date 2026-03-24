@@ -82,6 +82,73 @@ async def ensure_tenant_graph(conn: asyncpg.Connection, tenant_id: str | None = 
     except Exception:
         pass  # Graph already exists
     return graph_name
+
+
+# ---------------------------------------------------------------------------
+# Cognitive Firewall — Prompt Injection Heuristic Sanitizer
+# ---------------------------------------------------------------------------
+
+# Common prompt injection patterns (case-insensitive heuristic match)
+_INJECTION_PATTERNS: list[str] = [
+    "ignore previous instructions",
+    "ignore all previous",
+    "disregard previous",
+    "disregard all previous",
+    "system override",
+    "override system prompt",
+    "new system prompt",
+    "you are now",
+    "act as if",
+    "pretend you are",
+    "forget everything",
+    "forget your instructions",
+    "ignore your training",
+    "ignore your programming",
+    "do not follow",
+    "bypass safety",
+    "bypass your",
+    "jailbreak",
+    "DAN mode",
+    "developer mode enabled",
+    "\\[system\\]",
+    "\\[INST\\]",
+    "<\\|im_start\\|>system",
+    "### Instruction:",
+    "### System:",
+]
+
+import re as _re
+
+_COMPILED_PATTERNS = [_re.compile(p, _re.IGNORECASE) for p in _INJECTION_PATTERNS]
+
+
+def sanitize_memory_payload(text: str) -> tuple[bool, str | None]:
+    """Scan *text* for common prompt-injection patterns.
+
+    Returns:
+        (is_safe, matched_pattern):
+            - ``(True, None)`` if the text passes all heuristic checks.
+            - ``(False, pattern)`` if a suspicious pattern was detected.
+              The caller should drop the write, log a SecurityWarning,
+              and flag the memory as quarantined.
+    """
+    if not text:
+        return True, None
+
+    for pattern in _COMPILED_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            log.warning(
+                "SecurityWarning: Cognitive Firewall triggered — "
+                "prompt injection pattern detected: '%s' in text: '%.100s…'",
+                match.group(),
+                text,
+            )
+            return False, match.group()
+
+    return True, None
+
+
 MIN_CLUSTER_SIZE = int(os.environ.get("MIN_CLUSTER_SIZE", "3"))
 MAX_CLUSTER_SIZE = int(os.environ.get("MAX_CLUSTER_SIZE", "25"))
 IDLE_POLL_INTERVAL = int(os.environ.get("IDLE_POLL_SECONDS", "300"))
