@@ -18,6 +18,8 @@ class MemoryType(str, Enum):
     lesson = "lesson"
     user_action = "user_action"
     external = "external"
+    # Procedural memory — parameterized skill templates (Phase 3)
+    procedural = "procedural"
 
 class Relationship(BaseModel):
     """Graph-Lite entity/relationship tag for memory connections."""
@@ -36,6 +38,7 @@ class MemoryCreate(BaseModel):
     relationships: list[Relationship] = Field(default_factory=list, description="Graph-Lite entity/relationship tags")
     supersedes: UUID | None = None
     invalidates: list[UUID] = Field(default_factory=list)
+    salience_score: float = Field(0.5, ge=0.0, le=1.0, description="Salience: 0.0=routine, 1.0=critical")
 
 class Memory(BaseModel):
     id: UUID
@@ -47,6 +50,8 @@ class Memory(BaseModel):
     confidence: float
     access_count: int
     decay_score: Optional[float] = None
+    salience_score: float = 0.5
+    searchable: bool = True
     created_at: datetime
     updated_at: datetime
 

@@ -13,11 +13,12 @@ import nats
 from nats.js import JetStreamContext
 from nats.js.kv import KeyValue
 
+from memu.nats_config import primary_nats_url
 from memu.swarm_models import GatewayStatus
 
 logger = logging.getLogger(__name__)
 
-NATS_URL = os.environ.get("NATS_URL", "nats://localhost:4222")
+NATS_URL = primary_nats_url()
 
 class StateManager:
     def __init__(self, gateway_id: str, nats_url: str = NATS_URL):

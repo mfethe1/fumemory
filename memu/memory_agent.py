@@ -774,3 +774,153 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+
+# ===========================================================================
+# Phase 2: Semantic Ingestion Pipeline — Triplet Extraction + Entity Resolution
+# ===========================================================================
+
+from enum import Enum as StdEnum
+from pydantic import BaseModel as PydanticBaseModel, Field as PydanticField
+
+import httpx
+
+
+class RelationshipType(str, StdEnum):
+    """Allowed relationship types for the knowledge graph.
+    ALL triplet predicates MUST be one of these values.
+    """
+    RELATES_TO = "RELATES_TO"
+    DEPENDS_ON = "DEPENDS_ON"
+    CAUSES = "CAUSES"
+    CAUSED_BY = "CAUSED_BY"
+    PART_OF = "PART_OF"
+    CONTAINS = "CONTAINS"
+    USES = "USES"
+    USED_BY = "USED_BY"
+    CREATED_BY = "CREATED_BY"
+    CREATES = "CREATES"
+    MODIFIES = "MODIFIES"
+    MODIFIED_BY = "MODIFIED_BY"
+    TRIGGERS = "TRIGGERS"
+    TRIGGERED_BY = "TRIGGERED_BY"
+    SUPERSEDES = "SUPERSEDES"
+    CONTRADICTS = "CONTRADICTS"
+    DERIVED_FROM = "DERIVED_FROM"
+    SIMILAR_TO = "SIMILAR_TO"
+    INSTANCE_OF = "INSTANCE_OF"
+    OWNS = "OWNS"
+    OWNED_BY = "OWNED_BY"
+    COMMUNICATES_WITH = "COMMUNICATES_WITH"
+    LOCATED_IN = "LOCATED_IN"
+    OCCURRED_AT = "OCCURRED_AT"
+    PRECEDED_BY = "PRECEDED_BY"
+    FOLLOWED_BY = "FOLLOWED_BY"
+
+
+class Triplet(PydanticBaseModel):
+    subject: str = PydanticField(..., min_length=1, max_length=256)
+    predicate: RelationshipType
+    object: str = PydanticField(..., min_length=1, max_length=256)
+    confidence: float = PydanticField(0.8, ge=0.0, le=1.0)
+
+
+class TripletExtractionResult(PydanticBaseModel):
+    triplets: list[Triplet] = PydanticField(default_factory=list)
+
+
+class EntityResolutionResult(PydanticBaseModel):
+    is_same_entity: bool
+    reasoning: str = ""
+
+
+TRIPLET_LLM_BASE_URL = os.environ.get("TRIPLET_LLM_URL", os.environ.get("PROFILER_LLM_URL", "https://api.openai.com/v1"))
+TRIPLET_LLM_MODEL = os.environ.get("TRIPLET_LLM_MODEL", os.environ.get("PROFILER_LLM_MODEL", "gpt-4o-mini"))
+TRIPLET_LLM_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+ENTITY_SIMILARITY_THRESHOLD = 0.90
+MAX_TRIPLETS_PER_TEXT = 10
+
+EXTRACTION_SYSTEM_PROMPT = """\
+You are a knowledge graph extraction engine. Extract [Subject, Predicate, Object] triplets.
+Predicate MUST be one of: {predicates}
+Output JSON: {{"triplets": [{{"subject": "...", "predicate": "...", "object": "...", "confidence": 0.0-1.0}}]}}
+"""
+
+ENTITY_RESOLUTION_PROMPT = """\
+Are these two entities the exact same thing?
+Entity A: "{entity_a}" | Entity B: "{entity_b}"
+Output JSON: {{"is_same_entity": true/false, "reasoning": "..."}}
+"""
+
+
+async def _call_triplet_llm_json(system: str, user: str, max_tokens: int = 1000) -> dict | None:
+    if not TRIPLET_LLM_API_KEY:
+        return None
+    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {TRIPLET_LLM_API_KEY}"}
+    payload = {
+        "model": TRIPLET_LLM_MODEL,
+        "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+        "max_tokens": max_tokens, "temperature": 0.1,
+        "response_format": {"type": "json_object"},
+    }
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.post(f"{TRIPLET_LLM_BASE_URL}/chat/completions", headers=headers, json=payload)
+            resp.raise_for_status()
+            return json.loads(resp.json()["choices"][0]["message"]["content"])
+    except Exception as exc:
+        log.warning("Triplet LLM call failed: %s", exc)
+        return None
+
+
+async def extract_triplets(text: str) -> list[Triplet]:
+    predicates = ", ".join(r.value for r in RelationshipType)
+    system = EXTRACTION_SYSTEM_PROMPT.format(predicates=predicates)
+    result = await _call_triplet_llm_json(system, f"Extract triplets:\n\n{text[:4000]}")
+    if result is None:
+        return []
+    try:
+        return TripletExtractionResult.model_validate(result).triplets[:MAX_TRIPLETS_PER_TEXT]
+    except Exception:
+        return []
+
+
+async def find_similar_entity(entity_name, get_embedding, pool, threshold=ENTITY_SIMILARITY_THRESHOLD):
+    embedding = None
+    if get_embedding:
+        try:
+            embedding = await get_embedding(entity_name)
+        except Exception:
+            return None
+    if embedding is None or pool is None:
+        return None
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT id, content, 1 - (embedding <=> $1::vector) AS similarity FROM memories WHERE embedding IS NOT NULL ORDER BY embedding <=> $1::vector LIMIT 1",
+            str(embedding),
+        )
+    if not rows:
+        return None
+    row = rows[0]
+    return {"id": str(row["id"]), "content": row["content"], "similarity": float(row["similarity"])} if row["similarity"] >= threshold else None
+
+
+async def verify_entity_match(entity_a, entity_b, context_a="", context_b=""):
+    prompt = ENTITY_RESOLUTION_PROMPT.format(entity_a=entity_a, entity_b=entity_b)
+    result = await _call_triplet_llm_json("You are an entity resolution judge.", prompt, 200)
+    if result is None:
+        return False
+    try:
+        return EntityResolutionResult.model_validate(result).is_same_entity
+    except Exception:
+        return False
+
+
+async def resolve_and_get_node_id(entity_name, context, get_embedding, pool):
+    candidate = await find_similar_entity(entity_name, get_embedding, pool)
+    if candidate is None:
+        return entity_name, False
+    is_same = await verify_entity_match(entity_name, candidate["content"], context, candidate["content"])
+    if is_same:
+        return candidate["content"], True
+    return entity_name, False

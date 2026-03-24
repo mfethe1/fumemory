@@ -21,6 +21,7 @@ from typing import Any
 from nats.aio.client import Client as NATS
 
 from memu.context_isolation import sanitize_agent_message
+from memu.nats_config import primary_nats_url
 from memu.notion_bridge import NotionBridge
 from memu.skill_loader import get_skill_registry
 
@@ -28,7 +29,7 @@ from memu.skill_loader import get_skill_registry
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("memu.worker")
 
-NATS_URL = os.environ.get("NATS_URL", "nats://localhost:4222")
+NATS_URL = primary_nats_url()
 NOTION_API_KEY = os.environ.get("NOTION_API_KEY", "")
 NOTION_TASK_BOARD_ID = os.environ.get("NOTION_TASK_BOARD_ID", "")
 MEMU_BASE_URL = os.environ.get("MEMU_BASE_URL", "http://localhost:8000")
