@@ -326,8 +326,24 @@ def _cypher_string_literal(value: str) -> str:
 # --- Embedding ---
 
 async def get_embedding(text: str) -> list[float] | None:
-    """Get embedding vector from any OpenAI-compatible API (Ollama, OpenAI, etc.).
-    Falls back to FastEmbed (local) if API fails, then None if both fail."""
+    """Get embedding vector via NATS RPC, OpenAI-compatible API, or local FastEmbed.
+
+    Priority:
+      0. NATS RPC to dedicated embedding worker (preferred in production)
+      1. OpenAI-compatible /v1 or Ollama /api endpoint
+      2. Local FastEmbed fallback (for tests and local dev)
+    """
+    # 0. Try NATS RPC to dedicated embedding worker (avoids loading models in Gateway)
+    if _nats_cluster and _nats_cluster.active_connection.is_connected:
+        try:
+            from memu.embeddings_client import get_embedding_via_rpc
+            nc = _nats_cluster.active_connection
+            emb = await get_embedding_via_rpc(nc, text)
+            if emb is not None:
+                return emb
+            # Fall through to local fallbacks if RPC worker is unavailable
+        except Exception as exc:
+            logger.debug("Embedding RPC path unavailable: %s", exc)
 
     # 1. Try OpenAI-compatible /v1 or Ollama /api endpoint
     if EMBEDDING_BASE_URL and (OPENAI_API_KEY or "ollama" in EMBEDDING_BASE_URL) and "BAAI" not in EMBEDDING_MODEL:
@@ -371,7 +387,9 @@ async def get_embedding(text: str) -> list[float] | None:
 
         logger.warning("Primary embedding API failed, trying FastEmbed fallback")
 
-    # 2. Try FastEmbed (Local fallback)
+    # 2. Try FastEmbed (Local fallback — prefer RPC in production)
+    # TODO: Remove fastembed from requirements.txt once all environments use
+    # the dedicated embedding worker (scripts/embedding_worker.py).
     global _fastembed_model
     try:
         if _fastembed_model is None:

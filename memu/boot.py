@@ -358,6 +358,16 @@ async def main():
         logger.info("Graceful shutdown: releasing resources...")
         if heartbeat_task:
             heartbeat_task.cancel()
+
+        # Release gateway_topic_leases so other pods are not blocked until TTL expiry
+        try:
+            from memu.lane_lock import release_all_my_leases
+            from memu import api as _api_mod
+            if _api_mod.pool:
+                await release_all_my_leases(_api_mod.pool)
+        except Exception as exc:
+            logger.warning("Lease release during boot.py shutdown failed: %s", exc)
+
         if cluster:
             # Publish draining status before exit
             try:
@@ -370,6 +380,11 @@ async def main():
                         "reason": "graceful_shutdown",
                     }).encode(),
                 )
+            except Exception:
+                pass
+            # Drain NATS before closing to flush in-flight messages
+            try:
+                await cluster.active_connection.drain()
             except Exception:
                 pass
             await cluster.close()

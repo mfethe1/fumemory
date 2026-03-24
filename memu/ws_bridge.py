@@ -39,6 +39,23 @@ cluster: NATSClusterManager | None = None
 ledger: BridgeLedger = BridgeLedger()
 connected_clients: set[WebSocket] = set()
 
+# Per-user connection registry for targeted message delivery.
+# Maps user_id/agent_id → WebSocket so that user-specific chat messages
+# are forwarded only to the pod where that user is connected.
+_active_connections: dict[str, WebSocket] = {}
+
+
+def register_connection(user_id: str, ws: WebSocket) -> None:
+    """Register a user-specific WebSocket connection on this pod."""
+    _active_connections[user_id] = ws
+    logger.info("Registered user connection: %s (%d active)", user_id, len(_active_connections))
+
+
+def unregister_connection(user_id: str) -> None:
+    """Remove a user-specific WebSocket connection from this pod."""
+    _active_connections.pop(user_id, None)
+    logger.info("Unregistered user connection: %s (%d active)", user_id, len(_active_connections))
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -250,6 +267,17 @@ async def _nats_to_ws_bridge():
                             disconnected.add(client)
 
                     connected_clients.difference_update(disconnected)
+
+                    # Per-user targeted delivery: if the message contains a
+                    # user_id or agent_id, forward directly to that user's
+                    # WebSocket (if connected to THIS pod). Silently ignored
+                    # if the user is connected to a different pod.
+                    target_id = data.get("user_id") or data.get("agent_id")
+                    if target_id and target_id in _active_connections:
+                        try:
+                            await _active_connections[target_id].send_json(ws_msg)
+                        except Exception:
+                            unregister_connection(target_id)
 
                 except json.JSONDecodeError:
                     logger.debug(f"Non-JSON message on {msg.subject}")
