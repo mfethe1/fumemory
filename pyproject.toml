@@ -39,6 +39,9 @@ Consulting = "https://protelynx.ai"
 [project.scripts]
 memu = "memu.api:app"
 
+[tool.hatch.build.targets.wheel]
+packages = ["memu"]
+
 [tool.ruff]
 line-length = 100
 target-version = "py310"
