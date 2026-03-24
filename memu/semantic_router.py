@@ -101,17 +101,19 @@ class SemanticRouter:
         Returns:
             True if initialization succeeded.
         """
+        import asyncio
         embeddings = []
         targets = []
 
-        for description, target in INTENT_ANCHORS:
-            try:
-                emb = await get_embedding(description)
-                if emb is not None:
-                    embeddings.append(emb)
-                    targets.append(target)
-            except Exception as exc:
-                logger.warning("Failed to embed anchor '%s': %s", description[:50], exc)
+        tasks = [get_embedding(description) for description, _ in INTENT_ANCHORS]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        for (description, target), result in zip(INTENT_ANCHORS, results):
+            if isinstance(result, Exception):
+                logger.warning("Failed to embed anchor '%s': %s", description[:50], result)
+            elif result is not None:
+                embeddings.append(result)
+                targets.append(target)
 
         if not embeddings:
             logger.warning("SemanticRouter: no anchors embedded, routing disabled")

@@ -108,15 +108,24 @@ async def get_embedding(text: str, nc: Any = None) -> list[float] | None:
                         await _kv_put(nc, cache_key, embedding)
                     return embedding
 
-                if resp.status_code == 429 and attempt < _MAX_RETRIES:
-                    delay = _BASE_DELAY_S * (2 ** attempt) + random.uniform(0, _MAX_JITTER_S)
-                    logger.warning(
-                        "Embedding API rate-limited (429), retry %d/%d in %.1fs",
-                        attempt + 1, _MAX_RETRIES, delay,
-                    )
-                    import asyncio
-                    await asyncio.sleep(delay)
-                    continue
+                if resp.status_code == 429:
+                    try:
+                        err_data = resp.json().get("error", {})
+                        if err_data.get("code") == "insufficient_quota" or err_data.get("type") == "insufficient_quota":
+                            logger.error("Embedding API quota exceeded. Aborting retries.")
+                            return None
+                    except Exception:
+                        pass
+                    
+                    if attempt < _MAX_RETRIES:
+                        delay = _BASE_DELAY_S * (2 ** attempt) + random.uniform(0, _MAX_JITTER_S)
+                        logger.warning(
+                            "Embedding API rate-limited (429), retry %d/%d in %.1fs",
+                            attempt + 1, _MAX_RETRIES, delay,
+                        )
+                        import asyncio
+                        await asyncio.sleep(delay)
+                        continue
 
                 logger.warning(
                     "Embedding API error: HTTP %d — %s",
