@@ -273,7 +273,9 @@ def _dream_idempotency_key(agent_id: str, source_episode_ids: list[str]) -> str:
     produce the same key and can detect duplicate rules.
     """
     sorted_ids = sorted(str(eid) for eid in source_episode_ids if eid)
-    payload = f"{agent_id}:{','.join(sorted_ids)}"
+    # Use ::: as delimiter — cannot appear in UUIDs or agent IDs,
+    # preventing collisions like agent="a" + episodes=["b,c"] vs ["b","c"]
+    payload = f"{agent_id}:::{','.join(sorted_ids)}"
     return hashlib.md5(payload.encode()).hexdigest()
 
 
@@ -289,46 +291,55 @@ async def store_dream_rule(agent_id: str, rule_text: str, source_episode_ids: li
 
     conn = await asyncpg.connect(get_db_url())
     try:
-        # Check for existing rule with same idempotency key
-        existing = await conn.fetchrow(
-            """
-            SELECT id FROM memories
-            WHERE agent_id = $1
-              AND memory_type = 'reflection'
-              AND metadata->>'idempotency_key' = $2
-            LIMIT 1
-            """,
-            agent_id,
-            idempotency_key,
-        )
-        if existing:
-            activity.logger.info(
-                "Dream rule already exists (idempotency_key=%s), returning existing ID %s",
-                idempotency_key, existing["id"],
-            )
-            return str(existing["id"])
-
         # Generate embedding for the rule
         embedding = await generate_embedding(rule_text)
 
+        metadata = json.dumps({
+            "source": "dream_consolidation",
+            "source_episode_ids": source_episode_ids,
+            "idempotency_key": idempotency_key,
+        })
+
+        # Single-statement atomic upsert: eliminates TOCTOU race between
+        # SELECT and INSERT that could create duplicates on Temporal retries.
+        # Uses partial unique index uq_memories_idempotency_key (migration 017).
         row = await conn.fetchrow(
             """
             INSERT INTO memories (content, agent_id, memory_type, salience_score,
                                   metadata, embedding)
             VALUES ($1, $2, 'reflection', 0.90,
                     $3::jsonb, $4::vector)
+            ON CONFLICT ((metadata->>'idempotency_key'))
+                WHERE metadata->>'idempotency_key' IS NOT NULL
+            DO NOTHING
             RETURNING id
             """,
             rule_text,
             agent_id,
-            json.dumps({
-                "source": "dream_consolidation",
-                "source_episode_ids": source_episode_ids,
-                "idempotency_key": idempotency_key,
-            }),
+            metadata,
             str(embedding) if embedding else None,
         )
-        rule_id = str(row["id"])
+
+        if row:
+            # New row inserted
+            rule_id = str(row["id"])
+        else:
+            # DO NOTHING fired — fetch existing ID
+            existing = await conn.fetchrow(
+                """
+                SELECT id FROM memories
+                WHERE agent_id = $1
+                  AND metadata->>'idempotency_key' = $2
+                LIMIT 1
+                """,
+                agent_id,
+                idempotency_key,
+            )
+            rule_id = str(existing["id"]) if existing else "unknown"
+            activity.logger.info(
+                "Dream rule already exists (idempotency_key=%s), returning existing ID %s",
+                idempotency_key, rule_id,
+            )
 
         # Create DERIVED_FROM edges in Apache AGE (best-effort, idempotent MERGE)
         try:

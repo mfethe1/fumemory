@@ -95,13 +95,26 @@ def count_tokens(text: str) -> int:
     return max(1, len(text) // 4)
 
 
-def token_safe_truncate(data: list | dict, max_tokens: int) -> list | dict:
-    """Truncate a list or dict by removing the oldest/last items until the
+def token_safe_truncate(
+    data: list | dict,
+    max_tokens: int,
+    protected_keys: set[str] | None = None,
+) -> list | dict:
+    """Truncate a list or dict by removing the oldest items until the
     JSON serialization fits within *max_tokens*.
 
     This avoids raw string slicing which would corrupt JSON structure.
-    Items are popped from the end of lists or the first-inserted key of dicts.
+    Items are popped from the front of lists (oldest first) or the
+    first-inserted key of dicts (respecting ``protected_keys``).
     Returns a *new* (shallow-copied) container — the original is not mutated.
+
+    Args:
+        data: The list or dict to truncate.
+        max_tokens: Target token budget.
+        protected_keys: (dicts only) Keys that must never be evicted.
+            If all non-protected keys are exhausted and the dict still
+            exceeds *max_tokens*, a warning is logged and the dict is
+            returned as-is.
 
     If a single remaining item still exceeds the budget, it is kept to avoid
     returning an empty container (caller should handle oversized singletons).
@@ -112,13 +125,21 @@ def token_safe_truncate(data: list | dict, max_tokens: int) -> list | dict:
             data.pop(0)  # remove oldest entry
     elif isinstance(data, dict):
         data = dict(data)  # shallow copy
-        keys = list(data.keys())
+        protected = protected_keys or set()
+        # Build list of evictable keys (insertion order, skip protected)
+        evictable = [k for k in data.keys() if k not in protected]
         idx = 0
         while len(data) > 1 and count_tokens(json.dumps(data)) > max_tokens:
-            if idx < len(keys):
-                del data[keys[idx]]
+            if idx < len(evictable):
+                del data[evictable[idx]]
                 idx += 1
             else:
+                # All non-protected keys exhausted — cannot shrink further
+                logger.warning(
+                    "token_safe_truncate: dict still exceeds %d tokens after "
+                    "evicting all non-protected keys (protected=%s)",
+                    max_tokens, protected,
+                )
                 break
     return data
 
@@ -301,6 +322,7 @@ class CoreMemoryManager:
         key = self._key(agent_id, block)
         data = content.encode()
 
+        # Full replacement — content is caller-supplied, only revision needs refresh
         revision = expected_revision
         for attempt in range(1, MAX_CAS_RETRIES + 1):
             try:
@@ -409,12 +431,30 @@ class CoreMemoryManager:
         *,
         caller: str = "agent",
     ) -> BlockEntry:
-        """Replace *old_text* with *new_text* inside a block (CAS-protected)."""
+        """Replace *old_text* with *new_text* inside a block (CAS-protected).
+
+        Inlines CAS write logic to avoid nested retry loops (replace_in_block
+        previously delegated to update_block which has its own retry loop,
+        creating up to 5×5 = 25 attempts). Now: single flat retry loop that
+        re-reads latest state on each conflict and re-applies the replacement.
+        """
+        # Permission enforcement
+        if caller == "agent" and block not in AGENT_WRITABLE_BLOCKS:
+            raise PermissionError(
+                f"Agents may only write to {[b.value for b in AGENT_WRITABLE_BLOCKS]}; "
+                f"got {block.value}"
+            )
+        if caller == "worker" and block not in WORKER_WRITABLE_BLOCKS:
+            raise PermissionError(
+                f"Workers may only write to {[b.value for b in WORKER_WRITABLE_BLOCKS]}; "
+                f"got {block.value}"
+            )
+
         kv = await self.ensure_bucket()
         key = self._key(agent_id, block)
 
-        revision = expected_revision
         for attempt in range(1, MAX_CAS_RETRIES + 1):
+            # (1) Fetch latest content + revision
             try:
                 entry = await kv.get(key)
                 current = entry.value.decode() if entry.value else ""
@@ -422,15 +462,42 @@ class CoreMemoryManager:
             except KeyNotFoundError:
                 raise ValueError(f"Block {block.value} does not exist for agent {agent_id}")
 
+            # (2) Verify old_text exists in current content
             if old_text not in current:
                 raise ValueError(
                     f"old_text not found in {block.value} for agent {agent_id}"
                 )
 
+            # (3) Compute new content from latest state
             new_content = current.replace(old_text, new_text, 1)
-            return await self.update_block(
-                agent_id, block, new_content, revision, caller=caller
-            )
+
+            # Token budget enforcement
+            tokens = count_tokens(new_content)
+            limit = DEFAULT_TOKEN_LIMITS.get(block, 4_000)
+            if tokens > limit:
+                raise ValueError(
+                    f"Replaced content has {tokens} tokens, exceeding {block.value} limit of {limit}"
+                )
+
+            # (4) Attempt CAS update
+            try:
+                new_rev = await kv.update(key, new_content.encode(), revision)
+                logger.debug(
+                    "CAS replace OK: %s rev %d→%d (attempt %d)",
+                    key, revision, new_rev, attempt,
+                )
+                return BlockEntry(content=new_content, revision=new_rev, tokens=tokens)
+            except Exception as exc:
+                err_str = str(exc).lower()
+                if "wrong last sequence" in err_str or "already in use" in err_str:
+                    delay = CAS_BASE_DELAY * (2 ** (attempt - 1)) + random.uniform(0, CAS_BASE_DELAY)
+                    logger.info(
+                        "CAS conflict in replace on %s (attempt %d/%d), backing off %.3fs",
+                        key, attempt, MAX_CAS_RETRIES, delay,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                raise
 
         raise MemoryConcurrencyError(f"CAS replace failed after {MAX_CAS_RETRIES} retries on {key}")
 

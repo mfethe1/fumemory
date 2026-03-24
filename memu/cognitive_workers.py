@@ -268,6 +268,9 @@ class SubconsciousStream:
         self._subscription = None
         self._running = False
         self._eviction_task: asyncio.Task | None = None
+        # Protects _agent_matrix / _agent_ids from concurrent mutation
+        # (eviction loop vs. check_and_inject reads)
+        self._matrix_lock = asyncio.Lock()
 
     async def start(self, nc: Any) -> None:
         """Subscribe to memu.subconscious and start TTL eviction loop."""
@@ -291,11 +294,20 @@ class SubconsciousStream:
                 pass
 
     def update_agent_vector(self, agent_id: str, embedding: list[float]) -> None:
-        """Update the cached context vector for an active agent (rebuilds matrix row)."""
+        """Update the cached context vector for an active agent (rebuilds matrix row).
+
+        Zero-norm vectors are rejected (would produce invalid dot-product
+        similarities). Callers should pre-validate embeddings.
+        """
         vec = np.array(embedding, dtype=np.float32)
         norm = np.linalg.norm(vec)
-        if norm > 0:
-            vec = vec / norm  # Pre-normalize for fast dot-product similarity
+        if norm == 0:
+            logger.warning(
+                "Skipping zero-norm vector for agent %s — would corrupt similarity matrix",
+                agent_id,
+            )
+            return
+        vec = vec / norm  # Pre-normalize for fast dot-product similarity
 
         self._agent_last_seen[agent_id] = time.monotonic()
 
@@ -333,7 +345,8 @@ class SubconsciousStream:
                     if now - ts > AGENT_TTL_SECONDS
                 ]
                 for aid in stale:
-                    self.remove_agent(aid)
+                    async with self._matrix_lock:
+                        self.remove_agent(aid)
                     logger.debug("Evicted stale agent %s from subconscious matrix", aid)
             except asyncio.CancelledError:
                 break
@@ -375,19 +388,25 @@ class SubconsciousStream:
             return []
         broadcast_vec = broadcast_vec / b_norm
 
-        # Vectorized cosine similarity: single matrix-vector dot product
-        similarities = self._agent_matrix @ broadcast_vec  # shape: (n_agents,)
+        # Lock protects matrix shape from concurrent eviction mutations
+        async with self._matrix_lock:
+            if self._agent_matrix is None or not self._agent_ids:
+                return []
 
+            # Vectorized cosine similarity: single matrix-vector dot product
+            similarities = self._agent_matrix @ broadcast_vec  # shape: (n_agents,)
+
+            # Snapshot agent IDs while under lock (matrix shape is stable)
+            above_threshold = np.where(similarities >= SUBCONSCIOUS_SIMILARITY_THRESHOLD)[0]
+            targets = [
+                (self._agent_ids[idx], float(similarities[idx]))
+                for idx in above_threshold
+                if self._agent_ids[idx] != source_agent
+            ]
+
+        # Injection happens outside lock (CAS writes may be slow)
         injected = []
-        # Only iterate agents that exceed threshold
-        above_threshold = np.where(similarities >= SUBCONSCIOUS_SIMILARITY_THRESHOLD)[0]
-
-        for idx in above_threshold:
-            agent_id = self._agent_ids[idx]
-            if agent_id == source_agent:
-                continue
-
-            similarity = float(similarities[idx])
+        for agent_id, similarity in targets:
             try:
                 entry = await self._core_mem.get_block(agent_id, Block.PRIMED_CACHE)
                 revision = entry.revision if entry else 0

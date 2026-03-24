@@ -37,9 +37,6 @@ MEMU_API_KEY = os.environ.get("MEMU_API_KEY", "")
 DLQ_TOPIC = "memu.dlq.llm_failures"
 MAX_HANDLER_RETRIES = 3
 
-# Track per-message retry counts (subject+data hash → count)
-_msg_retry_counts: dict[str, int] = {}
-
 
 async def process_msg(msg: Any, bridge: NotionBridge) -> None:
     """Process a NATS task event with strict context isolation.
@@ -138,20 +135,21 @@ async def run() -> None:
 
     async def message_handler(msg: Any) -> None:
         logger.info("Received message on '%s'", msg.subject)
-        # Compute a stable key for retry tracking
-        msg_key = f"{msg.subject}:{hash(msg.data)}"
-        retry_count = _msg_retry_counts.get(msg_key, 0)
+
+        # Use JetStream metadata for stateless retry tracking (no local dict).
+        # msg.metadata is available on JetStream push/pull subscriptions.
+        num_delivered = 1
+        if hasattr(msg, "metadata") and msg.metadata:
+            num_delivered = getattr(msg.metadata, "num_delivered", 1) or 1
+
         try:
             await process_msg(msg, bridge)
-            _msg_retry_counts.pop(msg_key, None)  # Clear on success
         except (json.JSONDecodeError, KeyError, ValueError) as e:
-            # Poison message (bad payload) — nak with delay or DLQ
-            retry_count += 1
-            _msg_retry_counts[msg_key] = retry_count
-            if retry_count >= MAX_HANDLER_RETRIES:
+            # Poison message (bad payload) — check delivery count
+            if num_delivered >= MAX_HANDLER_RETRIES:
                 logger.error(
-                    "Poison message on %s after %d attempts, sending to DLQ: %s",
-                    msg.subject, retry_count, e,
+                    "Poison message on %s after %d deliveries, sending to DLQ: %s",
+                    msg.subject, num_delivered, e,
                 )
                 try:
                     dlq_payload = json.dumps({
@@ -163,16 +161,15 @@ async def run() -> None:
                     await nc.publish(DLQ_TOPIC, dlq_payload)
                 except Exception:
                     pass
-                _msg_retry_counts.pop(msg_key, None)
                 if hasattr(msg, "ack"):
                     await msg.ack()  # Clear the poison message
             else:
                 logger.warning(
-                    "Transient error on %s (attempt %d/%d): %s",
-                    msg.subject, retry_count, MAX_HANDLER_RETRIES, e,
+                    "Transient error on %s (delivery %d/%d): %s",
+                    msg.subject, num_delivered, MAX_HANDLER_RETRIES, e,
                 )
                 if hasattr(msg, "nak"):
-                    await msg.nak(delay=retry_count * 2)
+                    await msg.nak(delay=num_delivered * 2)
         except Exception as e:
             logger.exception("Worker message handling failed: %s", e)
             if hasattr(msg, "nak"):

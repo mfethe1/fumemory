@@ -169,7 +169,11 @@ class ImplicitProfiler:
                 "Merged profile for %s exceeds limit (%d > %d tokens), truncating",
                 agent_id, tokens, limit,
             )
-            merged = token_safe_truncate(merged, limit)
+            merged = token_safe_truncate(
+                merged,
+                limit,
+                protected_keys={"communication_style", "preferred_tools", "expertise_areas", "timezone"},
+            )
             merged_json = json.dumps(merged, indent=2)
 
         # CAS write
@@ -244,6 +248,9 @@ class ImplicitProfiler:
                             "LLM rate limited (attempt %d/%d), retrying in %.1fs",
                             attempt, MAX_LLM_RETRIES, retry_after,
                         )
+                        # TODO: If migrated to JetStream consumer, call
+                        # msg.in_progress() during long sleeps to prevent
+                        # AckWait timeout redelivery.
                         await asyncio.sleep(retry_after)
                         continue
 
