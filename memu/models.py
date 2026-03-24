@@ -18,6 +18,8 @@ class MemoryType(str, Enum):
     lesson = "lesson"
     user_action = "user_action"
     external = "external"
+    # Procedural memory — parameterized skill templates (Phase 3)
+    procedural = "procedural"
 
 class MemoryCreate(BaseModel):
     content: str
@@ -26,6 +28,7 @@ class MemoryCreate(BaseModel):
     metadata: dict | None = None
     parent_id: UUID | None = None
     confidence: float = 1.0
+    salience_score: float = Field(0.5, ge=0.0, le=1.0, description="Salience: 0.0=routine, 1.0=critical")
 
 class Memory(BaseModel):
     id: UUID
@@ -37,6 +40,8 @@ class Memory(BaseModel):
     confidence: float
     access_count: int
     decay_score: float | None = None
+    salience_score: float = 0.5
+    searchable: bool = True
     created_at: datetime
     updated_at: datetime
 

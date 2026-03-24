@@ -17,15 +17,16 @@ import asyncio
 import json
 import logging
 import os
-from collections import defaultdict
+from collections import Counter
 from datetime import datetime, timezone
 
 import nats
 
+from memu.nats_config import resolve_nats_endpoints
+
 logger = logging.getLogger(__name__)
 
-NATS_LOCAL_URL = os.environ.get("NATS_LOCAL_URL")
-NATS_RAILWAY_URL = os.environ.get("NATS_RAILWAY_URL")
+NATS_LOCAL_URL, NATS_RAILWAY_URL = resolve_nats_endpoints()
 SUBJECTS = [
     "swarm.>",
 ]
@@ -45,6 +46,28 @@ def _safe_decode(payload: bytes) -> dict | str:
             return payload.decode(errors="replace")
         except Exception:
             return str(payload)
+
+
+def _record_event(subject_counts: Counter[str], type_counts: Counter[str], payload: dict | str, subject: str) -> None:
+    subject_counts[subject] += 1
+    if not isinstance(payload, dict):
+        return
+    event_type = payload.get("event_type") or payload.get("type") or payload.get("status_note")
+    if event_type:
+        type_counts[str(event_type)] += 1
+
+
+def _heartbeat_summary(subject_counts: Counter[str], type_counts: Counter[str], elapsed: float) -> str:
+    return (
+        "consumer heartbeat: total=%s elapsed=%.1fs distinct_subjects=%s top_subjects=%s top_types=%s"
+        % (
+            sum(subject_counts.values()),
+            elapsed,
+            len(subject_counts),
+            subject_counts.most_common(10),
+            type_counts.most_common(10),
+        )
+    )
 
 
 async def _connect_with_fallback():
@@ -74,42 +97,37 @@ async def run_consumer():
             logger.info("Event consumer active on %s", connected_url)
             logger.info("Subjects: %s", subject)
 
-            counters = defaultdict(int)
+            subject_counts: Counter[str] = Counter()
+            type_counts: Counter[str] = Counter()
             start = datetime.now(timezone.utc)
             last_summary = datetime.now(timezone.utc)
 
-            # Prefer wildcard subscribe for now. Keep per-subject summary from parser.
-            sub = await nc.subscribe("swarm.>")
+            subscriptions = [await nc.subscribe(subject) for subject in SUBJECTS]
 
-            async for msg in sub.messages:
+            async def _iter_messages():
+                while True:
+                    pending = [asyncio.create_task(sub.messages.__anext__()) for sub in subscriptions]
+                    done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                    for task in pending:
+                        task.cancel()
+                    for task in done:
+                        yield task.result()
+
+            async for msg in _iter_messages():
                 now = datetime.now(timezone.utc)
                 payload = _safe_decode(msg.data)
-                counters[msg.subject] += 1
-                counters["total"] += 1
+                _record_event(subject_counts, type_counts, payload, msg.subject)
 
                 logger.info("EVENT %s subject=%s", now.isoformat(), msg.subject)
                 logger.debug("payload=%r", payload)
 
                 if isinstance(payload, dict):
-                    event_type = payload.get("event_type") or payload.get("type") or payload.get("status_note")
-                    if event_type:
-                        counters[f"type:{event_type}"] += 1
+                    task_id = payload.get("task_id") or payload.get("gateway_id") or "-"
+                    logger.info(" payload_keys=%s task=%s", list(payload.keys())[:8], task_id)
 
-                    # compact log for common swarm events
-                    if isinstance(payload, dict):
-                        task_id = payload.get("task_id") or payload.get("gateway_id") or "-"
-                        logger.info(" payload_keys=%s task=%s", list(payload.keys())[:8], task_id)
-
-                # Heartbeat summary timer
                 if (now - last_summary).total_seconds() >= SUMMARY_INTERVAL_SECONDS:
                     elapsed = (now - start).total_seconds()
-                    logger.info(
-                        "consumer heartbeat: total=%s elapsed=%.1fs subjects=%s top=%s",
-                        counters.get("total", 0),
-                        elapsed,
-                        len(counters),
-                        sorted(counters.items(), key=lambda kv: kv[1], reverse=True)[:10],
-                    )
+                    logger.info(_heartbeat_summary(subject_counts, type_counts, elapsed))
                     last_summary = now
 
         except Exception as exc:

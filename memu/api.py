@@ -29,6 +29,12 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 logging.getLogger("fastembed").setLevel(logging.WARNING)
 from memu.cluster import NATSClusterManager
+from memu.core_memory import (
+    Block,
+    CoreMemoryManager,
+    CASConflictError,
+)
+from memu.semantic_router import SemanticRouter, SearchTarget
 from memu.nats_publisher import NATSEventPublisher
 from memu.models import (
     BulkImportRequest,
@@ -83,6 +89,9 @@ pool: asyncpg.Pool | None = None
 _fastembed_model: Any = None
 _nats_cluster: NATSClusterManager | None = None
 _nats_publisher: NATSEventPublisher | None = None
+_core_memory_mgr: CoreMemoryManager | None = None
+_implicit_profiler: Any = None  # ImplicitProfiler (lazy import)
+_semantic_router: SemanticRouter | None = None
 logger = logging.getLogger(__name__)
 
 
@@ -121,12 +130,51 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.error(f"Failed to start OTel Exporter: {e}")
 
+        # Initialize Core Memory Manager (NATS KV)
+        try:
+            _core_memory_mgr = CoreMemoryManager(_nats_cluster.jetstream)
+            await _core_memory_mgr.ensure_bucket()
+            logger.info("Core Memory Manager initialized (NATS KV)")
+        except Exception as e:
+            logger.warning("Core Memory Manager init failed: %s", e)
+            _core_memory_mgr = None
+
+        # Start Implicit Profiling Daemon
+        try:
+            from memu.implicit_profiler import ImplicitProfiler
+            if _core_memory_mgr:
+                _implicit_profiler = ImplicitProfiler(_nats_cluster, _core_memory_mgr)
+                asyncio.create_task(_implicit_profiler.start())
+                logger.info("Implicit Profiler daemon started")
+        except Exception as e:
+            logger.warning("Implicit Profiler startup failed: %s", e)
+
     except Exception as e:
         logger.warning("NATS connection failed (API will work without events): %s", e)
         _nats_cluster = None
         _nats_publisher = None
+        _core_memory_mgr = None
+
+    # Initialize Semantic Router (no NATS dependency)
+    global _semantic_router
+    try:
+        _semantic_router = SemanticRouter()
+        ok = await _semantic_router.initialize(get_embedding)
+        if not ok:
+            logger.warning("Semantic Router init failed — falling back to hybrid search")
+            _semantic_router = None
+        else:
+            logger.info("Semantic Router initialized")
+    except Exception as e:
+        logger.warning("Semantic Router init error: %s", e)
+        _semantic_router = None
 
     yield
+    if _implicit_profiler:
+        try:
+            await _implicit_profiler.stop()
+        except Exception:
+            pass
     if _nats_cluster:
         await _nats_cluster.close()
     if pool:
@@ -214,6 +262,18 @@ def _validate_graph_identifier(graph_name: str) -> str:
     if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,62}", normalized):
         raise HTTPException(status_code=422, detail="invalid graph_name")
     return normalized
+
+
+def _cypher_string_literal(value: str) -> str:
+    """Wrap *value* as a safe Cypher double-quoted string literal.
+
+    Escapes backslashes and double-quotes so the result can be embedded
+    directly inside a Cypher string context (e.g. {id: "<value>"}).
+    UUID strings are trivially safe, but routing through this helper
+    ensures consistent, auditable escaping for all Cypher string values.
+    """
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
 
 
 # --- Embedding ---
@@ -304,6 +364,8 @@ def _row_to_memory(row) -> Memory:
         confidence=row["confidence"],
         access_count=row["access_count"],
         decay_score=row["decay_score"],
+        salience_score=float(row.get("salience_score", 0.5) or 0.5),
+        searchable=bool(row.get("searchable", True)),
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )
@@ -659,6 +721,7 @@ async def search_memories(req: SearchRequest, _key: str = Depends(verify_api_key
                 access_count=row["access_count"],
                 decay_rate=DECAY_RATE,
                 temporal_weight=req.temporal_weight,
+                salience_score=float(row.get("salience_score", 0.5) or 0.5),
             )
             results.append(
                 SearchResult(
@@ -796,6 +859,7 @@ async def search_memories(req: SearchRequest, _key: str = Depends(verify_api_key
             access_count=row["access_count"],
             decay_rate=DECAY_RATE,
             temporal_weight=req.temporal_weight,
+            salience_score=float(row.get("salience_score", 0.5) or 0.5),
         )
         entity_overlap = _entity_overlap_score(req.query, row["content"])
         score = (1 - req.entity_weight) * score + (req.entity_weight * entity_overlap)
@@ -1466,14 +1530,25 @@ async def execute_cypher(req: CypherRequest, _key: str = Depends(verify_api_key)
             raise HTTPException(status_code=400, detail=str(e))
 
 @app.get("/api/v1/memu/graph/neighbors/{memory_id}")
-async def get_graph_neighbors(memory_id: UUID, _key: str = Depends(verify_api_key)):
-    """Traverse graph to find 1st degree neighbors of a memory."""
+async def get_graph_neighbors(
+    memory_id: UUID,
+    graph_name: str = "memu_graph",
+    _key: str = Depends(verify_api_key),
+):
+    """Traverse graph to find 1st degree neighbors of a memory.
+
+    Args:
+        memory_id: UUID of the memory vertex to traverse from.
+        graph_name: Name of the AGE graph to query (default: memu_graph).
+    """
+    graph_name = _validate_graph_identifier(graph_name)
+    id_literal = _cypher_string_literal(str(memory_id))
     async with pool.acquire() as conn:
         try:
             await conn.execute("SET search_path = ag_catalog, \"$user\", public")
             cypher_sql = f"""
-            SELECT * FROM cypher('memu_graph', $$ 
-                MATCH (m:Memory {{id: "{memory_id}"}})-[r]-(neighbor:Memory)
+            SELECT * FROM cypher('{graph_name}', $$ 
+                MATCH (m:Memory {{id: {id_literal}}})-[r]-(neighbor:Memory)
                 RETURN type(r) as rel_type, neighbor
             $$) AS (rel_type agtype, neighbor agtype);
             """
@@ -1481,6 +1556,110 @@ async def get_graph_neighbors(memory_id: UUID, _key: str = Depends(verify_api_ke
             return {"ok": True, "neighbors": [dict(r) for r in rows]}
         except Exception as e:
             raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/api/v1/memu/graph/stats")
+async def get_graph_stats(
+    graph_name: str = "memu_graph",
+    _key: str = Depends(verify_api_key),
+):
+    """Return vertex count, edge count, and top relationship types for the knowledge graph.
+
+    Args:
+        graph_name: Name of the AGE graph to inspect (default: memu_graph).
+    """
+    graph_name = _validate_graph_identifier(graph_name)
+    async with pool.acquire() as conn:
+        try:
+            await conn.execute("SET search_path = ag_catalog, \"$user\", public")
+
+            # vertex count
+            v_rows = await conn.fetch(
+                f"SELECT * FROM cypher('{graph_name}', $$ MATCH (n) RETURN count(n) AS cnt $$) AS (cnt agtype);"
+            )
+            vertex_count = int(v_rows[0]["cnt"]) if v_rows else 0
+
+            # edge count
+            e_rows = await conn.fetch(
+                f"SELECT * FROM cypher('{graph_name}', $$ MATCH ()-[r]->() RETURN count(r) AS cnt $$) AS (cnt agtype);"
+            )
+            edge_count = int(e_rows[0]["cnt"]) if e_rows else 0
+
+            # top relation types (up to 10)
+            rt_rows = await conn.fetch(
+                f"""
+                SELECT * FROM cypher('{graph_name}', $$
+                    MATCH ()-[r]->()
+                    RETURN type(r) AS rel_type, count(r) AS cnt
+                    ORDER BY cnt DESC LIMIT 10
+                $$) AS (rel_type agtype, cnt agtype);
+                """
+            )
+            rel_types = [
+                {"rel_type": str(r["rel_type"]).strip('"'), "count": int(r["cnt"])}
+                for r in rt_rows
+            ]
+
+            return {
+                "ok": True,
+                "graph_name": graph_name,
+                "vertex_count": vertex_count,
+                "edge_count": edge_count,
+                "top_rel_types": rel_types,
+            }
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/api/v1/memu/graph/path/{from_id}/{to_id}")
+async def get_graph_path(
+    from_id: UUID,
+    to_id: UUID,
+    graph_name: str = "memu_graph",
+    max_hops: int = 5,
+    _key: str = Depends(verify_api_key),
+):
+    """Find the shortest path between two memory vertices in the knowledge graph.
+
+    Args:
+        from_id: UUID of the source memory vertex.
+        to_id: UUID of the target memory vertex.
+        graph_name: Name of the AGE graph to query (default: memu_graph).
+        max_hops: Maximum path length to search (default: 5, max: 10).
+    """
+    if max_hops < 1 or max_hops > 10:
+        raise HTTPException(status_code=422, detail="max_hops must be between 1 and 10")
+    graph_name = _validate_graph_identifier(graph_name)
+    from_literal = _cypher_string_literal(str(from_id))
+    to_literal = _cypher_string_literal(str(to_id))
+    async with pool.acquire() as conn:
+        try:
+            await conn.execute("SET search_path = ag_catalog, \"$user\", public")
+            cypher_sql = f"""
+            SELECT * FROM cypher('{graph_name}', $$ 
+                MATCH p = shortestPath(
+                    (src:Memory {{id: {from_literal}}})-[*1..{max_hops}]-(dst:Memory {{id: {to_literal}}})
+                )
+                RETURN length(p) AS hops, [n in nodes(p) | n.id] AS node_ids,
+                       [r in relationships(p) | type(r)] AS rel_types
+            $$) AS (hops agtype, node_ids agtype, rel_types agtype);
+            """
+            rows = await conn.fetch(cypher_sql)
+            if not rows:
+                return {"ok": True, "found": False, "path": None}
+            row = dict(rows[0])
+            return {
+                "ok": True,
+                "found": True,
+                "path": {
+                    "hops": row["hops"],
+                    "node_ids": row["node_ids"],
+                    "rel_types": row["rel_types"],
+                },
+            }
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
 
 # --- A-MEM Link Layer ---
 
@@ -2249,6 +2428,241 @@ async def history_cleanup(
         res = await conn.execute("DELETE FROM search_history WHERE created_at < NOW() - INTERVAL '1 day' * $1", days_old)
         deleted = int(res.split()[1]) if res.startswith("DELETE") else 0
         return HygieneCleanupResponse(deleted_history_count=deleted, dry_run=False)
+
+
+# ---------------------------------------------------------------------------
+# Core Memory API (NATS KV — Letta-parity)
+# ---------------------------------------------------------------------------
+
+
+class CoreMemoryBlockUpdate(BaseModel):
+    content: str
+
+
+class CoreMemoryAppendRequest(BaseModel):
+    text: str
+
+
+class CoreMemoryReplaceRequest(BaseModel):
+    old_text: str
+    new_text: str
+
+
+class PageArchivalRequest(BaseModel):
+    query: str
+    limit: int = 3
+
+
+def _require_core_memory() -> CoreMemoryManager:
+    if _core_memory_mgr is None:
+        raise HTTPException(status_code=503, detail="Core Memory Manager not available (NATS KV)")
+    return _core_memory_mgr
+
+
+@app.get("/api/v1/memu/core-memory/{agent_id}")
+async def get_core_memory(agent_id: str, _key: str = Depends(verify_api_key)):
+    """Get all core memory blocks for an agent."""
+    mgr = _require_core_memory()
+    mem = await mgr.get_agent_memory(agent_id)
+    return mem.to_dict()
+
+
+@app.get("/api/v1/memu/core-memory/{agent_id}/{block_name}")
+async def get_core_memory_block(agent_id: str, block_name: str, _key: str = Depends(verify_api_key)):
+    """Get a specific core memory block."""
+    mgr = _require_core_memory()
+    try:
+        block = Block(block_name)
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Invalid block: {block_name}. Valid: {[b.value for b in Block]}")
+    entry = await mgr.get_block(agent_id, block)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"Block {block_name} not found for agent {agent_id}")
+    return entry.to_dict()
+
+
+@app.put("/api/v1/memu/core-memory/{agent_id}/{block_name}")
+async def update_core_memory_block(
+    agent_id: str, block_name: str, req: CoreMemoryBlockUpdate,
+    revision: int = 0, _key: str = Depends(verify_api_key),
+):
+    """Update a core memory block (CAS-protected). Agent can only write Working_Context."""
+    mgr = _require_core_memory()
+    try:
+        block = Block(block_name)
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Invalid block: {block_name}")
+    try:
+        entry = await mgr.update_block(agent_id, block, req.content, revision, caller="agent")
+        return entry.to_dict()
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except CASConflictError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+
+
+@app.post("/api/v1/memu/core-memory/{agent_id}/{block_name}/append")
+async def append_core_memory_block(
+    agent_id: str, block_name: str, req: CoreMemoryAppendRequest,
+    _key: str = Depends(verify_api_key),
+):
+    """Append text to a core memory block."""
+    mgr = _require_core_memory()
+    try:
+        block = Block(block_name)
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Invalid block: {block_name}")
+    try:
+        entry = await mgr.append_block(agent_id, block, req.text, caller="agent")
+        return entry.to_dict()
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except CASConflictError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+
+
+@app.post("/api/v1/memu/core-memory/{agent_id}/{block_name}/replace")
+async def replace_core_memory_block(
+    agent_id: str, block_name: str, req: CoreMemoryReplaceRequest,
+    _key: str = Depends(verify_api_key),
+):
+    """Replace text within a core memory block."""
+    mgr = _require_core_memory()
+    try:
+        block = Block(block_name)
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Invalid block: {block_name}")
+    try:
+        entry = await mgr.replace_in_block(agent_id, block, req.old_text, req.new_text, caller="agent")
+        return entry.to_dict()
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except CASConflictError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+
+
+@app.post("/api/v1/memu/core-memory/{agent_id}/page-archival")
+async def page_archival_endpoint(
+    agent_id: str, req: PageArchivalRequest,
+    _key: str = Depends(verify_api_key),
+):
+    """Search PostgreSQL archival memory and page results into Working_Context."""
+    mgr = _require_core_memory()
+    from memu.archival_pager import page_from_archival
+    paged = await page_from_archival(
+        mgr, pool, agent_id, req.query,
+        get_embedding=get_embedding,
+        limit=req.limit,
+    )
+    return {"paged": paged, "count": len(paged)}
+
+
+@app.post("/api/v1/memu/core-memory/{agent_id}/bootstrap")
+async def bootstrap_agent_core_memory(
+    agent_id: str,
+    system: str = "",
+    persona: str = "",
+    _key: str = Depends(verify_api_key),
+):
+    """Initialize all core memory blocks for an agent (idempotent)."""
+    mgr = _require_core_memory()
+    mem = await mgr.bootstrap_agent(agent_id, system=system, persona=persona)
+    return mem.to_dict()
+
+
+@app.get("/api/v1/memu/core-memory/{agent_id}/system-prompt")
+async def get_system_prompt_fragment(agent_id: str, _key: str = Depends(verify_api_key)):
+    """Render core memory blocks into a system prompt fragment for LLM injection."""
+    mgr = _require_core_memory()
+    mem = await mgr.get_agent_memory(agent_id)
+    return {"agent_id": agent_id, "fragment": mem.as_system_prompt_fragment(), "total_tokens": mem.total_tokens}
+
+
+
+# ---------------------------------------------------------------------------
+# Prospective Memory API (Phase 4)
+# ---------------------------------------------------------------------------
+
+
+class ProspectiveMemoryRequest(BaseModel):
+    intent: str
+    trigger_condition: dict  # {"type": "time", "delay_seconds": 3600} or {"type": "event", "pattern": "..."}
+
+
+@app.post("/api/v1/memu/memory/prospective")
+async def create_prospective_memory(
+    req: ProspectiveMemoryRequest,
+    agent_id: str,
+    _key: str = Depends(verify_api_key),
+):
+    """Create a prospective memory — a future-intent reminder.
+
+    Starts a sleeping Temporal workflow that wakes on the trigger condition
+    and forcefully injects the intent into the agent's Working_Context.
+    """
+    trigger = req.trigger_condition
+    trigger_type = trigger.get("type", "time")
+
+    if trigger_type == "time":
+        delay_seconds = int(trigger.get("delay_seconds", 3600))
+    else:
+        # Event-based triggers default to 1 hour polling
+        delay_seconds = int(trigger.get("delay_seconds", 3600))
+
+    # Try to start Temporal workflow
+    try:
+        from temporalio.client import Client as TemporalClient
+        temporal_url = os.environ.get("TEMPORAL_URL", "localhost:7233")
+        client = await TemporalClient.connect(temporal_url)
+        handle = await client.start_workflow(
+            "ProspectiveMemoryWorkflow",
+            args=[agent_id, req.intent, delay_seconds],
+            id=f"prospective-{agent_id}-{hash(req.intent) % 10000}",
+            task_queue="memu-workers",
+        )
+        return {
+            "status": "scheduled",
+            "workflow_id": handle.id,
+            "agent_id": agent_id,
+            "intent": req.intent,
+            "delay_seconds": delay_seconds,
+        }
+    except Exception as e:
+        logger.warning("Temporal unavailable for prospective memory, using asyncio fallback: %s", e)
+
+        # Fallback: asyncio.create_task with sleep
+        async def _fallback_reminder():
+            import asyncio
+            await asyncio.sleep(delay_seconds)
+            if _core_memory_mgr:
+                try:
+                    reminder = f"[URGENT REMINDER: {req.intent}]"
+                    entry = await _core_memory_mgr.get_block(agent_id, Block.WORKING_CONTEXT)
+                    if entry:
+                        new_content = f"{reminder}\n{entry.content}"
+                        await _core_memory_mgr.update_block(
+                            agent_id, Block.WORKING_CONTEXT, new_content,
+                            entry.revision, caller="agent",
+                        )
+                    logger.info("Prospective memory triggered for %s: %s", agent_id, req.intent)
+                except Exception as exc:
+                    logger.error("Prospective memory injection failed: %s", exc)
+
+        import asyncio
+        asyncio.create_task(_fallback_reminder())
+        return {
+            "status": "scheduled_fallback",
+            "agent_id": agent_id,
+            "intent": req.intent,
+            "delay_seconds": delay_seconds,
+        }
+
 
 if __name__ == "__main__":
     import uvicorn

@@ -16,11 +16,12 @@ import nats
 import httpx
 from nats.js import JetStreamContext
 
+from memu.nats_config import primary_nats_url
 from memu.swarm_models import SwarmEvent, EventType
 
 logger = logging.getLogger(__name__)
 
-NATS_URL = os.environ.get("NATS_URL", "nats://localhost:4222")
+NATS_URL = primary_nats_url()
 MEMU_API_URL = os.environ.get("MEMU_API_URL", "http://localhost:8000")
 MEMU_API_KEY = os.environ.get("MEMU_API_KEY", "memu-dev-key")
 
