@@ -229,15 +229,22 @@ class NATSClusterManager:
                 "servers": [url],
                 "connect_timeout": 5,
                 "reconnect_time_wait": 2,
-                "max_reconnect_attempts": 2,  # bounded reconnects for bootstrap reliability
+                "max_reconnect_attempts": -1,  # infinite reconnects to survive VPN/Tailscale micro-drops
                 "ping_interval": 10,
                 "max_outstanding_pings": 3,
                 "allow_reconnect": True,
-                "max_reconnect_attempts": 10,
             }
 
             if self.auth_token:
                 connect_opts["token"] = self.auth_token
+
+            # Synadia Cloud / NGS credential-based auth
+            creds_file = os.environ.get("NATS_CREDS_FILE")
+            nkey_seed = os.environ.get("NATS_NKEY_SEED")
+            if creds_file:
+                connect_opts["user_credentials"] = creds_file
+            elif nkey_seed:
+                connect_opts["nkeys_seed"] = nkey_seed
 
             # Error callbacks
             async def on_error(e):

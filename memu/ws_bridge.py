@@ -88,6 +88,20 @@ app = FastAPI(
 
 # --- WebSocket endpoint ---
 
+async def _keepalive(ws: WebSocket):
+    """Send periodic pings to prevent Railway LB from killing idle WebSockets.
+
+    Railway's load balancer terminates connections after 100s of inactivity.
+    A 30s ping interval keeps the connection alive during long swarm tasks.
+    """
+    try:
+        while True:
+            await asyncio.sleep(30)
+            await ws.send_json({"type": "ping"})
+    except (asyncio.CancelledError, Exception):
+        pass
+
+
 @app.websocket("/ws/swarm")
 async def ws_swarm(ws: WebSocket):
     """Stream swarm events to the Glass Box UI."""
@@ -95,6 +109,7 @@ async def ws_swarm(ws: WebSocket):
     connected_clients.add(ws)
     logger.info(f"Glass Box client connected ({len(connected_clients)} total)")
 
+    keepalive_task = asyncio.create_task(_keepalive(ws))
     try:
         # Send cluster status on connect
         if cluster:
@@ -122,6 +137,10 @@ async def ws_swarm(ws: WebSocket):
     except WebSocketDisconnect:
         pass
     finally:
+        try:
+            keepalive_task.cancel()
+        except Exception:
+            pass
         connected_clients.discard(ws)
         logger.info(f"Glass Box client disconnected ({len(connected_clients)} total)")
 

@@ -88,7 +88,6 @@ IVFFLAT_MAX_PROBES = int(os.environ.get("IVFFLAT_MAX_PROBES", "10"))
 # --- Globals ---
 
 pool: asyncpg.Pool | None = None
-_fastembed_model: Any = None
 _nats_cluster: NATSClusterManager | None = None
 _nats_publisher: NATSEventPublisher | None = None
 _core_memory_mgr: CoreMemoryManager | None = None
@@ -326,86 +325,13 @@ def _cypher_string_literal(value: str) -> str:
 # --- Embedding ---
 
 async def get_embedding(text: str) -> list[float] | None:
-    """Get embedding vector via NATS RPC, OpenAI-compatible API, or local FastEmbed.
+    """Get embedding vector via external Serverless API.
 
-    Priority:
-      0. NATS RPC to dedicated embedding worker (preferred in production)
-      1. OpenAI-compatible /v1 or Ollama /api endpoint
-      2. Local FastEmbed fallback (for tests and local dev)
+    All ML inference is offloaded to an external API (e.g., OpenAI text-embedding-3-small).
+    No ML models are loaded in the Gateway pod.
     """
-    # 0. Try NATS RPC to dedicated embedding worker (avoids loading models in Gateway)
-    if _nats_cluster and _nats_cluster.active_connection.is_connected:
-        try:
-            from memu.embeddings_client import get_embedding_via_rpc
-            nc = _nats_cluster.active_connection
-            emb = await get_embedding_via_rpc(nc, text)
-            if emb is not None:
-                return emb
-            # Fall through to local fallbacks if RPC worker is unavailable
-        except Exception as exc:
-            logger.debug("Embedding RPC path unavailable: %s", exc)
-
-    # 1. Try OpenAI-compatible /v1 or Ollama /api endpoint
-    if EMBEDDING_BASE_URL and (OPENAI_API_KEY or "ollama" in EMBEDDING_BASE_URL) and "BAAI" not in EMBEDDING_MODEL:
-        headers = {"Content-Type": "application/json"}
-        if OPENAI_API_KEY:
-            headers["Authorization"] = f"Bearer {OPENAI_API_KEY}"
-
-        async def _try_embedding(url: str, body: dict) -> list[float] | None:
-            try:
-                async with httpx.AsyncClient(timeout=120.0) as client:
-                    r = await client.post(url, headers=headers, json=body)
-                    r.raise_for_status()
-                    res = r.json()
-                    if "data" in res and res["data"]:
-                        emb = res["data"][0].get("embedding")
-                        if emb is not None:
-                            return emb
-                    if "embedding" in res:
-                        return res["embedding"]
-            except Exception as e:
-                logger.warning("Embedding probe failed for %s: %s", url, e)
-            return None
-
-        # Modern Ollama/OpenAI-compatible endpoint
-        emb = await _try_embedding(
-            f"{EMBEDDING_BASE_URL.rstrip('/')}/v1/embeddings",
-            {"input": text, "model": EMBEDDING_MODEL, "dimensions": EMBEDDING_DIMS},
-        )
-        if emb is not None and len(emb) == EMBEDDING_DIMS:
-            return emb
-
-        # Legacy Ollama endpoint (some self-hosted builds still use this shape)
-        emb = await _try_embedding(
-            f"{EMBEDDING_BASE_URL.rstrip('/')}/api/embeddings",
-            {"model": EMBEDDING_MODEL, "prompt": text},
-        )
-        if emb is not None and len(emb) == EMBEDDING_DIMS:
-            return emb
-        if emb is not None:
-            logger.warning("Primary embedding dim mismatch: got %d, expected %d", len(emb), EMBEDDING_DIMS)
-
-        logger.warning("Primary embedding API failed, trying FastEmbed fallback")
-
-    # 2. Try FastEmbed (Local fallback — prefer RPC in production)
-    # TODO: Remove fastembed from requirements.txt once all environments use
-    # the dedicated embedding worker (scripts/embedding_worker.py).
-    global _fastembed_model
-    try:
-        if _fastembed_model is None:
-            from fastembed import TextEmbedding
-            _fastembed_model = TextEmbedding()
-        
-        # fastembed returns a generator
-        embeddings = list(_fastembed_model.embed([text]))
-        emb = embeddings[0].tolist()
-        if len(emb) == EMBEDDING_DIMS:
-            return emb
-        logger.warning("FastEmbed dim mismatch: got %d, expected %d", len(emb), EMBEDDING_DIMS)
-    except Exception as e:
-        logger.error("FastEmbed fallback failed: %s", e)
-    
-    return None
+    from memu.embeddings_client import get_embedding as _get_embedding
+    return await _get_embedding(text)
 
 
 def content_hash(text: str) -> str:
