@@ -25,6 +25,7 @@ from memu.core_memory import (
     Block,
     CoreMemoryManager,
     count_tokens,
+    token_safe_truncate,
     DEFAULT_TOKEN_LIMITS,
 )
 
@@ -37,6 +38,8 @@ LLM_BASE_URL = os.environ.get("PROFILER_LLM_URL", "https://api.openai.com/v1")
 LLM_MODEL = os.environ.get("PROFILER_LLM_MODEL", "gpt-4o-mini")
 LLM_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 MAX_BATCH_CHARS = 4_000  # Max chars to send to LLM per batch
+DLQ_TOPIC = "memu.dlq.llm_failures"
+MAX_LLM_RETRIES = 3
 
 SYSTEM_PROMPT = """\
 You are a silent observer that extracts user preference signals from chat messages.
@@ -158,7 +161,7 @@ class ImplicitProfiler:
         merged = self._merge_profile(current_profile, diff)
         merged_json = json.dumps(merged, indent=2)
 
-        # Token budget check
+        # Token-safe budget check: pop discrete dict keys until it fits
         tokens = count_tokens(merged_json)
         limit = DEFAULT_TOKEN_LIMITS[Block.USER_PROFILE]
         if tokens > limit:
@@ -166,10 +169,8 @@ class ImplicitProfiler:
                 "Merged profile for %s exceeds limit (%d > %d tokens), truncating",
                 agent_id, tokens, limit,
             )
-            # Truncate by removing oldest context_notes
-            if "context_notes" in merged:
-                del merged["context_notes"]
-                merged_json = json.dumps(merged, indent=2)
+            merged = token_safe_truncate(merged, limit)
+            merged_json = json.dumps(merged, indent=2)
 
         # CAS write
         try:
@@ -207,7 +208,7 @@ class ImplicitProfiler:
         return merged
 
     async def _call_llm(self, batch_text: str) -> dict[str, Any] | None:
-        """Call fast LLM to extract preference diff."""
+        """Call fast LLM to extract preference diff with retry + DLQ on failure."""
         if not LLM_API_KEY:
             logger.debug("No LLM API key — skipping profile extraction")
             return None
@@ -227,23 +228,66 @@ class ImplicitProfiler:
             "response_format": {"type": "json_object"},
         }
 
-        try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                resp = await client.post(
-                    f"{LLM_BASE_URL}/chat/completions",
-                    headers=headers,
-                    json=payload,
+        last_error = None
+        for attempt in range(1, MAX_LLM_RETRIES + 1):
+            try:
+                async with httpx.AsyncClient(timeout=30.0) as client:
+                    resp = await client.post(
+                        f"{LLM_BASE_URL}/chat/completions",
+                        headers=headers,
+                        json=payload,
+                    )
+                    # Rate limit → transient retry
+                    if resp.status_code == 429:
+                        retry_after = float(resp.headers.get("retry-after", "5"))
+                        logger.warning(
+                            "LLM rate limited (attempt %d/%d), retrying in %.1fs",
+                            attempt, MAX_LLM_RETRIES, retry_after,
+                        )
+                        await asyncio.sleep(retry_after)
+                        continue
+
+                    resp.raise_for_status()
+                    data = resp.json()
+                    content = data["choices"][0]["message"]["content"]
+                    diff = json.loads(content)
+                    if not isinstance(diff, dict):
+                        raise json.JSONDecodeError("LLM returned non-dict", content, 0)
+                    return diff if diff else None
+
+            except json.JSONDecodeError as exc:
+                last_error = exc
+                logger.warning(
+                    "LLM returned bad JSON (attempt %d/%d): %s",
+                    attempt, MAX_LLM_RETRIES, exc,
                 )
-                resp.raise_for_status()
-                data = resp.json()
-                content = data["choices"][0]["message"]["content"]
-                diff = json.loads(content)
-                if not isinstance(diff, dict):
-                    return None
-                return diff if diff else None
+            except Exception as exc:
+                last_error = exc
+                logger.warning(
+                    "LLM call failed (attempt %d/%d): %s",
+                    attempt, MAX_LLM_RETRIES, exc,
+                )
+            # Backoff between retries
+            if attempt < MAX_LLM_RETRIES:
+                await asyncio.sleep(1.0 * attempt)
+
+        # All retries exhausted — publish to DLQ
+        await self._publish_to_dlq(batch_text, str(last_error))
+        return None
+
+    async def _publish_to_dlq(self, batch_text: str, error: str) -> None:
+        """Publish failed LLM payload to dead letter queue for later inspection."""
+        try:
+            nc = self._cluster.active_connection
+            dlq_payload = json.dumps({
+                "source": "implicit_profiler",
+                "error": error,
+                "batch_text_preview": batch_text[:500],
+            }).encode()
+            await nc.publish(DLQ_TOPIC, dlq_payload)
+            logger.info("Published failed LLM payload to DLQ: %s", DLQ_TOPIC)
         except Exception as exc:
-            logger.warning("LLM profile extraction failed: %s", exc)
-            return None
+            logger.error("Failed to publish to DLQ: %s", exc)
 
 
 # ---------------------------------------------------------------------------

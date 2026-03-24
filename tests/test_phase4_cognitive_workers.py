@@ -192,7 +192,7 @@ class TestSubconsciousStream:
     def test_remove_agent(self):
         stream = SubconsciousStream()
         stream.update_agent_vector("lenny", make_embedding())
-        assert "lenny" in stream._agent_vectors
+        assert "lenny" in stream._agent_ids
         stream.remove_agent("lenny")
-        assert "lenny" not in stream._agent_vectors
+        assert "lenny" not in stream._agent_ids
 

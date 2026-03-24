@@ -1,4 +1,5 @@
 # memu/temporal_worker/activities.py
+import hashlib
 import json
 import os
 from typing import Any
@@ -265,11 +266,48 @@ Only include clear, actionable rules. Max 5 rules."""
         return {"rules": []}
 
 
+def _dream_idempotency_key(agent_id: str, source_episode_ids: list[str]) -> str:
+    """Generate a deterministic MD5 hash from sorted source episode IDs.
+
+    This ensures that Temporal retries of DreamConsolidationWorkflow
+    produce the same key and can detect duplicate rules.
+    """
+    sorted_ids = sorted(str(eid) for eid in source_episode_ids if eid)
+    payload = f"{agent_id}:{','.join(sorted_ids)}"
+    return hashlib.md5(payload.encode()).hexdigest()
+
+
 @activity.defn
 async def store_dream_rule(agent_id: str, rule_text: str, source_episode_ids: list[str]) -> str:
-    """Store a synthesized rule as a high-salience semantic memory."""
+    """Store a synthesized rule as a high-salience semantic memory (idempotent).
+
+    Uses a deterministic MD5 idempotency key derived from the sorted source
+    episode IDs. If a rule with the same key already exists, returns the
+    existing ID instead of creating a duplicate.
+    """
+    idempotency_key = _dream_idempotency_key(agent_id, source_episode_ids)
+
     conn = await asyncpg.connect(get_db_url())
     try:
+        # Check for existing rule with same idempotency key
+        existing = await conn.fetchrow(
+            """
+            SELECT id FROM memories
+            WHERE agent_id = $1
+              AND memory_type = 'reflection'
+              AND metadata->>'idempotency_key' = $2
+            LIMIT 1
+            """,
+            agent_id,
+            idempotency_key,
+        )
+        if existing:
+            activity.logger.info(
+                "Dream rule already exists (idempotency_key=%s), returning existing ID %s",
+                idempotency_key, existing["id"],
+            )
+            return str(existing["id"])
+
         # Generate embedding for the rule
         embedding = await generate_embedding(rule_text)
 
@@ -286,12 +324,13 @@ async def store_dream_rule(agent_id: str, rule_text: str, source_episode_ids: li
             json.dumps({
                 "source": "dream_consolidation",
                 "source_episode_ids": source_episode_ids,
+                "idempotency_key": idempotency_key,
             }),
             str(embedding) if embedding else None,
         )
         rule_id = str(row["id"])
 
-        # Create DERIVED_FROM edges in Apache AGE (best-effort)
+        # Create DERIVED_FROM edges in Apache AGE (best-effort, idempotent MERGE)
         try:
             await conn.execute("SET search_path = ag_catalog, \"$user\", public")
             for ep_id in source_episode_ids:
@@ -300,7 +339,7 @@ async def store_dream_rule(agent_id: str, rule_text: str, source_episode_ids: li
                     SELECT * FROM cypher('memu_graph', $$
                         MERGE (rule:Memory {{id: '{rule_id}'}})
                         MERGE (ep:Memory {{id: '{ep_id}'}})
-                        CREATE (rule)-[:DERIVED_FROM]->(ep)
+                        MERGE (rule)-[:DERIVED_FROM]->(ep)
                     $$) AS (result agtype);
                     """
                     await conn.execute(cypher_sql)

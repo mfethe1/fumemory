@@ -34,6 +34,11 @@ NOTION_API_KEY = os.environ.get("NOTION_API_KEY", "")
 NOTION_TASK_BOARD_ID = os.environ.get("NOTION_TASK_BOARD_ID", "")
 MEMU_BASE_URL = os.environ.get("MEMU_BASE_URL", "http://localhost:8000")
 MEMU_API_KEY = os.environ.get("MEMU_API_KEY", "")
+DLQ_TOPIC = "memu.dlq.llm_failures"
+MAX_HANDLER_RETRIES = 3
+
+# Track per-message retry counts (subject+data hash → count)
+_msg_retry_counts: dict[str, int] = {}
 
 
 async def process_msg(msg: Any, bridge: NotionBridge) -> None:
@@ -133,8 +138,41 @@ async def run() -> None:
 
     async def message_handler(msg: Any) -> None:
         logger.info("Received message on '%s'", msg.subject)
+        # Compute a stable key for retry tracking
+        msg_key = f"{msg.subject}:{hash(msg.data)}"
+        retry_count = _msg_retry_counts.get(msg_key, 0)
         try:
             await process_msg(msg, bridge)
+            _msg_retry_counts.pop(msg_key, None)  # Clear on success
+        except (json.JSONDecodeError, KeyError, ValueError) as e:
+            # Poison message (bad payload) — nak with delay or DLQ
+            retry_count += 1
+            _msg_retry_counts[msg_key] = retry_count
+            if retry_count >= MAX_HANDLER_RETRIES:
+                logger.error(
+                    "Poison message on %s after %d attempts, sending to DLQ: %s",
+                    msg.subject, retry_count, e,
+                )
+                try:
+                    dlq_payload = json.dumps({
+                        "source": "nats_worker",
+                        "subject": msg.subject,
+                        "error": str(e),
+                        "data_preview": msg.data.decode()[:500],
+                    }).encode()
+                    await nc.publish(DLQ_TOPIC, dlq_payload)
+                except Exception:
+                    pass
+                _msg_retry_counts.pop(msg_key, None)
+                if hasattr(msg, "ack"):
+                    await msg.ack()  # Clear the poison message
+            else:
+                logger.warning(
+                    "Transient error on %s (attempt %d/%d): %s",
+                    msg.subject, retry_count, MAX_HANDLER_RETRIES, e,
+                )
+                if hasattr(msg, "nak"):
+                    await msg.nak(delay=retry_count * 2)
         except Exception as e:
             logger.exception("Worker message handling failed: %s", e)
             if hasattr(msg, "nak"):

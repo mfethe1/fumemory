@@ -15,8 +15,10 @@ Token counting uses tiktoken to enforce strict size boundaries.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import random
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -93,6 +95,34 @@ def count_tokens(text: str) -> int:
     return max(1, len(text) // 4)
 
 
+def token_safe_truncate(data: list | dict, max_tokens: int) -> list | dict:
+    """Truncate a list or dict by removing the oldest/last items until the
+    JSON serialization fits within *max_tokens*.
+
+    This avoids raw string slicing which would corrupt JSON structure.
+    Items are popped from the end of lists or the first-inserted key of dicts.
+    Returns a *new* (shallow-copied) container — the original is not mutated.
+
+    If a single remaining item still exceeds the budget, it is kept to avoid
+    returning an empty container (caller should handle oversized singletons).
+    """
+    if isinstance(data, list):
+        data = list(data)  # shallow copy
+        while len(data) > 1 and count_tokens(json.dumps(data)) > max_tokens:
+            data.pop(0)  # remove oldest entry
+    elif isinstance(data, dict):
+        data = dict(data)  # shallow copy
+        keys = list(data.keys())
+        idx = 0
+        while len(data) > 1 and count_tokens(json.dumps(data)) > max_tokens:
+            if idx < len(keys):
+                del data[keys[idx]]
+                idx += 1
+            else:
+                break
+    return data
+
+
 # ---------------------------------------------------------------------------
 # Data structures
 # ---------------------------------------------------------------------------
@@ -140,11 +170,15 @@ class AgentCoreMemory:
 # CAS retry logic
 # ---------------------------------------------------------------------------
 
-class CASConflictError(Exception):
-    """Raised when CAS retry budget is exhausted."""
+class MemoryConcurrencyError(Exception):
+    """Raised when CAS retry budget is exhausted after exponential backoff."""
 
 
-MAX_CAS_RETRIES = 3
+# Legacy alias for backward compatibility
+CASConflictError = MemoryConcurrencyError
+
+MAX_CAS_RETRIES = 5
+CAS_BASE_DELAY = 0.1  # 100ms base delay for exponential backoff
 
 
 # ---------------------------------------------------------------------------
@@ -291,11 +325,13 @@ class CoreMemoryManager:
                 is_key_exists = "already in use" in err_str
 
                 if is_cas_conflict or is_key_exists:
-                    # Fetch latest revision and retry
+                    # Fetch latest revision and retry with exponential backoff + jitter
+                    delay = CAS_BASE_DELAY * (2 ** (attempt - 1)) + random.uniform(0, CAS_BASE_DELAY)
                     logger.info(
-                        "CAS conflict on %s (attempt %d/%d), fetching latest revision",
-                        key, attempt, MAX_CAS_RETRIES,
+                        "CAS conflict on %s (attempt %d/%d), backing off %.3fs",
+                        key, attempt, MAX_CAS_RETRIES, delay,
                     )
+                    await asyncio.sleep(delay)
                     try:
                         latest = await kv.get(key)
                         revision = latest.revision
@@ -304,7 +340,7 @@ class CoreMemoryManager:
                 else:
                     raise
 
-        raise CASConflictError(
+        raise MemoryConcurrencyError(
             f"CAS failed after {MAX_CAS_RETRIES} retries on {key}"
         )
 
@@ -352,11 +388,16 @@ class CoreMemoryManager:
             except Exception as exc:
                 err_str = str(exc).lower()
                 if "wrong last sequence" in err_str or "already in use" in err_str:
-                    logger.info("CAS conflict in append on %s (attempt %d)", key, attempt)
+                    delay = CAS_BASE_DELAY * (2 ** (attempt - 1)) + random.uniform(0, CAS_BASE_DELAY)
+                    logger.info(
+                        "CAS conflict in append on %s (attempt %d/%d), backing off %.3fs",
+                        key, attempt, MAX_CAS_RETRIES, delay,
+                    )
+                    await asyncio.sleep(delay)
                     continue
                 raise
 
-        raise CASConflictError(f"CAS append failed after {MAX_CAS_RETRIES} retries on {key}")
+        raise MemoryConcurrencyError(f"CAS append failed after {MAX_CAS_RETRIES} retries on {key}")
 
     async def replace_in_block(
         self,
@@ -391,7 +432,7 @@ class CoreMemoryManager:
                 agent_id, block, new_content, revision, caller=caller
             )
 
-        raise CASConflictError(f"CAS replace failed after {MAX_CAS_RETRIES} retries on {key}")
+        raise MemoryConcurrencyError(f"CAS replace failed after {MAX_CAS_RETRIES} retries on {key}")
 
     # ------------------------------------------------------------------
     # Admin / bootstrap operations (no permission checks)

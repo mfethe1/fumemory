@@ -18,6 +18,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from typing import Any
 
 import httpx
@@ -242,28 +243,47 @@ class ContradictionEngine:
 # ---------------------------------------------------------------------------
 
 
+AGENT_TTL_SECONDS = 300  # Evict agents inactive for 5 minutes
+
+
 class SubconsciousStream:
     """Central worker that broadcasts high-value context and injects into relevant agents.
 
     Listens to memu.subconscious JetStream topic.
-    Compares broadcast embeddings against cached active agent context vectors.
+    Maintains a NumPy 2D matrix of active agent context vectors for vectorized
+    cosine similarity (single ``np.dot`` across all agents — no per-agent loop).
     If similarity > 0.85, injects into that agent's Primed_Cache block.
+
+    Agents are evicted from the matrix after AGENT_TTL_SECONDS of inactivity.
     """
 
     def __init__(self, core_mem: CoreMemoryManager | None = None):
         self._core_mem = core_mem
-        self._agent_vectors: dict[str, np.ndarray] = {}  # agent_id → context embedding
+        # Ordered list of agent IDs matching rows in the matrix
+        self._agent_ids: list[str] = []
+        # 2D matrix: rows = agents, cols = embedding dims (lazily sized)
+        self._agent_matrix: np.ndarray | None = None
+        # Last-seen timestamps for TTL eviction
+        self._agent_last_seen: dict[str, float] = {}
         self._subscription = None
         self._running = False
+        self._eviction_task: asyncio.Task | None = None
 
     async def start(self, nc: Any) -> None:
-        """Subscribe to memu.subconscious."""
+        """Subscribe to memu.subconscious and start TTL eviction loop."""
         self._running = True
         self._subscription = await nc.subscribe("memu.subconscious", cb=self._on_broadcast)
+        self._eviction_task = asyncio.create_task(self._eviction_loop())
         logger.info("SubconsciousStream started — listening on memu.subconscious")
 
     async def stop(self) -> None:
         self._running = False
+        if self._eviction_task:
+            self._eviction_task.cancel()
+            try:
+                await self._eviction_task
+            except asyncio.CancelledError:
+                pass
         if self._subscription:
             try:
                 await self._subscription.unsubscribe()
@@ -271,12 +291,54 @@ class SubconsciousStream:
                 pass
 
     def update_agent_vector(self, agent_id: str, embedding: list[float]) -> None:
-        """Update the cached context vector for an active agent."""
-        self._agent_vectors[agent_id] = np.array(embedding, dtype=np.float32)
+        """Update the cached context vector for an active agent (rebuilds matrix row)."""
+        vec = np.array(embedding, dtype=np.float32)
+        norm = np.linalg.norm(vec)
+        if norm > 0:
+            vec = vec / norm  # Pre-normalize for fast dot-product similarity
+
+        self._agent_last_seen[agent_id] = time.monotonic()
+
+        if agent_id in self._agent_ids:
+            idx = self._agent_ids.index(agent_id)
+            self._agent_matrix[idx] = vec
+        else:
+            self._agent_ids.append(agent_id)
+            row = vec.reshape(1, -1)
+            if self._agent_matrix is None or len(self._agent_matrix) == 0:
+                self._agent_matrix = row
+            else:
+                self._agent_matrix = np.vstack([self._agent_matrix, row])
 
     def remove_agent(self, agent_id: str) -> None:
-        """Remove an agent from the active set."""
-        self._agent_vectors.pop(agent_id, None)
+        """Remove an agent from the active set and matrix."""
+        if agent_id not in self._agent_ids:
+            return
+        idx = self._agent_ids.index(agent_id)
+        self._agent_ids.pop(idx)
+        self._agent_last_seen.pop(agent_id, None)
+        if self._agent_matrix is not None and len(self._agent_matrix) > 0:
+            self._agent_matrix = np.delete(self._agent_matrix, idx, axis=0)
+            if len(self._agent_matrix) == 0:
+                self._agent_matrix = None
+
+    async def _eviction_loop(self) -> None:
+        """Periodically evict agents that haven't refreshed within TTL."""
+        while self._running:
+            try:
+                await asyncio.sleep(60)  # Check every minute
+                now = time.monotonic()
+                stale = [
+                    aid for aid, ts in self._agent_last_seen.items()
+                    if now - ts > AGENT_TTL_SECONDS
+                ]
+                for aid in stale:
+                    self.remove_agent(aid)
+                    logger.debug("Evicted stale agent %s from subconscious matrix", aid)
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                pass
 
     async def _on_broadcast(self, msg: Any) -> None:
         """Handle a subconscious broadcast."""
@@ -300,11 +362,11 @@ class SubconsciousStream:
         summary: str,
         source_agent: str = "",
     ) -> list[str]:
-        """Compare broadcast against all active agents, inject if relevant.
+        """Vectorized comparison: single np.dot across all agents.
 
         Returns list of agent_ids that received the injection.
         """
-        if not self._agent_vectors or self._core_mem is None:
+        if not self._agent_ids or self._agent_matrix is None or self._core_mem is None:
             return []
 
         broadcast_vec = np.array(embedding, dtype=np.float32)
@@ -313,38 +375,36 @@ class SubconsciousStream:
             return []
         broadcast_vec = broadcast_vec / b_norm
 
+        # Vectorized cosine similarity: single matrix-vector dot product
+        similarities = self._agent_matrix @ broadcast_vec  # shape: (n_agents,)
+
         injected = []
-        for agent_id, agent_vec in self._agent_vectors.items():
+        # Only iterate agents that exceed threshold
+        above_threshold = np.where(similarities >= SUBCONSCIOUS_SIMILARITY_THRESHOLD)[0]
+
+        for idx in above_threshold:
+            agent_id = self._agent_ids[idx]
             if agent_id == source_agent:
-                continue  # Don't echo back to source
-
-            a_norm = np.linalg.norm(agent_vec)
-            if a_norm == 0:
                 continue
-            normalized = agent_vec / a_norm
 
-            similarity = float(np.dot(broadcast_vec, normalized))
+            similarity = float(similarities[idx])
+            try:
+                entry = await self._core_mem.get_block(agent_id, Block.PRIMED_CACHE)
+                revision = entry.revision if entry else 0
+                content = f"[Subconscious insight | sim={similarity:.2f}] {summary}"
 
-            if similarity >= SUBCONSCIOUS_SIMILARITY_THRESHOLD:
-                # Inject into Primed_Cache
-                try:
-                    entry = await self._core_mem.get_block(agent_id, Block.PRIMED_CACHE)
-                    revision = entry.revision if entry else 0
-                    content = f"[Subconscious insight | sim={similarity:.2f}] {summary}"
-
-                    # Token check
-                    if count_tokens(content) <= DEFAULT_TOKEN_LIMITS[Block.PRIMED_CACHE]:
-                        await self._core_mem.update_block(
-                            agent_id, Block.PRIMED_CACHE, content,
-                            revision, caller="worker",
-                        )
-                        injected.append(agent_id)
-                        logger.info(
-                            "Subconscious injection: %s → %s (sim=%.3f)",
-                            source_agent, agent_id, similarity,
-                        )
-                except Exception as exc:
-                    logger.warning("Subconscious injection failed for %s: %s", agent_id, exc)
+                if count_tokens(content) <= DEFAULT_TOKEN_LIMITS[Block.PRIMED_CACHE]:
+                    await self._core_mem.update_block(
+                        agent_id, Block.PRIMED_CACHE, content,
+                        revision, caller="worker",
+                    )
+                    injected.append(agent_id)
+                    logger.info(
+                        "Subconscious injection: %s → %s (sim=%.3f)",
+                        source_agent, agent_id, similarity,
+                    )
+            except Exception as exc:
+                logger.warning("Subconscious injection failed for %s: %s", agent_id, exc)
 
         return injected
 

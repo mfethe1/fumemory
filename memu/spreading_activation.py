@@ -21,6 +21,7 @@ from memu.core_memory import (
     Block,
     CoreMemoryManager,
     count_tokens,
+    token_safe_truncate,
     DEFAULT_TOKEN_LIMITS,
 )
 
@@ -120,15 +121,14 @@ async def prime_agent_cache(
 
     content = "\n".join(lines)
 
-    # Token budget check
+    # Token-safe truncation: pop discrete neighbor entries (not raw string slice)
     tokens = count_tokens(content)
     if tokens > PRIMED_CACHE_TOKEN_LIMIT:
-        # Trim neighbors until it fits
-        while neighbors and count_tokens("\n".join(lines)) > PRIMED_CACHE_TOKEN_LIMIT:
-            neighbors.pop()
-            lines = ["[Primed Context — associative neighbors]"]
-            for n in neighbors:
-                lines.append(f"• {n['name']} ({n['rel_type']})")
+        truncated = token_safe_truncate(neighbors, PRIMED_CACHE_TOKEN_LIMIT - 20)
+        neighbors = truncated if isinstance(truncated, list) else neighbors
+        lines = ["[Primed Context — associative neighbors]"]
+        for n in neighbors:
+            lines.append(f"• {n['name']} ({n['rel_type']})")
         content = "\n".join(lines)
 
     try:
