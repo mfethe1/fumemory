@@ -20,6 +20,7 @@ Usage:
 from __future__ import annotations
 
 import logging
+import os
 from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID, uuid4
@@ -36,6 +37,17 @@ from memu.swarm_models import EventType, SwarmEvent
 logger = logging.getLogger(__name__)
 
 
+def tenant_subject(tenant_id: str | None, subject: str) -> str:
+    """Prefix a NATS subject with tenant namespace.
+
+    Falls back to the original global subject if no tenant_id is provided,
+    ensuring backward compatibility with local dev and existing tests.
+    """
+    if tenant_id:
+        return f"tenant.{tenant_id}.{subject}"
+    return subject
+
+
 class NATSEventPublisher:
     """Publish validated and cryptographically signed events onto the NATS swarm mesh."""
 
@@ -44,9 +56,11 @@ class NATSEventPublisher:
         cluster: NATSClusterManager,
         gateway_id: str = "memu-api",
         keypair: GatewayKeyPair | None = None,
+        tenant_id: str | None = None,
     ):
         self.cluster = cluster
         self.gateway_id = gateway_id
+        self.tenant_id = tenant_id or os.environ.get("TENANT_ID") or None
         # Generate keypair if not provided and crypto backend is available
         if keypair is not None:
             self.keypair = keypair
@@ -157,7 +171,7 @@ class NATSEventPublisher:
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             },
         )
-        return await self._publish(f"swarm.memory.{agent_id}", event)
+        return await self._publish(tenant_subject(self.tenant_id, f"swarm.memory.{agent_id}"), event)
 
     async def publish_task_drafted(
         self,
@@ -181,7 +195,7 @@ class NATSEventPublisher:
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             },
         )
-        return await self._publish("swarm.task.drafted", event)
+        return await self._publish(tenant_subject(self.tenant_id, "swarm.task.drafted"), event)
 
     async def publish_task_claimed(
         self,
@@ -201,7 +215,7 @@ class NATSEventPublisher:
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             },
         )
-        return await self._publish(f"swarm.task.claimed", event)
+        return await self._publish(tenant_subject(self.tenant_id, "swarm.task.claimed"), event)
 
     async def publish_task_failed(
         self,
@@ -225,7 +239,7 @@ class NATSEventPublisher:
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             },
         )
-        return await self._publish("swarm.task.failed", event)
+        return await self._publish(tenant_subject(self.tenant_id, "swarm.task.failed"), event)
 
     async def publish_task_completed(
         self,
@@ -247,7 +261,7 @@ class NATSEventPublisher:
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             },
         )
-        return await self._publish(f"swarm.task.completed", event)
+        return await self._publish(tenant_subject(self.tenant_id, "swarm.task.completed"), event)
 
     async def publish_search_logged(
         self,
@@ -270,7 +284,7 @@ class NATSEventPublisher:
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             },
         )
-        return await self._publish(f"swarm.search.{agent_id}", event)
+        return await self._publish(tenant_subject(self.tenant_id, f"swarm.search.{agent_id}"), event)
 
     async def publish_heartbeat(
         self,
@@ -288,7 +302,7 @@ class NATSEventPublisher:
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             },
         )
-        return await self._publish(f"swarm.heartbeat.{agent_id}", event)
+        return await self._publish(tenant_subject(self.tenant_id, f"swarm.heartbeat.{agent_id}"), event)
 
     async def publish_action_logged(
         self,
@@ -313,4 +327,4 @@ class NATSEventPublisher:
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             },
         )
-        return await self._publish(f"swarm.actions.{agent_id}", event)
+        return await self._publish(tenant_subject(self.tenant_id, f"swarm.actions.{agent_id}"), event)

@@ -325,13 +325,14 @@ def _cypher_string_literal(value: str) -> str:
 # --- Embedding ---
 
 async def get_embedding(text: str) -> list[float] | None:
-    """Get embedding vector via external Serverless API.
+    """Get embedding vector via NATS KV cache or external Serverless API.
 
     All ML inference is offloaded to an external API (e.g., OpenAI text-embedding-3-small).
-    No ML models are loaded in the Gateway pod.
+    No ML models are loaded in the Gateway pod. NATS KV provides L1 semantic caching.
     """
     from memu.embeddings_client import get_embedding as _get_embedding
-    return await _get_embedding(text)
+    nc = _nats_cluster.active_connection if _nats_cluster else None
+    return await _get_embedding(text, nc=nc)
 
 
 def content_hash(text: str) -> str:

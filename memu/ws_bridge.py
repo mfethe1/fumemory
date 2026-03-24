@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from contextlib import asynccontextmanager
 from typing import Any
 from uuid import UUID
@@ -24,6 +25,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from pydantic import BaseModel, Field
 
 from memu.cluster import NATSClusterManager
+from memu.nats_publisher import tenant_subject
 from memu.bridge_ledger import BridgeLedger
 from memu.swarm_models import (
     EventType,
@@ -261,7 +263,8 @@ async def _nats_to_ws_bridge():
             # Fan-out: every gateway pod must receive broadcasts to check local WS connections.
             # Intentionally NO queue group — if we used queue="...", only one pod would
             # receive each message, and users connected to other pods would never see it.
-            sub = await nc.subscribe("swarm.>")  # Wildcard: all swarm subjects
+            _tenant_id = os.environ.get("TENANT_ID") or None
+            sub = await nc.subscribe(tenant_subject(_tenant_id, "swarm.>"))  # Wildcard: all swarm subjects
 
             logger.info("NATS → WebSocket bridge active")
 

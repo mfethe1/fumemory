@@ -58,6 +58,30 @@ LLM_PREFERENCE = os.environ.get(
 ).split(",")
 
 SIMILARITY_CLUSTER_THRESHOLD = float(os.environ.get("CLUSTER_THRESHOLD", "0.82"))
+
+
+# ---------------------------------------------------------------------------
+# Apache AGE Graph-per-Tenant Isolation
+# ---------------------------------------------------------------------------
+
+
+async def ensure_tenant_graph(conn: asyncpg.Connection, tenant_id: str | None = None) -> str:
+    """Ensure the tenant-specific Apache AGE graph exists. Returns the graph name.
+
+    Each enterprise tenant gets an isolated graph namespace to prevent
+    cross-tenant knowledge graph traversal. Falls back to 'memu_default'
+    for local dev and tests (when TENANT_ID is not set).
+    """
+    graph_name = f"tenant_{tenant_id}" if tenant_id else "memu_default"
+    try:
+        await conn.execute(
+            "SELECT * FROM ag_catalog.create_graph($1);",
+            graph_name,
+        )
+        log.info("Created Apache AGE graph: %s", graph_name)
+    except Exception:
+        pass  # Graph already exists
+    return graph_name
 MIN_CLUSTER_SIZE = int(os.environ.get("MIN_CLUSTER_SIZE", "3"))
 MAX_CLUSTER_SIZE = int(os.environ.get("MAX_CLUSTER_SIZE", "25"))
 IDLE_POLL_INTERVAL = int(os.environ.get("IDLE_POLL_SECONDS", "300"))

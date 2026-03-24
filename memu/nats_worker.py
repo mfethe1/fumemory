@@ -18,6 +18,8 @@ import signal
 import socket
 from typing import Any
 
+from memu.nats_publisher import tenant_subject
+
 from nats.aio.client import Client as NATS
 
 from memu.context_isolation import sanitize_agent_message
@@ -87,8 +89,9 @@ async def process_msg(msg: Any, bridge: NotionBridge) -> None:
         await msg.ack()
 
 
-async def run() -> None:
+async def run(tenant_id: str | None = None) -> None:
     """Run NATS worker with IPv4-first connection strategy and progressive skill loading."""
+    tenant_id = tenant_id or os.environ.get("TENANT_ID") or None
     # Initialize skill registry (lazy-loading, doesn't load skills yet)
     skill_registry = get_skill_registry()
     logger.info(f"Skill registry initialized. Available skills: {skill_registry.list_available_skills()}")
@@ -177,9 +180,9 @@ async def run() -> None:
 
     # Queue group ensures only ONE worker pod processes each task event,
     # preventing duplicate LLM calls and DB writes during horizontal scaling.
-    await nc.subscribe("swarm.task.started", cb=message_handler, queue="memu-worker-group")
-    await nc.subscribe("swarm.task.completed", cb=message_handler, queue="memu-worker-group")
-    await nc.subscribe("swarm.task.failed", cb=message_handler, queue="memu-worker-group")
+    await nc.subscribe(tenant_subject(tenant_id, "swarm.task.started"), cb=message_handler, queue="memu-worker-group")
+    await nc.subscribe(tenant_subject(tenant_id, "swarm.task.completed"), cb=message_handler, queue="memu-worker-group")
+    await nc.subscribe(tenant_subject(tenant_id, "swarm.task.failed"), cb=message_handler, queue="memu-worker-group")
 
     logger.info("Listening for swarm task messages...")
 

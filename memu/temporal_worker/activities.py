@@ -429,6 +429,87 @@ async def inject_prospective_memory(agent_id: str, intent: str) -> bool:
         return False
 
 
+# ---------------------------------------------------------------------------
+# GDPR "Scorched Earth" Hard-Deletion Activities
+# ---------------------------------------------------------------------------
+
+
+@activity.defn
+async def gdpr_delete_kv_memory(agent_id: str) -> bool:
+    """Purge all core memory KV entries for an agent.
+
+    GDPR Article 17 "Right to Erasure" — permanently deletes all KV blocks
+    for the specified agent from the NATS KV core memory bucket.
+    """
+    try:
+        from memu.cluster import NATSClusterManager
+        from memu.core_memory import CoreMemoryManager
+
+        cluster = NATSClusterManager()
+        await cluster.connect()
+        try:
+            mgr = CoreMemoryManager(cluster.jetstream)
+            deleted = await mgr.delete_agent(agent_id)
+            activity.logger.info("GDPR: deleted %d KV entries for agent %s", deleted, agent_id)
+            return True
+        finally:
+            await cluster.close()
+    except Exception as e:
+        activity.logger.error("GDPR KV delete failed for %s: %s", agent_id, e)
+        return False
+
+
+@activity.defn
+async def gdpr_delete_vector_memory(tenant_id: str, user_id: str) -> int:
+    """Hard-delete all vector memories for a user from PostgreSQL.
+
+    GDPR Article 17 — bypasses bitemporal retention rules.
+    """
+    try:
+        # One-shot connection — acceptable for Temporal activity isolation
+        conn = await asyncpg.connect(get_db_url())
+        try:
+            result = await conn.execute(
+                "DELETE FROM memories WHERE agent_id = $1",
+                user_id,
+            )
+            count = int(result.split()[-1]) if result else 0
+            activity.logger.info("GDPR: deleted %d vector rows for user %s", count, user_id)
+            return count
+        finally:
+            await conn.close()
+    except Exception as e:
+        activity.logger.error("GDPR vector delete failed for %s: %s", user_id, e)
+        return 0
+
+
+@activity.defn
+async def gdpr_delete_graph_memory(tenant_id: str, user_id: str) -> bool:
+    """Hard-delete all knowledge graph entities for a user from Apache AGE.
+
+    GDPR Article 17 — removes all nodes with matching user_id from the
+    tenant-specific graph namespace.
+    """
+    try:
+        graph_name = f"tenant_{tenant_id}" if tenant_id else "memu_default"
+        # One-shot connection — acceptable for Temporal activity isolation
+        conn = await asyncpg.connect(get_db_url())
+        try:
+            await conn.execute("LOAD 'age';")
+            await conn.execute("SET search_path = ag_catalog, '$user', public;")
+            await conn.execute(
+                f"SELECT * FROM ag_catalog.cypher('{graph_name}', "
+                f"$$ MATCH (n {{user_id: '{user_id}'}}) DETACH DELETE n $$) AS (v agtype);"
+            )
+            activity.logger.info("GDPR: deleted graph entities for user %s in graph %s", user_id, graph_name)
+            return True
+        finally:
+            await conn.close()
+    except Exception as e:
+        activity.logger.error("GDPR graph delete failed for %s: %s", user_id, e)
+        return False
+
+
 # Export for worker registration
 GenerateEmbeddingActivity = generate_embedding
 StoreMemoryActivity = store_memory
@@ -439,3 +520,6 @@ SynthesizeDreamRulesActivity = synthesize_dream_rules
 StoreDreamRuleActivity = store_dream_rule
 MarkEpisodesConsolidatedActivity = mark_episodes_consolidated
 InjectProspectiveMemoryActivity = inject_prospective_memory
+GDPRDeleteKVMemoryActivity = gdpr_delete_kv_memory
+GDPRDeleteVectorMemoryActivity = gdpr_delete_vector_memory
+GDPRDeleteGraphMemoryActivity = gdpr_delete_graph_memory

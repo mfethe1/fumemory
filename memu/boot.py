@@ -166,7 +166,10 @@ async def register_with_mesh():
 
     from memu.cluster import NATSClusterManager
     from memu.crypto import GatewayKeyPair, get_backend
+    from memu.nats_publisher import tenant_subject
     from memu.swarm_models import GatewayAnnounce, GatewayStatus
+
+    _tenant_id = os.environ.get("TENANT_ID") or None
 
     cluster = NATSClusterManager(
         local_url=NATS_LOCAL_URL,
@@ -212,8 +215,8 @@ async def register_with_mesh():
             pass
 
     # Subscribe to both the specific and wildcard suicide channels
-    await nc.subscribe(f"swarm.advisory.suicide.{GATEWAY_ID}", cb=_suicide_handler)
-    await nc.subscribe("swarm.advisory.suicide.*", cb=_suicide_handler)
+    await nc.subscribe(tenant_subject(_tenant_id, f"swarm.advisory.suicide.{GATEWAY_ID}"), cb=_suicide_handler)
+    await nc.subscribe(tenant_subject(_tenant_id, "swarm.advisory.suicide.*"), cb=_suicide_handler)
     logger.info(f"Suicide signal listener active on swarm.advisory.suicide.{GATEWAY_ID}")
 
     # Announce presence (include public key for signature verification)
@@ -231,7 +234,7 @@ async def register_with_mesh():
     )
 
     await nc.publish(
-        "swarm.discovery",
+        tenant_subject(_tenant_id, "swarm.discovery"),
         announce.model_dump_json().encode(),
     )
 
@@ -246,7 +249,7 @@ async def start_heartbeat(cluster, interval_s: float = 3.0):
     while True:
         try:
             await nc.publish(
-                "swarm.warden.heartbeat",
+                tenant_subject(_tenant_id, "swarm.warden.heartbeat"),
                 json.dumps({
                     "gateway_id": GATEWAY_ID,
                     "task_id": TASK_ID,
@@ -373,7 +376,7 @@ async def main():
             try:
                 nc = cluster.active_connection
                 await nc.publish(
-                    "swarm.discovery",
+                    tenant_subject(_tenant_id, "swarm.discovery"),
                     json.dumps({
                         "gateway_id": GATEWAY_ID,
                         "status": "offline",

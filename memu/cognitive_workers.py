@@ -24,6 +24,7 @@ from typing import Any
 import httpx
 import numpy as np
 
+from memu.nats_publisher import tenant_subject
 from memu.core_memory import (
     Block,
     CoreMemoryManager,
@@ -91,17 +92,19 @@ class ContradictionEngine:
       4. Does NOT auto-delete — preserves both facts for human review
     """
 
-    def __init__(self, core_mem: CoreMemoryManager | None = None):
+    def __init__(self, core_mem: CoreMemoryManager | None = None, tenant_id: str | None = None):
         self._core_mem = core_mem
+        self._tenant_id = tenant_id or os.environ.get("TENANT_ID") or None
         self._subscription = None
         self._running = False
 
     async def start(self, nc: Any) -> None:
         """Subscribe to memu.events.ingested."""
         self._running = True
+        subject = tenant_subject(self._tenant_id, "memu.events.ingested")
         # Queue group: only one worker pod processes each ingestion event
-        self._subscription = await nc.subscribe("memu.events.ingested", cb=self._on_ingested, queue="memu-worker-group")
-        logger.info("ContradictionEngine started — listening on memu.events.ingested")
+        self._subscription = await nc.subscribe(subject, cb=self._on_ingested, queue="memu-worker-group")
+        logger.info("ContradictionEngine started — listening on %s", subject)
 
     async def stop(self) -> None:
         self._running = False
@@ -258,8 +261,9 @@ class SubconsciousStream:
     Agents are evicted from the matrix after AGENT_TTL_SECONDS of inactivity.
     """
 
-    def __init__(self, core_mem: CoreMemoryManager | None = None):
+    def __init__(self, core_mem: CoreMemoryManager | None = None, tenant_id: str | None = None):
         self._core_mem = core_mem
+        self._tenant_id = tenant_id or os.environ.get("TENANT_ID") or None
         # Ordered list of agent IDs matching rows in the matrix
         self._agent_ids: list[str] = []
         # 2D matrix: rows = agents, cols = embedding dims (lazily sized)
@@ -276,10 +280,11 @@ class SubconsciousStream:
     async def start(self, nc: Any) -> None:
         """Subscribe to memu.subconscious and start TTL eviction loop."""
         self._running = True
+        subject = tenant_subject(self._tenant_id, "memu.subconscious")
         # Queue group: only one worker pod processes each broadcast
-        self._subscription = await nc.subscribe("memu.subconscious", cb=self._on_broadcast, queue="memu-worker-group")
+        self._subscription = await nc.subscribe(subject, cb=self._on_broadcast, queue="memu-worker-group")
         self._eviction_task = asyncio.create_task(self._eviction_loop())
-        logger.info("SubconsciousStream started — listening on memu.subconscious")
+        logger.info("SubconsciousStream started — listening on %s", subject)
 
     async def stop(self) -> None:
         self._running = False

@@ -21,6 +21,7 @@ from typing import Any
 import httpx
 
 from memu.cluster import NATSClusterManager
+from memu.nats_publisher import tenant_subject
 from memu.core_memory import (
     Block,
     CoreMemoryManager,
@@ -69,9 +70,11 @@ class ImplicitProfiler:
         self,
         cluster: NATSClusterManager,
         core_mem: CoreMemoryManager,
+        tenant_id: str | None = None,
     ):
         self._cluster = cluster
         self._core_mem = core_mem
+        self._tenant_id = tenant_id or os.environ.get("TENANT_ID") or None
         self._buffers: dict[str, list[str]] = defaultdict(list)
         self._flush_tasks: dict[str, asyncio.Task] = {}
         self._running = False
@@ -81,9 +84,10 @@ class ImplicitProfiler:
         """Subscribe to swarm.chat.* and begin processing."""
         self._running = True
         nc = self._cluster.active_connection
+        subject = tenant_subject(self._tenant_id, "swarm.chat.*")
         # Queue group: only one worker pod extracts preferences per chat batch
-        self._subscription = await nc.subscribe("swarm.chat.*", cb=self._on_message, queue="memu-worker-group")
-        logger.info("ImplicitProfiler started — listening on swarm.chat.*")
+        self._subscription = await nc.subscribe(subject, cb=self._on_message, queue="memu-worker-group")
+        logger.info("ImplicitProfiler started — listening on %s", subject)
 
     async def stop(self) -> None:
         """Graceful shutdown."""

@@ -165,3 +165,37 @@ class ProspectiveMemoryWorkflow:
         )
 
         return {"status": "triggered", "agent_id": agent_id, "intent": intent}
+
+
+@workflow.defn
+class GDPRScrubWorkflow:
+    """Permanently delete ALL data for a user across all storage layers.
+
+    GDPR Article 17 "Right to Erasure" — bypasses bitemporal retention.
+    Deletes from: NATS KV (core memory), PostgreSQL (vector memories),
+    Apache AGE (knowledge graph entities).
+    """
+
+    @workflow.run
+    async def run(self, tenant_id: str, user_id: str, agent_id: str) -> dict:
+        # Execute all three deletions. Each is idempotent and independently retried.
+        kv_ok = await workflow.execute_activity(
+            "gdpr_delete_kv_memory",
+            args=[agent_id],
+            start_to_close_timeout=timedelta(seconds=30),
+        )
+        rows_deleted = await workflow.execute_activity(
+            "gdpr_delete_vector_memory",
+            args=[tenant_id, user_id],
+            start_to_close_timeout=timedelta(seconds=30),
+        )
+        graph_ok = await workflow.execute_activity(
+            "gdpr_delete_graph_memory",
+            args=[tenant_id, user_id],
+            start_to_close_timeout=timedelta(seconds=30),
+        )
+        return {
+            "kv_deleted": kv_ok,
+            "vector_rows_deleted": rows_deleted,
+            "graph_deleted": graph_ok,
+        }

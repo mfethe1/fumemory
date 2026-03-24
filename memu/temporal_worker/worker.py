@@ -15,8 +15,15 @@ from memu.temporal_worker.activities import (
     search_memory,
     log_audit,
     generate_embedding,
+    gdpr_delete_kv_memory,
+    gdpr_delete_vector_memory,
+    gdpr_delete_graph_memory,
 )
-from memu.temporal_worker.workflows import MemoryIngestionWorkflow, MemorySearchWorkflow
+from memu.temporal_worker.workflows import (
+    MemoryIngestionWorkflow,
+    MemorySearchWorkflow,
+    GDPRScrubWorkflow,
+)
 from memu.skill_loader import get_skill_registry
 
 logger = logging.getLogger(__name__)
@@ -41,12 +48,15 @@ async def main():
     worker = Worker(
         client,
         task_queue="memu-queue",
-        workflows=[MemoryIngestionWorkflow, MemorySearchWorkflow],
+        workflows=[MemoryIngestionWorkflow, MemorySearchWorkflow, GDPRScrubWorkflow],
         activities=[
             store_memory,
             search_memory,
             log_audit,
-            generate_embedding
+            generate_embedding,
+            gdpr_delete_kv_memory,
+            gdpr_delete_vector_memory,
+            gdpr_delete_graph_memory,
         ],
     )
 
