@@ -441,6 +441,7 @@ See also:
 - `CONTRIBUTING.md`
 - `SECURITY.md`
 - `docs/CROSS_GATEWAY_NATS_FEDERATION.md`
+- `docs/GATEWAY_FEDERATION_ROLLOUT_CHECKLIST.md`
 - `docs/MULTI_MACHINE.md`
 - `scripts/gateway_federation_smoke.py`
 - `memu/policy/rules/jetstream_authz.rego`
