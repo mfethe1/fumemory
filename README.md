@@ -133,6 +133,8 @@ memu serve
 See also:
 - `CONTRIBUTING.md`
 - `SECURITY.md`
+- `docs/CROSS_GATEWAY_NATS_FEDERATION.md`
+- `docs/MULTI_MACHINE.md`
 
 ---
 
