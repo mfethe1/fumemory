@@ -10,6 +10,6 @@ DROP INDEX IF EXISTS idx_memories_embedding;
 
 CREATE INDEX idx_memories_embedding_hnsw
 ON memories
-USING hnsw (embedding vector_cosine_ops)
-WITH (m = 16, ef_construction = 64);
+USING ivfflat (embedding vector_cosine_ops)
+;
 

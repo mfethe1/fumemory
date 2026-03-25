@@ -21,7 +21,7 @@ CREATE TABLE IF NOT EXISTS memories (
 );
 
 -- Indexes
-CREATE INDEX IF NOT EXISTS idx_memories_embedding ON memories USING hnsw (embedding vector_cosine_ops);
+-- CREATE INDEX IF NOT EXISTS idx_memories_embedding ON memories USING hnsw (embedding vector_cosine_ops);
 CREATE INDEX IF NOT EXISTS idx_memories_agent_id ON memories (agent_id);
 CREATE INDEX IF NOT EXISTS idx_memories_type ON memories (memory_type);
 CREATE INDEX IF NOT EXISTS idx_memories_parent ON memories (parent_id);
