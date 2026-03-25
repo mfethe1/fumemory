@@ -183,20 +183,22 @@ class AgentEventsConsumer:
 
         try:
             _ = json.loads(msg.data.decode())
-            await self._ack(msg)
-            self.metrics.acked_count += 1
-            self.metrics.last_processed_ts = time.time()
+            acked = await self._ack(msg)
+            if acked:
+                self.metrics.acked_count += 1
+                self.metrics.last_processed_ts = time.time()
         except Exception as exc:
             self.metrics.failure_count += 1
             self.metrics.last_error = str(exc)
             self.metrics.last_error_ts = time.time()
             await self._nak(msg)
 
-    async def _ack(self, msg: Any) -> None:
+    async def _ack(self, msg: Any) -> bool:
         try:
             result = msg.ack()
             if inspect.isawaitable(result):
                 await result
+            return True
         except Exception as exc:
             self.metrics.failure_count += 1
             self.metrics.last_error = str(exc)
@@ -205,9 +207,10 @@ class AgentEventsConsumer:
                 result = msg.ack_sync()
                 if inspect.isawaitable(result):
                     await result
+                return True
             except Exception:
                 # caller handles metrics as failure
-                pass
+                return False
 
     async def _nak(self, msg: Any) -> None:
         try:

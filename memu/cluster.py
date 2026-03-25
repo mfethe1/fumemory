@@ -71,9 +71,9 @@ class NATSClusterManager:
         self.local_url = local_url or os.environ.get(
             "NATS_LOCAL_URL", "nats://localhost:4222"
         )
-        self.railway_url = railway_url or os.environ.get(
-            "NATS_RAILWAY_URL", "nats://nats.railway.internal:4222"
-        )
+        self.railway_url = railway_url or os.environ.get("NATS_RAILWAY_URL")
+        if not self.railway_url:
+            raise RuntimeError("NATS_RAILWAY_URL environment variable is required")
         self.ping_interval_s = ping_interval_s
         self.failover_threshold_ms = failover_threshold_ms
         self.auth_token = auth_token or os.environ.get("NATS_AUTH_TOKEN")
