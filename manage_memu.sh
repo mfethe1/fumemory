@@ -27,6 +27,7 @@ function start_memu() {
         echo "memU started successfully."
     else
         echo "Failed to start memU. Check memu_api.log"
+        exit 1
     fi
 }
 
@@ -55,8 +56,10 @@ case $ACTION in
     status)
         if check_status; then
             echo "memU is RUNNING."
+            exit 0
         else
             echo "memU is DOWN."
+            exit 1
         fi
         ;;
     watchdog)
