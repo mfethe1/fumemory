@@ -400,10 +400,27 @@ Until then, the method is still implementation-stage, not fleet-ready.
 
 ---
 
+## Implementation artifacts in this repo
+
+- Smoke verifier: `scripts/gateway_federation_smoke.py`
+- Federation helpers/contract utilities: `memu/gateway_federation.py`
+- OPA/Rego subject policy: `memu/policy/rules/jetstream_authz.rego`
+
+Example:
+
+```bash
+GATEWAY_ID=mac-mini-main \
+NATS_RAILWAY_URL='nats://...' \
+NATS_AUTH_TOKEN='...' \
+MEMU_BASE_URL='https://api-production-86f5.up.railway.app' \
+X_MEMU_KEY='...' \
+python scripts/gateway_federation_smoke.py --json
+```
+
 ## Recommended next implementation steps
 
 1. wire subject-level OPA/Rego enforcement to this exact subject list
-2. add a reusable onboarding script for the 7 smoke tests
+2. run `scripts/gateway_federation_smoke.py` during onboarding for every gateway
 3. standardize durable consumer naming in code
 4. add replay/idempotency assertions to CI
 5. add a lightweight federation status dashboard / artifact output
