@@ -1,6 +1,10 @@
 #!/bin/bash
 # manage_memu.sh - Start, stop, or check status of local memU instance
 
+cd "$(dirname "$0")"
+
+export PATH="/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
+
 ACTION=$1
 PID_FILE="memu.pid"
 
