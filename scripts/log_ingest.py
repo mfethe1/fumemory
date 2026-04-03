@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import glob as glob_module
 import hashlib
 import json
 import sqlite3
@@ -90,7 +91,9 @@ def main() -> int:
         total += ingest_jsonl(conn, f)
 
     if args.raw_glob:
-        for f in Path(".").glob(args.raw_glob):
+        # Use glob.glob() instead of Path.glob() to support absolute paths and .. patterns
+        for fstr in sorted(glob_module.glob(args.raw_glob)):
+            f = Path(fstr)
             if f.is_file():
                 total += ingest_raw(conn, f)
 
