@@ -1,0 +1,12 @@
+{
+  "name": "memu",
+  "version": "0.1.0",
+  "description": "Karpathy-style LLM wiki memory — markdown + SQLite + Postgres — for any coding agent. Adds /rlm-investigate, /wiki-search, /wiki-write, /fix-with-context and an RLM orchestrator that keeps context small by passing slugs, not bodies.",
+  "author": {
+    "name": "memU contributors",
+    "url": "https://github.com/mfethe1/fumemory"
+  },
+  "homepage": "https://github.com/mfethe1/fumemory",
+  "license": "Apache-2.0",
+  "keywords": ["memory", "wiki", "obsidian", "rlm", "mcp", "karpathy", "knowledge-graph"]
+}

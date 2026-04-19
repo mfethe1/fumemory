@@ -1,0 +1,13 @@
+{
+  "context_servers": {
+    "memu": {
+      "command": {
+        "path": "python",
+        "args": ["-m", "memu.mcp.server"]
+      },
+      "settings": {
+        "MEMU_STORAGE_DSN": "file://~/.memu/vault"
+      }
+    }
+  }
+}

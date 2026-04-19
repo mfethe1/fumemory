@@ -1,0 +1,13 @@
+{
+  "experimental": {
+    "modelContextProtocolServers": [
+      {
+        "transport": {
+          "type": "stdio",
+          "command": "python",
+          "args": ["-m", "memu.mcp.server"]
+        }
+      }
+    ]
+  }
+}

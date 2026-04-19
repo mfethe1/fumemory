@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python -m memu.plugin_hooks.post_edit_reindex",
+            "description": "Re-index any vault file touched by Edit/Write so wiki backlinks stay fresh."
+          }
+        ]
+      }
+    ]
+  }
+}

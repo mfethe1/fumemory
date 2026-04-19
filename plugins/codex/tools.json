@@ -1,0 +1,34 @@
+{
+  "tools": [
+    {
+      "name": "wiki_search",
+      "description": "Search the memU wiki for slugs relevant to a query.",
+      "invoke": {
+        "transport": "mcp-stdio",
+        "command": "python",
+        "args": ["-m", "memu.mcp.server"],
+        "tool": "wiki_search"
+      }
+    },
+    {
+      "name": "wiki_read",
+      "description": "Read a memU wiki node (frontmatter + body + links).",
+      "invoke": {
+        "transport": "mcp-stdio",
+        "command": "python",
+        "args": ["-m", "memu.mcp.server"],
+        "tool": "wiki_read"
+      }
+    },
+    {
+      "name": "rlm_solve",
+      "description": "Run the Karpathy-style recursive orchestrator over the memU wiki.",
+      "invoke": {
+        "transport": "mcp-stdio",
+        "command": "python",
+        "args": ["-m", "memu.mcp.server"],
+        "tool": "rlm_solve"
+      }
+    }
+  ]
+}
