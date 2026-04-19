@@ -71,9 +71,25 @@ class MarkdownBackend:
         # counter (a new generation of the memory).
         existing = await self._find_by_slug(node.slug)
         if existing is not None and existing.content_hash() == node.content_hash():
+            # Reinforcement preserves title+body (that's what equivalence
+            # means) but still refreshes side-channel fields the caller
+            # may have set on the incoming node (``happened_at``,
+            # ``metadata``, ``extra``, ``tags``, ``source``, ``agent_id``,
+            # etc.). Without this, callers who re-put a known-good node
+            # after enriching its metadata would silently lose the
+            # enrichment.
             existing.reinforcement_count = (existing.reinforcement_count or 0) + 1
             existing.last_reinforced_at = now
             existing.updated_at = now
+            existing.tags = list(node.tags)
+            existing.metadata = dict(node.metadata or {})
+            existing.extra = dict(node.extra or {})
+            existing.source = node.source
+            existing.happened_at = node.happened_at
+            existing.agent_id = node.agent_id
+            existing.memory_type = node.memory_type
+            existing.salience = node.salience
+            existing.confidence = node.confidence
             path = self._path_for(existing)
             path.parent.mkdir(parents=True, exist_ok=True)
             fm = existing.to_frontmatter()
