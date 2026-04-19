@@ -25,24 +25,29 @@ from .base import (
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS nodes (
-    id          TEXT PRIMARY KEY,
-    slug        TEXT UNIQUE NOT NULL,
-    kind        TEXT NOT NULL,
-    title       TEXT NOT NULL,
-    body        TEXT NOT NULL,
-    tags_json   TEXT NOT NULL DEFAULT '[]',
+    id            TEXT PRIMARY KEY,
+    slug          TEXT UNIQUE NOT NULL,
+    kind          TEXT NOT NULL,
+    title         TEXT NOT NULL,
+    body          TEXT NOT NULL,
+    tags_json     TEXT NOT NULL DEFAULT '[]',
     metadata_json TEXT NOT NULL DEFAULT '{}',
-    source_json TEXT,
-    agent_id    TEXT NOT NULL DEFAULT 'user',
-    memory_type TEXT NOT NULL DEFAULT 'observation',
-    salience    REAL NOT NULL DEFAULT 0.5,
-    confidence  REAL NOT NULL DEFAULT 1.0,
-    created_at  TEXT NOT NULL,
-    updated_at  TEXT NOT NULL
+    extra_json    TEXT NOT NULL DEFAULT '{}',
+    source_json   TEXT,
+    agent_id      TEXT NOT NULL DEFAULT 'user',
+    memory_type   TEXT NOT NULL DEFAULT 'observation',
+    salience      REAL NOT NULL DEFAULT 0.5,
+    confidence    REAL NOT NULL DEFAULT 1.0,
+    created_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL,
+    happened_at   TEXT
 );
 
-CREATE INDEX IF NOT EXISTS nodes_kind_idx   ON nodes(kind);
-CREATE INDEX IF NOT EXISTS nodes_updated_idx ON nodes(updated_at);
+CREATE INDEX IF NOT EXISTS nodes_kind_idx       ON nodes(kind);
+CREATE INDEX IF NOT EXISTS nodes_updated_idx    ON nodes(updated_at);
+-- ``nodes_happened_idx`` is created by ``_apply_idempotent_migrations``
+-- so that legacy DBs without the ``happened_at`` column don't error
+-- on the CREATE INDEX step before the column is added.
 
 CREATE TABLE IF NOT EXISTS slug_registry (
     slug    TEXT PRIMARY KEY,
@@ -97,8 +102,26 @@ class SqliteBackend:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA foreign_keys = ON")
         self._conn.execute("PRAGMA journal_mode = WAL")
+        fts_existed_before = _has_table(self._conn, "nodes_fts")
+        nodes_count_before = (
+            self._conn.execute("SELECT count(*) FROM nodes").fetchone()[0]
+            if _has_table(self._conn, "nodes")
+            else 0
+        )
+        # Order matters: ALTER TABLE must precede CREATE VIRTUAL TABLE so
+        # the external-content FTS5 table binds to the final ``nodes``
+        # schema, not an intermediate one.
+        _apply_idempotent_migrations(self._conn)
         self._conn.executescript(SCHEMA)
         self._conn.executescript(FTS_TRIGGERS)
+        # If FTS was just created but ``nodes`` already held rows, the
+        # insert triggers never fired for them; backfill so the AFTER
+        # UPDATE trigger's shadow-row delete succeeds on first put_node.
+        if not fts_existed_before and nodes_count_before > 0:
+            self._conn.execute(
+                "INSERT INTO nodes_fts(rowid, slug, title, body, tags) "
+                "SELECT rowid, slug, title, body, tags_json FROM nodes"
+            )
         self._conn.commit()
 
     async def close(self) -> None:
@@ -121,10 +144,10 @@ class SqliteBackend:
         self.conn.execute(
             """
             INSERT INTO nodes(id, slug, kind, title, body, tags_json, metadata_json,
-                              source_json, agent_id, memory_type, salience,
-                              confidence, created_at, updated_at)
-            VALUES(:id,:slug,:kind,:title,:body,:tags,:meta,:source,:agent,:mtype,
-                   :sal,:conf,:created,:updated)
+                              extra_json, source_json, agent_id, memory_type, salience,
+                              confidence, created_at, updated_at, happened_at)
+            VALUES(:id,:slug,:kind,:title,:body,:tags,:meta,:extra,:source,:agent,:mtype,
+                   :sal,:conf,:created,:updated,:happened)
             ON CONFLICT(id) DO UPDATE SET
                 slug=excluded.slug,
                 kind=excluded.kind,
@@ -132,12 +155,14 @@ class SqliteBackend:
                 body=excluded.body,
                 tags_json=excluded.tags_json,
                 metadata_json=excluded.metadata_json,
+                extra_json=excluded.extra_json,
                 source_json=excluded.source_json,
                 agent_id=excluded.agent_id,
                 memory_type=excluded.memory_type,
                 salience=excluded.salience,
                 confidence=excluded.confidence,
-                updated_at=excluded.updated_at
+                updated_at=excluded.updated_at,
+                happened_at=excluded.happened_at
             """,
             {
                 "id": node.id,
@@ -147,6 +172,7 @@ class SqliteBackend:
                 "body": node.body,
                 "tags": json.dumps(list(node.tags)),
                 "meta": json.dumps(node.metadata or {}),
+                "extra": json.dumps(node.extra or {}),
                 "source": json.dumps(node.source) if node.source else None,
                 "agent": node.agent_id,
                 "mtype": node.memory_type,
@@ -154,6 +180,7 @@ class SqliteBackend:
                 "conf": node.confidence,
                 "created": node.created_at.isoformat(),
                 "updated": node.updated_at.isoformat(),
+                "happened": node.happened_at.isoformat() if node.happened_at else None,
             },
         )
         await self.register_slug(node.slug, node.id, node.kind)
@@ -316,6 +343,8 @@ class SqliteBackend:
         link_rows = self.conn.execute(
             "SELECT dst_slug, type, strength FROM links WHERE src_id = ?", (src_id,)
         ).fetchall()
+        extra_json = _column_or_default(row, "extra_json", "{}")
+        happened_at_val = _column_or_default(row, "happened_at", None)
         return WikiNode(
             id=row["id"],
             slug=row["slug"],
@@ -324,6 +353,7 @@ class SqliteBackend:
             body=row["body"],
             tags=json.loads(row["tags_json"] or "[]"),
             metadata=json.loads(row["metadata_json"] or "{}"),
+            extra=json.loads(extra_json or "{}"),
             source=json.loads(row["source_json"]) if row["source_json"] else None,
             agent_id=row["agent_id"],
             memory_type=row["memory_type"],
@@ -331,6 +361,7 @@ class SqliteBackend:
             confidence=row["confidence"],
             created_at=_parse(row["created_at"]),
             updated_at=_parse(row["updated_at"]),
+            happened_at=_parse(happened_at_val) if happened_at_val else None,
             links=[
                 LinkRecord(
                     src_slug=row["slug"],
@@ -351,6 +382,56 @@ def _parse(val: Optional[str]) -> Optional[datetime]:
         return datetime.fromisoformat(val)
     except ValueError:
         return None
+
+
+def _apply_idempotent_migrations(conn: sqlite3.Connection) -> None:
+    """Bring older SQLite vaults forward without a separate migration tool.
+
+    Runs before ``SCHEMA`` so the external-content FTS5 table in ``SCHEMA``
+    binds to the final ``nodes`` layout. For a brand-new DB the
+    ``nodes`` table does not yet exist; we no-op in that case and
+    ``SCHEMA``'s ``CREATE TABLE`` includes the columns directly.
+
+    Each migration entry is ``(column, DDL)``; we add the column only
+    if it is missing from ``PRAGMA table_info(nodes)``. This lets solo
+    users upgrade memU in place — the first ``init()`` after a pull
+    adds any new columns without destroying their index.
+    """
+    cur = conn.execute("PRAGMA table_info(nodes)")
+    existing = {row[1] for row in cur.fetchall()}
+    if not existing:
+        return  # fresh DB; SCHEMA will create everything
+    migrations: list[tuple[str, str]] = [
+        ("extra_json", "ALTER TABLE nodes ADD COLUMN extra_json TEXT NOT NULL DEFAULT '{}'"),
+        ("happened_at", "ALTER TABLE nodes ADD COLUMN happened_at TEXT"),
+    ]
+    for column, ddl in migrations:
+        if column not in existing:
+            conn.execute(ddl)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS nodes_happened_idx ON nodes(happened_at)"
+    )
+
+
+def _has_table(conn: sqlite3.Connection, name: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type IN ('table','view') AND name = ?",
+        (name,),
+    ).fetchone()
+    return row is not None
+
+
+def _column_or_default(row: sqlite3.Row, name: str, default):
+    """Tolerate databases created before the column was added.
+
+    Rather than requiring users to wipe their SQLite index when we add a
+    column, the backend's ``init`` runs idempotent ``ALTER TABLE`` statements
+    and this helper guards reads. Keeps upgrades painless for solo users.
+    """
+    try:
+        return row[name]
+    except (IndexError, KeyError):
+        return default
 
 
 _FTS_TOKEN_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_\-]*")

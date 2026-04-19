@@ -33,6 +33,21 @@ class WikiNode:
 
     A node maps 1:1 to a markdown file in the vault. ``id`` is globally
     stable (ULID/UUID); ``slug`` is the human/Obsidian-friendly handle.
+
+    Event time vs. ingest time
+    --------------------------
+    ``created_at`` and ``updated_at`` track when we learned about the
+    node (ingest time). ``happened_at`` is when the event the node
+    describes actually occurred — often earlier, sometimes much earlier
+    when importing a backlog (git log, Slack export, old ADRs). Decay
+    curves and recency-weighted search should prefer ``happened_at``
+    when it's set, so importing yesterday's 2022 commit doesn't make
+    that commit look fresh.
+
+    ``extra`` is a forward-compatible escape hatch for per-source
+    fields that don't warrant a top-level column yet (PR number,
+    author, transcript URL). Prefer promoting heavily-used keys into
+    typed fields over time.
     """
 
     id: str
@@ -45,11 +60,13 @@ class WikiNode:
     metadata: dict[str, Any] = field(default_factory=dict)
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
+    happened_at: Optional[datetime] = None
     salience: float = 0.5
     confidence: float = 1.0
     agent_id: str = "user"
     memory_type: str = "observation"
     source: Optional[dict[str, Any]] = None  # {path, symbol, commit} for code/paper nodes
+    extra: dict[str, Any] = field(default_factory=dict)
 
     def to_frontmatter(self) -> dict[str, Any]:
         """Serializable frontmatter dict (ordered for readability)."""
@@ -64,6 +81,8 @@ class WikiNode:
             fm["created"] = self.created_at.isoformat()
         if self.updated_at:
             fm["updated"] = self.updated_at.isoformat()
+        if self.happened_at:
+            fm["happened_at"] = self.happened_at.isoformat()
         fm["agent_id"] = self.agent_id
         fm["memory_type"] = self.memory_type
         fm["salience"] = self.salience
@@ -81,7 +100,17 @@ class WikiNode:
             fm["source"] = self.source
         if self.metadata:
             fm["metadata"] = self.metadata
+        if self.extra:
+            fm["extra"] = self.extra
         return fm
+
+    def effective_time(self) -> Optional[datetime]:
+        """``happened_at`` if set, else ``created_at``.
+
+        This is the single point decay curves and recency-weighted
+        search should call; never hand-roll the fallback elsewhere.
+        """
+        return self.happened_at or self.created_at
 
 
 @dataclass

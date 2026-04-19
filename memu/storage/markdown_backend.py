@@ -217,11 +217,13 @@ class MarkdownBackend:
             metadata=fm.get("metadata") or {},
             created_at=_parse_dt(fm.get("created")),
             updated_at=_parse_dt(fm.get("updated")),
+            happened_at=_parse_dt(fm.get("happened_at")),
             salience=float(fm.get("salience", 0.5)),
             confidence=float(fm.get("confidence", 1.0)),
             agent_id=fm.get("agent_id", "user"),
             memory_type=fm.get("memory_type", "observation"),
             source=fm.get("source"),
+            extra=dict(fm.get("extra") or {}),
         )
 
 
