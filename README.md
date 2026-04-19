@@ -28,6 +28,16 @@ Your agents' memories belong to you — not a SaaS vendor.
 
 ## Features
 
+**LLM wiki layer (solo-user friendly)**
+- **Obsidian-compatible markdown vault** — every memory is a plain `.md` with YAML frontmatter and `[[wikilinks]]`; open the folder in Obsidian for free graph view + backlinks
+- **Pluggable storage** — markdown-only / SQLite / Postgres + pgvector; swap backends by changing `MEMU_STORAGE_DSN`, no code changes
+- **Python codebase ingester** — `memu ingest code <repo>` materializes every top-level class, function, method, and module as an addressable slug, with typed outbound links for imports and same-module calls
+- **Hybrid retrieval** — FTS + vector + graph fused via Reciprocal Rank Fusion, capability-introspected per backend (no config)
+- **Recursive-LM orchestrator** — decomposes a task, retrieves slugs, recursively summarizes; sub-agents receive slug citations, not raw file contents, so context stays small
+- **Wiki sync daemon** — `memu sync watch` keeps the index fresh as Obsidian / VS Code / any editor writes to your vault (polling, debounced, no C dependency)
+- **MCP server + Claude Code plugin + editor shims** — one `python -m memu.mcp.server` serves Claude Code, Cursor, Zed, Continue, Windsurf, Aider, Codex, and Gemini from a single implementation
+
+**Swarm-scale (team/enterprise)**
 - **Semantic vector search** — pgvector-powered similarity search over all memories
 - **Multi-agent namespacing** — agents share one memory pool, search across all or filter by agent
 - **Temporal awareness** — recency-weighted search, not just cosine similarity
@@ -41,6 +51,90 @@ Your agents' memories belong to you — not a SaaS vendor.
 - **Warden** — container orchestration with heartbeat watchdog and Dead Man's Switch
 - **Glass Box UI** — real-time WebSocket dashboard for swarm observability
 - **One command to run** — `docker compose up` and you're done
+
+---
+
+## Two ways to run memU
+
+memU scales from a solo researcher's laptop to a multi-agent swarm on Postgres without changing a line of your agent code. Pick the tier that matches your needs; the `StorageBackend` abstraction means the same memory code runs in all of them.
+
+| Tier | DSN | Use case | Dependencies |
+|---|---|---|---|
+| **Tier 0 — markdown** | `file://~/vault` | Solo user, pure Obsidian | stdlib only |
+| **Tier 1 — SQLite** | `sqlite:///path/index.db` | Solo user + fast search | stdlib only |
+| **Tier 2 — Postgres** | `postgres://…` | Team, shared memory | Postgres + pgvector |
+| **Tier 3 — Postgres + AGE + RLS** | `postgres://…` | Enterprise swarm | Postgres + pgvector + Apache AGE |
+
+```bash
+# Tier 1 quick start — ~30 seconds, no Docker
+pip install -e .
+memu init ~/my-vault
+export MEMU_STORAGE_DSN=sqlite:///~/my-vault/.memu/index.db
+memu ingest code /path/to/your/repo
+memu solve "fix the FooParser bug"
+```
+
+```bash
+# Tier 2/3 quick start — team / enterprise
+docker compose up -d
+export MEMU_STORAGE_DSN=postgres://memu:memu@localhost:5432/memu
+# Existing FastAPI routes under :8000 continue to serve the swarm stack
+```
+
+---
+
+## LLM wiki layer
+
+Inspired by Karpathy's "LLM wiki" idea: the LLM both writes and reads a shared knowledge base of notes, code symbols, and research papers, connected by typed wikilinks. memU's implementation:
+
+### Vault layout (Obsidian-native)
+
+```
+vault/
+  notes/<slug>.md                         # handwritten + LLM-generated notes
+  code/<lang>/<module>/<symbol>.md        # auto-materialized by `memu ingest code`
+  papers/<arxiv-id>.md                    # (future: `memu ingest paper`)
+  tasks/<task-id>.md                      # agent task state
+  _index/master.md                        # LLM-maintained TOC
+  .memu/index.db                          # SQLite index (Tier 1)
+```
+
+Every node has YAML frontmatter (`id`, `slug`, `kind`, `tags`, `links`, `source`) and a markdown body with `[[wikilinks]]`. Obsidian renders graph view + backlinks with zero plugins.
+
+### Recursive retrieval (RLM orchestrator)
+
+```python
+from memu.rlm import Orchestrator, RLMContext
+from memu.storage import get_backend
+
+backend = get_backend()
+await backend.init()
+orch = Orchestrator(backend)  # auto-uses HybridRetriever (FTS + vector + graph)
+
+result = await orch.solve("fix the FooParser bug", RLMContext(max_depth=2, k=6))
+print(result.slugs)   # -> ['code/memu/parsers/FooParser', 'code/memu/parsers/_private', ...]
+print(result.answer)  # slug-cited synthesis — NOT raw bodies
+```
+
+Sub-agents get slugs, not full file contents — context stays small as you scale.
+
+### MCP / plugin surface
+
+One `python -m memu.mcp.server` process exposes:
+
+- `wiki_search` / `wiki_read` / `wiki_write` / `wiki_link` / `wiki_backlinks`
+- `rlm_solve` — recursive orchestration
+- `wiki_ingest_code` — codebase materialization
+
+All served over MCP stdio, so **one implementation** powers the Claude Code plugin bundle (`/memu:wiki-search`, `/memu:ingest-code`, `/memu:rlm-investigate`, `/memu:vault-sync`, `/memu:fix-with-context`), Cursor, Zed, Continue, Windsurf, Aider, Codex CLI, and Gemini CLI. Adding a new editor is a `mcp.json`, not a new integration.
+
+```bash
+# In Claude Code
+/plugin marketplace add mfethe1/fumemory
+/plugin install memu
+```
+
+See [`plugins/README.md`](plugins/README.md) for per-editor install paths and [`docs/UPSTREAM_PORT_BACKLOG.md`](docs/UPSTREAM_PORT_BACKLOG.md) for the roadmap of features we're porting from upstream NevaMind-AI/memU.
 
 ---
 
@@ -65,7 +159,41 @@ Your agents' memories belong to you — not a SaaS vendor.
 
 ## Quick Start
 
-### Docker (recommended)
+### Solo user (markdown + SQLite, no Docker)
+
+```bash
+git clone https://github.com/mfethe1/fumemory.git
+cd fumemory
+pip install -e .
+
+memu init ~/my-vault
+export MEMU_STORAGE_DSN=sqlite:///~/my-vault/.memu/index.db
+
+# Seed the wiki from your codebase
+memu ingest code /path/to/your/repo --exclude 'tests/**'
+
+# Search, list links, run the RLM orchestrator
+memu search "FooParser"
+memu links code/pkg/foo/FooParser
+memu solve "where does FooParser handle errors"
+
+# Open the folder in Obsidian for graph + backlinks (optional)
+obsidian ~/my-vault
+```
+
+### Agent integration (MCP — works in Claude Code, Cursor, Zed, Continue, Aider, Codex, Gemini)
+
+```bash
+# Claude Code
+/plugin marketplace add mfethe1/fumemory
+/plugin install memu
+
+# Cursor, Zed, Continue, Windsurf, Aider, Codex CLI, Gemini CLI:
+# see plugins/README.md — each is a single config file pointing at
+# `python -m memu.mcp.server`
+```
+
+### Team / swarm (Docker)
 
 ```bash
 git clone https://github.com/mfethe1/fumemory.git
@@ -75,7 +203,7 @@ docker compose up -d
 
 memU is running at `http://localhost:8000`.
 
-### Python client
+### Python client (legacy Postgres API)
 
 ```bash
 pip install memu-memory
@@ -98,7 +226,7 @@ results = client.search("deployment failures", limit=5)
 answer = client.chat("What have we learned about deployments?")
 ```
 
-### From source
+### From source (Postgres + NATS stack)
 
 ```bash
 git clone https://github.com/mfethe1/fumemory.git
