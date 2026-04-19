@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import AsyncIterator, Literal, Optional
 
+from ..lane_lock import FencingTokenError
 from .base import (
     LinkRecord,
     NodeKind,
@@ -25,29 +26,32 @@ from .base import (
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS nodes (
-    id            TEXT PRIMARY KEY,
-    slug          TEXT UNIQUE NOT NULL,
-    kind          TEXT NOT NULL,
-    title         TEXT NOT NULL,
-    body          TEXT NOT NULL,
-    tags_json     TEXT NOT NULL DEFAULT '[]',
-    metadata_json TEXT NOT NULL DEFAULT '{}',
-    extra_json    TEXT NOT NULL DEFAULT '{}',
-    source_json   TEXT,
-    agent_id      TEXT NOT NULL DEFAULT 'user',
-    memory_type   TEXT NOT NULL DEFAULT 'observation',
-    salience      REAL NOT NULL DEFAULT 0.5,
-    confidence    REAL NOT NULL DEFAULT 1.0,
-    created_at    TEXT NOT NULL,
-    updated_at    TEXT NOT NULL,
-    happened_at   TEXT
+    id                  TEXT PRIMARY KEY,
+    slug                TEXT UNIQUE NOT NULL,
+    kind                TEXT NOT NULL,
+    title               TEXT NOT NULL,
+    body                TEXT NOT NULL,
+    tags_json           TEXT NOT NULL DEFAULT '[]',
+    metadata_json       TEXT NOT NULL DEFAULT '{}',
+    extra_json          TEXT NOT NULL DEFAULT '{}',
+    source_json         TEXT,
+    agent_id            TEXT NOT NULL DEFAULT 'user',
+    memory_type         TEXT NOT NULL DEFAULT 'observation',
+    salience            REAL NOT NULL DEFAULT 0.5,
+    confidence          REAL NOT NULL DEFAULT 1.0,
+    created_at          TEXT NOT NULL,
+    updated_at          TEXT NOT NULL,
+    happened_at         TEXT,
+    reinforcement_count INTEGER NOT NULL DEFAULT 0,
+    last_reinforced_at  TEXT
 );
 
 CREATE INDEX IF NOT EXISTS nodes_kind_idx       ON nodes(kind);
 CREATE INDEX IF NOT EXISTS nodes_updated_idx    ON nodes(updated_at);
--- ``nodes_happened_idx`` is created by ``_apply_idempotent_migrations``
--- so that legacy DBs without the ``happened_at`` column don't error
--- on the CREATE INDEX step before the column is added.
+-- ``nodes_happened_idx`` and ``nodes_reinforce_idx`` are created by
+-- ``_apply_idempotent_migrations`` so that legacy DBs without the
+-- underlying columns don't error on the CREATE INDEX step before the
+-- columns are added.
 
 CREATE TABLE IF NOT EXISTS slug_registry (
     slug    TEXT PRIMARY KEY,
@@ -68,6 +72,25 @@ CREATE INDEX IF NOT EXISTS links_dst_idx ON links(dst_slug);
 CREATE VIRTUAL TABLE IF NOT EXISTS nodes_fts USING fts5(
     slug, title, body, tags,
     content='nodes', content_rowid='rowid', tokenize='porter'
+);
+
+-- Neighborhood lock registry (see ``memu/neighborhood_lock.py``).
+-- One row per held slug; ``root_slug`` records which acquisition owns
+-- the row so release can reclaim every slug in a single neighborhood.
+CREATE TABLE IF NOT EXISTS neighborhood_locks (
+    slug           TEXT PRIMARY KEY,
+    agent          TEXT NOT NULL,
+    fencing_token  INTEGER NOT NULL,
+    acquired_at    TEXT NOT NULL,
+    expires_at     TEXT NOT NULL,
+    root_slug      TEXT NOT NULL
+);
+
+-- Monotonic fencing-token counter, one row per slug. Survives lock
+-- releases so every acquire issues a strictly-higher token.
+CREATE TABLE IF NOT EXISTS fencing_tokens (
+    slug   TEXT PRIMARY KEY,
+    value  INTEGER NOT NULL
 );
 """
 
@@ -136,18 +159,106 @@ class SqliteBackend:
         return self._conn
 
     # ---- node CRUD
-    async def put_node(self, node: WikiNode) -> WikiNode:
+    async def put_node(
+        self,
+        node: WikiNode,
+        *,
+        fencing_token: int | None = None,
+    ) -> WikiNode:
         now = datetime.now(timezone.utc)
         if node.created_at is None:
             node.created_at = now
         node.updated_at = now
+        if fencing_token is not None:
+            # Split-brain guard: require the caller to prove they hold
+            # the current neighborhood lock. Runs in the same implicit
+            # transaction as the INSERT/UPDATE below so a racing
+            # acquirer can't slip between the check and the write.
+            row = self.conn.execute(
+                "SELECT fencing_token FROM neighborhood_locks WHERE slug = ?",
+                (node.slug,),
+            ).fetchone()
+            if row is None:
+                raise FencingTokenError(
+                    f"No neighborhood lock held for slug {node.slug!r}; "
+                    f"cannot validate fencing token {fencing_token}."
+                )
+            held = int(row["fencing_token"])
+            if held != fencing_token:
+                raise FencingTokenError(
+                    f"Fencing token mismatch on slug {node.slug!r}: "
+                    f"caller has {fencing_token}, registry has {held}. "
+                    f"Split-brain prevented."
+                )
+        # Reinforcement-on-duplicate: if the same slug is already in the
+        # index with an identical ``content_hash()``, treat this as a
+        # "seen again" signal and bump the counter/timestamp instead of
+        # overwriting the row. Upstream memU does this to let summaries
+        # surface the most-reinforced items first.
+        existing_row = self.conn.execute(
+            """SELECT id, title, body, reinforcement_count, created_at
+               FROM nodes WHERE slug = ? LIMIT 1""",
+            (node.slug,),
+        ).fetchone()
+        if existing_row is not None and _row_content_hash(existing_row) == node.content_hash():
+            new_count = int(existing_row["reinforcement_count"] or 0) + 1
+            # Reinforcement preserves title+body (that's what equivalence
+            # means) but still refreshes side-channel fields the caller
+            # may have set on the incoming node (``happened_at``,
+            # ``metadata``, ``extra``, ``tags``, ``source``, ``agent_id``,
+            # etc.). Without this, callers who re-put a known-good node
+            # after enriching its metadata would silently lose the
+            # enrichment.
+            self.conn.execute(
+                """UPDATE nodes
+                      SET reinforcement_count = ?,
+                          last_reinforced_at  = ?,
+                          updated_at          = ?,
+                          happened_at         = ?,
+                          tags_json           = ?,
+                          metadata_json       = ?,
+                          extra_json          = ?,
+                          source_json         = ?,
+                          agent_id            = ?,
+                          memory_type         = ?,
+                          salience            = ?,
+                          confidence          = ?
+                    WHERE id = ?""",
+                (
+                    new_count,
+                    now.isoformat(),
+                    now.isoformat(),
+                    node.happened_at.isoformat() if node.happened_at else None,
+                    json.dumps(list(node.tags)),
+                    json.dumps(node.metadata or {}),
+                    json.dumps(node.extra or {}),
+                    json.dumps(node.source) if node.source else None,
+                    node.agent_id,
+                    node.memory_type,
+                    node.salience,
+                    node.confidence,
+                    existing_row["id"],
+                ),
+            )
+            self.conn.commit()
+            # Return the stored node so the caller observes the bumped
+            # counter + merged side-channel fields.
+            stored = await self.get_node(existing_row["id"])
+            return stored if stored is not None else node
+        # Different content — this is a real write. Reset reinforcement
+        # because the node has changed; upstream considers edits a new
+        # "generation" of the memory.
+        if existing_row is not None:
+            node.reinforcement_count = 0
+            node.last_reinforced_at = None
         self.conn.execute(
             """
             INSERT INTO nodes(id, slug, kind, title, body, tags_json, metadata_json,
                               extra_json, source_json, agent_id, memory_type, salience,
-                              confidence, created_at, updated_at, happened_at)
+                              confidence, created_at, updated_at, happened_at,
+                              reinforcement_count, last_reinforced_at)
             VALUES(:id,:slug,:kind,:title,:body,:tags,:meta,:extra,:source,:agent,:mtype,
-                   :sal,:conf,:created,:updated,:happened)
+                   :sal,:conf,:created,:updated,:happened,:rcount,:rat)
             ON CONFLICT(id) DO UPDATE SET
                 slug=excluded.slug,
                 kind=excluded.kind,
@@ -162,7 +273,9 @@ class SqliteBackend:
                 salience=excluded.salience,
                 confidence=excluded.confidence,
                 updated_at=excluded.updated_at,
-                happened_at=excluded.happened_at
+                happened_at=excluded.happened_at,
+                reinforcement_count=excluded.reinforcement_count,
+                last_reinforced_at=excluded.last_reinforced_at
             """,
             {
                 "id": node.id,
@@ -181,6 +294,8 @@ class SqliteBackend:
                 "created": node.created_at.isoformat(),
                 "updated": node.updated_at.isoformat(),
                 "happened": node.happened_at.isoformat() if node.happened_at else None,
+                "rcount": int(node.reinforcement_count or 0),
+                "rat": node.last_reinforced_at.isoformat() if node.last_reinforced_at else None,
             },
         )
         await self.register_slug(node.slug, node.id, node.kind)
@@ -194,6 +309,25 @@ class SqliteBackend:
             )
         self.conn.commit()
         return node
+
+    async def reinforce_node(self, ref: str) -> Optional[WikiNode]:
+        now = datetime.now(timezone.utc)
+        row = self.conn.execute(
+            "SELECT id FROM nodes WHERE id = ? OR slug = ? LIMIT 1",
+            (ref, ref),
+        ).fetchone()
+        if row is None:
+            return None
+        self.conn.execute(
+            """UPDATE nodes
+                  SET reinforcement_count = reinforcement_count + 1,
+                      last_reinforced_at  = ?,
+                      updated_at          = ?
+                WHERE id = ?""",
+            (now.isoformat(), now.isoformat(), row["id"]),
+        )
+        self.conn.commit()
+        return await self.get_node(row["id"])
 
     async def get_node(self, ref: str) -> Optional[WikiNode]:
         row = self.conn.execute(
@@ -345,6 +479,8 @@ class SqliteBackend:
         ).fetchall()
         extra_json = _column_or_default(row, "extra_json", "{}")
         happened_at_val = _column_or_default(row, "happened_at", None)
+        rc = _column_or_default(row, "reinforcement_count", 0) or 0
+        lra = _column_or_default(row, "last_reinforced_at", None)
         return WikiNode(
             id=row["id"],
             slug=row["slug"],
@@ -362,6 +498,8 @@ class SqliteBackend:
             created_at=_parse(row["created_at"]),
             updated_at=_parse(row["updated_at"]),
             happened_at=_parse(happened_at_val) if happened_at_val else None,
+            reinforcement_count=int(rc),
+            last_reinforced_at=_parse(lra) if lra else None,
             links=[
                 LinkRecord(
                     src_slug=row["slug"],
@@ -384,6 +522,23 @@ def _parse(val: Optional[str]) -> Optional[datetime]:
         return None
 
 
+def _row_content_hash(row: sqlite3.Row) -> str:
+    """Content hash of a raw ``nodes`` row (title + body).
+
+    Uses the same normalization as :meth:`WikiNode.content_hash` so
+    ``put_node`` can decide reinforce-vs-overwrite without materializing
+    a full ``WikiNode`` first.
+    """
+    # Build a throwaway WikiNode-like object just to call the method;
+    # avoids duplicating the normalization logic here.
+    from .base import WikiNode as _WN  # local import avoids cycle at module load
+    return _WN(
+        id="", slug="", kind="note",
+        title=row["title"] or "",
+        body=row["body"] or "",
+    ).content_hash()
+
+
 def _apply_idempotent_migrations(conn: sqlite3.Connection) -> None:
     """Bring older SQLite vaults forward without a separate migration tool.
 
@@ -404,12 +559,20 @@ def _apply_idempotent_migrations(conn: sqlite3.Connection) -> None:
     migrations: list[tuple[str, str]] = [
         ("extra_json", "ALTER TABLE nodes ADD COLUMN extra_json TEXT NOT NULL DEFAULT '{}'"),
         ("happened_at", "ALTER TABLE nodes ADD COLUMN happened_at TEXT"),
+        (
+            "reinforcement_count",
+            "ALTER TABLE nodes ADD COLUMN reinforcement_count INTEGER NOT NULL DEFAULT 0",
+        ),
+        ("last_reinforced_at", "ALTER TABLE nodes ADD COLUMN last_reinforced_at TEXT"),
     ]
     for column, ddl in migrations:
         if column not in existing:
             conn.execute(ddl)
     conn.execute(
         "CREATE INDEX IF NOT EXISTS nodes_happened_idx ON nodes(happened_at)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS nodes_reinforce_idx ON nodes(reinforcement_count)"
     )
 
 
