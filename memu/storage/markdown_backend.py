@@ -184,6 +184,13 @@ class MarkdownBackend:
     async def close(self) -> None:  # nothing to close
         return None
 
+    def get_lock_registry(self):
+        """Return a :class:`MarkdownLockRegistry` rooted at this vault.
+        Callers must ``await registry.init()`` before use."""
+        from ..neighborhood_lock import MarkdownLockRegistry
+
+        return MarkdownLockRegistry(root=self.layout.root)
+
     # ---------------------------------------------------------------- helpers
     def _read(self, path: Path) -> Optional[WikiNode]:
         try:
