@@ -17,3 +17,5 @@ infra/local-nats/*.pid
 .local-nats*
 ui/node_modules/
 ui/dist/
+tmp/
+.pytest_cache/
