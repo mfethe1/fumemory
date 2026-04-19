@@ -13,6 +13,10 @@ from typing import Any
 from ..rlm import Orchestrator, RLMContext
 from ..storage.base import LinkRecord, StorageBackend, WikiNode
 from ..wiki import parse_wikilinks
+from .neighborhood_lock import InProcessLockBackend, NeighborhoodLock
+
+
+_DEFAULT_LOCK_BACKEND = InProcessLockBackend()
 
 
 TOOL_SCHEMAS: list[dict[str, Any]] = [
@@ -218,25 +222,31 @@ async def dispatch(
             ]
         return out
     if name == "wiki_write":
-        existing = await backend.get_node(args["slug"])
-        node_id = existing.id if existing else str(uuid.uuid4())
         body = args["body"]
-        links = [
-            LinkRecord(src_slug=args["slug"], dst_slug=link.slug, type="related")
-            for link in parse_wikilinks(body)
-        ]
-        node = WikiNode(
-            id=node_id,
-            slug=args["slug"],
-            kind=args.get("kind", "note"),
-            title=args.get("title") or args["slug"],
-            body=body,
-            tags=args.get("tags", []),
-            agent_id=args.get("agent_id", "mcp"),
-            links=links,
-            created_at=existing.created_at if existing else datetime.now(timezone.utc),
-        )
-        await backend.put_node(node)
+        new_outbound = [link.slug for link in parse_wikilinks(body)]
+        # Neighborhood: the target slug + any slug this write links out to.
+        # Target lock serializes concurrent writes to this slug; outbound locks
+        # prevent racing against concurrent writes to slugs we're linking to.
+        neighborhood = {args["slug"], *new_outbound}
+        async with NeighborhoodLock(_DEFAULT_LOCK_BACKEND, neighborhood):
+            existing = await backend.get_node(args["slug"])
+            node_id = existing.id if existing else str(uuid.uuid4())
+            links = [
+                LinkRecord(src_slug=args["slug"], dst_slug=dst, type="related")
+                for dst in new_outbound
+            ]
+            node = WikiNode(
+                id=node_id,
+                slug=args["slug"],
+                kind=args.get("kind", "note"),
+                title=args.get("title") or args["slug"],
+                body=body,
+                tags=args.get("tags", []),
+                agent_id=args.get("agent_id", "mcp"),
+                links=links,
+                created_at=existing.created_at if existing else datetime.now(timezone.utc),
+            )
+            await backend.put_node(node)
         return {"id": node.id, "slug": node.slug, "outbound_links": len(links)}
     if name == "wiki_link":
         link = LinkRecord(
