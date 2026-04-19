@@ -26,3 +26,18 @@ export MEMU_STORAGE_DSN=file://~/vault          # Tier 0 — markdown only
 export MEMU_STORAGE_DSN=sqlite:///~/vault/.memu/index.db
 export MEMU_STORAGE_DSN=postgres://user@host/memu  # Tier 2/3 (Phase 5)
 ```
+
+## Seeding the vault
+
+An empty vault is dead weight. Run the codebase ingester once to
+materialize every top-level symbol (class, function, method, module) as
+an addressable wiki node with typed outbound links for imports and
+same-module calls:
+
+```bash
+memu ingest code /path/to/repo --exclude 'tests/**'
+```
+
+or call the `wiki_ingest_code` MCP tool from any editor. Ingest is
+idempotent via content hashing — re-running on an unchanged tree is a
+no-op.

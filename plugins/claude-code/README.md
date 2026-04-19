@@ -29,6 +29,7 @@ python -m memu.cli.main init ~/my-vault
 
 - `/memu:wiki-search <query>` — full-text search, returns ranked slugs.
 - `/memu:wiki-write <slug> <body>` — create or update a note.
+- `/memu:ingest-code <path>` — materialize every top-level symbol in a Python source tree as a wiki node (imports + calls become typed links).
 - `/memu:rlm-investigate <task>` — recursive investigation over the vault.
 - `/memu:fix-with-context <symbol>` — pulls the 1-hop neighborhood, proposes a fix.
 - `/memu:vault-init <path>` — create a vault directory.

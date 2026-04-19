@@ -8,6 +8,7 @@ works and vector calls degrade gracefully.
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -271,8 +272,9 @@ class SqliteBackend:
     ) -> list[SearchHit]:
         if not query.strip():
             return []
-        # Quote to disable FTS5 operators for safety with arbitrary user input.
-        escaped = '"' + query.replace('"', '""') + '"'
+        escaped = _escape_fts_query(query)
+        if not escaped:
+            return []
         if kind:
             rows = self.conn.execute(
                 """SELECT n.*, bm25(nodes_fts) AS score
@@ -349,3 +351,24 @@ def _parse(val: Optional[str]) -> Optional[datetime]:
         return datetime.fromisoformat(val)
     except ValueError:
         return None
+
+
+_FTS_TOKEN_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_\-]*")
+
+
+def _escape_fts_query(query: str) -> str:
+    """Turn free-form user input into an FTS5 query string.
+
+    Splits on non-identifier characters, wraps each surviving token in
+    double-quotes, and joins with explicit ``OR`` so BM25 ranks the
+    document by how many tokens it covers. This mirrors the feel of
+    Obsidian/Google-style search — multi-word queries with stopwords
+    still return relevant results ranked by overlap instead of requiring
+    every token to appear. The surrounding quotes disable the FTS5
+    operator surface (``NEAR``, ``*``, column filters) against
+    unsanitised input.
+    """
+    tokens = _FTS_TOKEN_RE.findall(query)
+    if not tokens:
+        return ""
+    return " OR ".join(f'"{t}"' for t in tokens)

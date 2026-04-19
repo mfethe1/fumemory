@@ -129,6 +129,44 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "required": ["task"],
         },
     },
+    {
+        "name": "wiki_ingest_code",
+        "description": (
+            "Walk a source tree and materialize one wiki node per "
+            "top-level symbol (class, function, method, module). Imports "
+            "and same-module calls become typed outbound links. "
+            "Idempotent: re-running on an unchanged tree is a no-op."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Filesystem path to the source root.",
+                },
+                "languages": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Restrict to these parser keys (e.g. ['python']).",
+                },
+                "includes": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Glob patterns to include (repeatable).",
+                },
+                "excludes": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Glob patterns to exclude (repeatable).",
+                },
+                "respect_gitignore": {"type": "boolean", "default": True},
+                "force": {"type": "boolean", "default": False},
+                "repo_url": {"type": "string"},
+                "commit_sha": {"type": "string"},
+            },
+            "required": ["path"],
+        },
+    },
 ]
 
 
@@ -235,6 +273,30 @@ async def dispatch(
             "answer": result.answer,
             "slugs": result.slugs,
             "depth": result.depth,
+        }
+    if name == "wiki_ingest_code":
+        from ..ingest import ingest_codebase
+
+        result = await ingest_codebase(
+            backend,
+            args["path"],
+            languages=args.get("languages"),
+            includes=args.get("includes"),
+            excludes=args.get("excludes"),
+            respect_gitignore=args.get("respect_gitignore", True),
+            commit_sha=args.get("commit_sha"),
+            repo_url=args.get("repo_url"),
+            force=args.get("force", False),
+        )
+        return {
+            "added": result.added,
+            "updated": result.updated,
+            "unchanged_count": len(result.unchanged),
+            "scanned_files": result.scanned_files,
+            "skipped_files": result.skipped_files,
+            "parse_errors": result.parse_errors,
+            "elapsed_ms": result.elapsed_ms,
+            "commit_sha": result.commit_sha,
         }
     raise ValueError(f"Unknown tool: {name!r}")
 

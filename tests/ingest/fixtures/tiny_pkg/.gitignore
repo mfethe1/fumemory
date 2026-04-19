@@ -1,0 +1,3 @@
+ignored_file.py
+# The tests materialize `ignored_file.py` at runtime inside the fixture
+# directory to confirm the walker honors it.

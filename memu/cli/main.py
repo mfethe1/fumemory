@@ -70,6 +70,45 @@ def _build_parser() -> argparse.ArgumentParser:
     serve = sub.add_parser("serve", help="Start a server")
     serve.add_argument("kind", choices=["mcp"])
 
+    ingest = sub.add_parser("ingest", help="Ingest external sources")
+    ingest_sub = ingest.add_subparsers(dest="ingest_kind", required=True)
+    ingest_code = ingest_sub.add_parser("code", help="Ingest a codebase")
+    ingest_code.add_argument("path", help="Path to the source root to ingest")
+    ingest_code.add_argument(
+        "--language",
+        action="append",
+        default=None,
+        help="Restrict to a language (repeatable). Default: all supported.",
+    )
+    ingest_code.add_argument(
+        "--include",
+        action="append",
+        default=None,
+        help="Glob to include (repeatable).",
+    )
+    ingest_code.add_argument(
+        "--exclude",
+        action="append",
+        default=None,
+        help="Glob to exclude (repeatable).",
+    )
+    ingest_code.add_argument(
+        "--no-gitignore",
+        action="store_true",
+        help="Do not honor .gitignore files during the walk.",
+    )
+    ingest_code.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-write all nodes even when the source hash matches.",
+    )
+    ingest_code.add_argument(
+        "--repo-url", default=None, help="Record a repo URL in each node's source."
+    )
+    ingest_code.add_argument(
+        "--commit", default=None, help="Override the detected commit SHA."
+    )
+
     return p
 
 
@@ -167,6 +206,31 @@ async def _cmd_serve(args: argparse.Namespace, backend: StorageBackend) -> int:
     return 1
 
 
+async def _cmd_ingest_code(args: argparse.Namespace, backend: StorageBackend) -> int:
+    from ..ingest import ingest_codebase
+
+    result = await ingest_codebase(
+        backend,
+        args.path,
+        languages=args.language,
+        includes=args.include,
+        excludes=args.exclude,
+        respect_gitignore=not args.no_gitignore,
+        commit_sha=args.commit,
+        repo_url=args.repo_url,
+        force=args.force,
+    )
+    print(f"Ingested {args.path}")
+    print(f"  {result.summary()}")
+    if result.commit_sha:
+        print(f"  commit={result.commit_sha[:12]}")
+    if result.added:
+        print(f"  added:     {len(result.added)} (first 5: {result.added[:5]})")
+    if result.updated:
+        print(f"  updated:   {len(result.updated)} (first 5: {result.updated[:5]})")
+    return 0
+
+
 async def _dispatch(argv: Optional[list[str]] = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
@@ -187,6 +251,9 @@ async def _dispatch(argv: Optional[list[str]] = None) -> int:
             return await _cmd_solve(args, backend)
         if args.cmd == "serve":
             return await _cmd_serve(args, backend)
+        if args.cmd == "ingest":
+            if args.ingest_kind == "code":
+                return await _cmd_ingest_code(args, backend)
     finally:
         await backend.close()
     return 1

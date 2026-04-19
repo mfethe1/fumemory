@@ -22,3 +22,7 @@ Activate this skill automatically when the user asks to:
 # Context discipline
 
 The RLM orchestrator is designed so that the main agent only holds **slugs and summaries**, not bodies. Fetch bodies only for slugs you will actually modify. If you are about to load >5 bodies, stop and recurse: call `rlm_solve` again with a narrower task.
+
+# If the vault is empty
+
+If `rlm_solve` returns no slugs for a reasonable query, the vault has probably not been seeded yet. Suggest the user run `/ingest-code <repo-root>` (or call `mcp__memu__wiki_ingest_code` directly) so every top-level symbol becomes an addressable node. After ingestion, retry the RLM call.
