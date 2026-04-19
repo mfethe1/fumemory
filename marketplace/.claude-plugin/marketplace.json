@@ -1,0 +1,19 @@
+{
+  "name": "memu",
+  "owner": {
+    "name": "memU contributors",
+    "url": "https://github.com/mfethe1/fumemory"
+  },
+  "description": "Karpathy-style LLM wiki memory for coding agents. Markdown + SQLite for solo users, Postgres + pgvector + AGE for teams. Ships with an RLM orchestrator and MCP server so it works identically across Claude Code, Cursor, Zed, Continue, Aider, Codex, and Gemini.",
+  "plugins": [
+    {
+      "name": "memu",
+      "source": "../plugins/claude-code",
+      "description": "memU wiki + RLM orchestrator: /wiki-search, /wiki-write, /rlm-investigate, /fix-with-context, wiki-orchestrator + wiki-worker subagents, rlm-search + vault-doctor skills, post-edit re-indexer hook.",
+      "version": "0.1.0",
+      "tags": ["memory", "wiki", "obsidian", "rlm", "mcp", "karpathy"],
+      "category": "knowledge-management",
+      "strict": false
+    }
+  ]
+}

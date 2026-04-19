@@ -1,0 +1,11 @@
+{
+  "mcp": {
+    "memu": {
+      "command": "python",
+      "args": ["-m", "memu.mcp.server"],
+      "environment": {
+        "MEMU_STORAGE_DSN": "file://~/.memu/vault"
+      }
+    }
+  }
+}

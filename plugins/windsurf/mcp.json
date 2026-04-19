@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "memu": {
+      "command": "python",
+      "args": ["-m", "memu.mcp.server"]
+    }
+  }
+}
