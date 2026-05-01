@@ -82,14 +82,13 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning("Migration 002 failed (non-fatal): %s", e)
 
-    # Wire enhanced search router
+    # Wire enhanced search dependencies
     try:
-        from memu.search_enhanced import router as enhanced_router, configure as configure_enhanced
+        from memu.search_enhanced import configure as configure_enhanced
         configure_enhanced(pool, get_embedding, verify_api_key)
-        app.include_router(enhanced_router)
-        logger.info("Enhanced search endpoints registered (/search/hybrid, /search/raptor, /search/grep)")
+        logger.info("Enhanced search endpoints configured (/search/hybrid, /search/raptor, /search/grep)")
     except Exception as e:
-        logger.warning("Enhanced search router failed to load (non-fatal): %s", e)
+        logger.warning("Enhanced search router failed to configure (non-fatal): %s", e)
 
     if ENABLE_AGENT_EVENTS_CONSUMER:
         try:
@@ -124,6 +123,13 @@ app = FastAPI(
     version="0.1.0",
     lifespan=lifespan,
 )
+
+try:
+    from memu.search_enhanced import router as enhanced_router
+
+    app.include_router(enhanced_router)
+except Exception as e:
+    logger.warning("Enhanced search router import failed at app init: %s", e)
 
 memu_key_header = APIKeyHeader(name="X-MemU-Key", auto_error=False)
 legacy_api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)

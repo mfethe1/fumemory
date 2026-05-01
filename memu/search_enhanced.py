@@ -29,6 +29,12 @@ _verify_key_fn = None  # set via set_verify_key_fn()
 router = APIRouter(tags=["enhanced-search"])
 
 
+async def _require_api_key():
+    if _verify_key_fn is None:
+        raise HTTPException(503, "Auth verifier not configured")
+    return await _verify_key_fn()
+
+
 def configure(pool, get_embedding, verify_api_key):
     """Call this from api.py lifespan/startup to inject dependencies."""
     global _pool, _get_embedding_fn, _verify_key_fn
@@ -77,7 +83,7 @@ def _row_to_dict(row) -> dict:
 @router.post("/api/v1/memu/search/recall")
 async def hybrid_search_endpoint(
     req: HybridSearchRequest,
-    _key: str = Depends(lambda: _verify_key_fn),
+    _key: str = Depends(_require_api_key),
 ):
     """
     Hybrid semantic + BM25 search using Reciprocal Rank Fusion.
@@ -162,7 +168,7 @@ async def hybrid_search_endpoint(
 @router.post("/search/raptor")
 async def raptor_search_endpoint(
     req: RaptorSearchRequest,
-    _key: str = Depends(lambda: _verify_key_fn),
+    _key: str = Depends(_require_api_key),
 ):
     """
     RAPTOR hierarchical retrieval.
@@ -222,7 +228,7 @@ async def grep_search_endpoint(
     q: str,
     limit: int = 20,
     agent_id: str | None = None,
-    _key: str = Depends(lambda: _verify_key_fn),
+    _key: str = Depends(_require_api_key),
 ):
     """
     Fast keyword grep using the keyword index + PostgreSQL full-text.
