@@ -2693,6 +2693,13 @@ async def get_lane_status(api_key: str = Security(api_key_header)):
 
 # --- Search Vault / Recall Endpoints ---
 
+class MemURecallCompatRequest(BaseModel):
+    query: str
+    limit: int = 5
+    agent: str | None = None
+    agent_id: str | None = None
+
+
 @app.get("/api/v1/memu/search/recall")
 async def recall_search_compat(
     q: str,
@@ -2702,6 +2709,16 @@ async def recall_search_compat(
     _key: str = Depends(verify_api_key),
 ):
     return await recall_search(query=q, limit=limit, agent_id=agent_id or agent, _key=_key)
+
+
+@app.post("/api/v1/memu/search/recall")
+async def recall_search_post_compat(req: MemURecallCompatRequest, _key: str = Depends(verify_api_key)):
+    return await recall_search(query=req.query, limit=req.limit, agent_id=req.agent_id or req.agent, _key=_key)
+
+
+@app.post("/search/recall")
+async def recall_search_post(req: MemURecallCompatRequest, _key: str = Depends(verify_api_key)):
+    return await recall_search(query=req.query, limit=req.limit, agent_id=req.agent_id or req.agent, _key=_key)
 
 
 @app.get("/search/recall")
@@ -2730,20 +2747,33 @@ async def recall_search(
         raise HTTPException(status_code=503, detail="Database not initialized")
 
     async with _tenant_conn(_key) as conn:
-        vec = f"vector({EMBEDDING_DIMS})"
-        rows = await conn.fetch(
-            f"""
-            SELECT query, agent_id, created_at, results_count, 
-                   1 - (embedding <=> $1::{vec}) as similarity
-            FROM search_history
-            WHERE embedding IS NOT NULL
-            ORDER BY embedding <=> $1::{vec}
-            LIMIT $2
-            """,
-            str(embedding),
-            limit,
-        )
-        
+        if embedding is None:
+            rows = await conn.fetch(
+                """
+                SELECT query, agent_id, created_at, results_count, 0.0::float8 as similarity
+                FROM search_history
+                WHERE query ILIKE $1
+                ORDER BY created_at DESC
+                LIMIT $2
+                """,
+                f"%{normalized_query}%",
+                limit,
+            )
+        else:
+            vec = f"vector({EMBEDDING_DIMS})"
+            rows = await conn.fetch(
+                f"""
+                SELECT query, agent_id, created_at, results_count, 
+                       1 - (embedding <=> $1::{vec}) as similarity
+                FROM search_history
+                WHERE embedding IS NOT NULL
+                ORDER BY embedding <=> $1::{vec}
+                LIMIT $2
+                """,
+                str(embedding),
+                limit,
+            )
+
     return [dict(r) for r in rows]
 
 
