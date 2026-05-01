@@ -13,7 +13,7 @@ from typing import Any, Iterable
 from uuid import UUID
 
 import asyncpg
-from fastapi import Depends, FastAPI, HTTPException, Security
+from fastapi import Depends, FastAPI, HTTPException, Query, Security
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel
 
@@ -133,18 +133,39 @@ except Exception as e:
 
 memu_key_header = APIKeyHeader(name="X-MemU-Key", auto_error=False)
 legacy_api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+DEFAULT_TENANT_ID = UUID("00000000-0000-0000-0000-000000000001")
+
+
+class AuthContext(str):
+    tenant_id: UUID
+
+    def __new__(cls, api_key: str, tenant_id: UUID | None = None):
+        instance = super().__new__(cls, api_key)
+        instance.tenant_id = tenant_id or DEFAULT_TENANT_ID
+        return instance
 
 
 async def verify_api_key(
     memu_key: str | None = Security(memu_key_header),
     legacy_key: str | None = Security(legacy_api_key_header),
-) -> str:
+) -> AuthContext:
     key = memu_key or legacy_key
     if not key:
         raise HTTPException(status_code=401, detail="Missing authentication credentials")
     if key != MEMU_API_KEY:
         raise HTTPException(status_code=401, detail="Invalid X-MemU-Key")
-    return key
+    return AuthContext(api_key=key)
+
+
+@asynccontextmanager
+async def _tenant_conn(auth: AuthContext):
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.fetchval(
+                "SELECT set_config('app.current_tenant', $1, true)",
+                str(auth.tenant_id),
+            )
+            yield conn
 
 
 # --- Embedding ---
@@ -335,7 +356,7 @@ async def create_memory(req: MemoryCreate, _key: str = Depends(verify_api_key)):
     embedding = await get_embedding(req.content)
     c_hash = content_hash(req.content)
 
-    async with pool.acquire() as conn:
+    async with _tenant_conn(_key) as conn:
         # Check for duplicates
         existing = await conn.fetchrow(
             """
@@ -367,10 +388,11 @@ async def create_memory(req: MemoryCreate, _key: str = Depends(verify_api_key)):
                 json.dumps(normalized_metadata),
             )
         else:
+            tenant_id = getattr(_key, "tenant_id", DEFAULT_TENANT_ID)
             row = await conn.fetchrow(
                 """
-                INSERT INTO memories (content, embedding, memory_type, agent_id, metadata, parent_id, confidence, content_hash)
-                VALUES ($1, $2::vector, $3, $4, $5::jsonb, $6, $7, $8)
+                INSERT INTO memories (content, embedding, memory_type, agent_id, metadata, parent_id, confidence, content_hash, tenant_id)
+                VALUES ($1, $2::vector, $3, $4, $5::jsonb, $6, $7, $8, $9)
                 RETURNING *
                 """,
                 req.content,
@@ -381,6 +403,7 @@ async def create_memory(req: MemoryCreate, _key: str = Depends(verify_api_key)):
                 req.parent_id,
                 req.confidence,
                 c_hash,
+                tenant_id,
             )
 
     return _row_to_memory(row)
@@ -440,14 +463,14 @@ async def get_recent_memories(
     args.append(limit)
     query += f" ORDER BY created_at DESC LIMIT ${len(args)}"
     
-    async with pool.acquire() as conn:
+    async with _tenant_conn(_key) as conn:
         rows = await conn.fetch(query, *args)
         
     return [_row_to_memory(row) for row in rows]
 
 @app.get("/memories/{memory_id}", response_model=Memory)
 async def get_memory(memory_id: UUID, _key: str = Depends(verify_api_key)):
-    async with pool.acquire() as conn:
+    async with _tenant_conn(_key) as conn:
         # Increment access count (reinforcement)
         row = await conn.fetchrow(
             """
@@ -464,7 +487,7 @@ async def get_memory(memory_id: UUID, _key: str = Depends(verify_api_key)):
 
 @app.delete("/memories/{memory_id}")
 async def delete_memory(memory_id: UUID, _key: str = Depends(verify_api_key)):
-    async with pool.acquire() as conn:
+    async with _tenant_conn(_key) as conn:
         result = await conn.execute("DELETE FROM memories WHERE id = $1", memory_id)
     if result == "DELETE 0":
         raise HTTPException(status_code=404, detail="Memory not found")
@@ -560,7 +583,7 @@ async def search_memories(req: SearchRequest, _key: str = Depends(verify_api_key
 
     where = (" AND " + " AND ".join(filters)) if filters else ""
 
-    async with pool.acquire() as conn:
+    async with _tenant_conn(_key) as conn:
         candidate_limit = max(req.limit * 8, 32)
         rows = await conn.fetch(
             f"""
@@ -635,9 +658,11 @@ async def memu_search_compat(req: SearchRequest, _key: str = Depends(verify_api_
     return await search_memories(req, _key=_key)
 
 
+@app.get("/search-text")
 @app.post("/search-text")
 async def search_text(
-    query: str,
+    query: str | None = None,
+    q: str | None = Query(default=None),
     agent_id: str | None = None,
     memory_type: str | None = None,
     limit: int = 10,
@@ -647,8 +672,12 @@ async def search_text(
     Full-text search using PostgreSQL ILIKE — no embeddings needed.
     Useful for environments without an embedding provider or for exact keyword lookups.
     """
+    search_query = query or q
+    if not search_query:
+        raise HTTPException(status_code=422, detail="Missing query or q parameter")
+
     filters = ["content ILIKE $1"]
-    params: list[Any] = [f"%{query}%"]
+    params: list[Any] = [f"%{search_query}%"]
     idx = 2
 
     if agent_id:
@@ -706,7 +735,7 @@ async def chat(req: ChatRequest, _key: str = Depends(verify_api_key)):
 
     # Search for relevant context
     search_req = SearchRequest(query=req.question, limit=req.context_limit, agent_id=req.agent_id)
-    search_results = await search_memories(search_req, _key="internal")
+    search_results = await search_memories(search_req, _key=_key)
 
     context = "\n\n".join(
         f"[{r.memory.memory_type.value}] {r.memory.content}" for r in search_results
