@@ -24,6 +24,7 @@ import urllib.request
 
 
 COMPAT_BASE_SUFFIX = "/api/v1/memu"
+PRODUCTION_DEFAULT_API_URL = "https://api-production-86f5.up.railway.app/api/v1/memu"
 
 
 def _default_api_url() -> str:
@@ -33,6 +34,19 @@ def _default_api_url() -> str:
         or os.environ.get("MEMU_BASE_URL")
         or "http://127.0.0.1:8000"
     ).rstrip("/")
+
+
+def _api_candidates(api_url: str) -> list[str]:
+    requested = (api_url or "").rstrip("/")
+    if requested and requested.lower() != "auto":
+        return [requested]
+
+    candidates: list[str] = []
+    for url in (_default_api_url(), PRODUCTION_DEFAULT_API_URL):
+        normalized = url.rstrip("/")
+        if normalized and normalized not in candidates:
+            candidates.append(normalized)
+    return candidates
 
 
 def _resolve_api_key(explicit: str | None) -> str:
@@ -211,34 +225,44 @@ def _check_async(api_url: str, api_key: str) -> bool:
     return True
 
 
+def _verify_single(api_url: str, api_key: str, check_async: bool) -> bool:
+    if not _check_health(api_url):
+        return False
+
+    content = _write_sync_memory(api_url, api_key)
+    if not content:
+        return False
+
+    if not _verify_search_text(api_url, api_key, content):
+        return False
+
+    if not _verify_search_recall(api_url, api_key, content):
+        return False
+
+    if check_async and not _check_async(api_url, api_key):
+        return False
+
+    print(f"\n🎉 Deployment verification complete: SUCCESS ({api_url})")
+    return True
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Verify a memU deployment without mutating infra config.")
-    parser.add_argument("--api-url", default=_default_api_url(), help="Base URL for memU API")
+    parser.add_argument("--api-url", default="auto", help="Base URL for memU API, or 'auto' to try local then production")
     parser.add_argument("--api-key", default=None, help="memU API key (defaults to env/secrets lookup)")
     parser.add_argument("--check-async", action="store_true", help="Also verify Temporal-backed async endpoints")
     args = parser.parse_args()
 
-    api_url = args.api_url.rstrip("/")
     api_key = _resolve_api_key(args.api_key)
+    failures: list[str] = []
+    for api_url in _api_candidates(args.api_url):
+        print(f"\n=== Verifying {api_url} ===")
+        if _verify_single(api_url, api_key, args.check_async):
+            return 0
+        failures.append(api_url)
 
-    if not _check_health(api_url):
-        return 1
-
-    content = _write_sync_memory(api_url, api_key)
-    if not content:
-        return 1
-
-    if not _verify_search_text(api_url, api_key, content):
-        return 1
-
-    if not _verify_search_recall(api_url, api_key, content):
-        return 1
-
-    if args.check_async and not _check_async(api_url, api_key):
-        return 1
-
-    print("\n🎉 Deployment verification complete: SUCCESS")
-    return 0
+    print(f"\n❌ Deployment verification failed for: {', '.join(failures)}")
+    return 1
 
 
 if __name__ == "__main__":
