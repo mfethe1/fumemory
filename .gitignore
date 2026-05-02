@@ -13,3 +13,6 @@ infra/local-nats/nats-server
 infra/local-nats/nats-server.exe
 ui/node_modules/
 ui/dist/
+memu.pid
+memu_api.log
+uv.lock
