@@ -7,6 +7,17 @@ export PATH="/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PAT
 
 ACTION=$1
 PID_FILE="memu.pid"
+SECRET_MEMU_KEY_FILE="$HOME/.openclaw/secrets/memu_api_key"
+
+load_runtime_env() {
+    if [ -f .env ]; then
+        source .env
+    fi
+    if [ -f "$SECRET_MEMU_KEY_FILE" ] && { [ -z "${MEMU_API_KEY:-}" ] || [ "${MEMU_API_KEY}" = "memu-dev-key" ]; }; then
+        MEMU_API_KEY="$(tr -d '\r\n' < "$SECRET_MEMU_KEY_FILE")"
+        export MEMU_API_KEY
+    fi
+}
 
 function check_status() {
     if curl -s -m 2 http://localhost:8000/health > /dev/null; then
@@ -22,7 +33,7 @@ function start_memu() {
         exit 0
     fi
     echo "Starting memU..."
-    source .env || true
+    load_runtime_env
     export UV_PROJECT_ENVIRONMENT=.venv
     nohup uv run uvicorn memu.api:app --host 0.0.0.0 --port 8000 > memu_api.log 2>&1 &
     echo $! > $PID_FILE
