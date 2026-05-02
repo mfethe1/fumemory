@@ -22,6 +22,14 @@ import urllib.parse
 import urllib.request
 
 
+WRITE_PATHS = ("/upsert", "/memories")
+SEARCH_PROBES = (
+    ("POST", "/search", lambda q: {"query": q, "limit": 1}),
+    ("POST", "/search-text", lambda q: {"query": q, "limit": 1}),
+    ("GET", "/search-text", lambda q: None),
+)
+
+
 def _default_api_url() -> str:
     return (
         os.environ.get("MEMU_VERIFY_BASE_URL")
@@ -52,6 +60,7 @@ def _request(method: str, url: str, *, api_key: str | None = None, json_body: di
     headers = {"Content-Type": "application/json"}
     if api_key:
         headers["X-MemU-Key"] = api_key
+        headers["X-API-Key"] = api_key
     data = None if json_body is None else json.dumps(json_body).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
@@ -61,6 +70,13 @@ def _request(method: str, url: str, *, api_key: str | None = None, json_body: di
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")
         return e.code, body
+
+
+def _parse_json(body: str):
+    try:
+        return json.loads(body)
+    except json.JSONDecodeError:
+        return None
 
 
 def _check_health(api_url: str) -> bool:
@@ -79,36 +95,68 @@ def _write_sync_memory(api_url: str, api_key: str) -> str | None:
     payload = {
         "content": content,
         "agent_id": "macklemore-qa",
-        "memory_type": "observation",
+        "memory_type": "fact",
         "metadata": {"source": "deployment_test", "verified": True},
     }
-    status, body = _request("POST", f"{api_url}/memories", api_key=api_key, json_body=payload)
-    if status == 200:
-        print("✅ Sync write succeeded.")
-        return content
-    print(f"❌ Sync write failed: {status} - {body}")
+    for path in WRITE_PATHS:
+        status, body = _request("POST", f"{api_url}{path}", api_key=api_key, json_body=payload)
+        if status == 200:
+            print(f"✅ Sync write succeeded via {path}.")
+            return content
+    print(f"❌ Sync write failed on {', '.join(WRITE_PATHS)}: {status} - {body}")
     return None
 
 
 def _verify_ingestion(api_url: str, api_key: str, content: str) -> bool:
-    print("\n🔍 Verifying ingestion via /search-text...")
-    params = urllib.parse.urlencode({"q": content, "limit": 1})
-    status, body = _request("GET", f"{api_url}/search-text?{params}", api_key=api_key)
-    if status != 200:
-        print(f"❌ Verification query failed: {status} - {body}")
-        return False
+    print("\n🔍 Verifying ingestion via search endpoint...")
+    for method, path, payload_builder in SEARCH_PROBES:
+        if method == "GET":
+            params = urllib.parse.urlencode({"q": content, "query": content, "limit": 1})
+            status, body = _request(method, f"{api_url}{path}?{params}", api_key=api_key)
+        else:
+            status, body = _request(method, f"{api_url}{path}", api_key=api_key, json_body=payload_builder(content))
 
-    try:
-        results = json.loads(body)
-    except json.JSONDecodeError:
-        print(f"❌ Verification response was not JSON: {body}")
-        return False
+        if status != 200:
+            continue
 
-    if results and content in results[0].get("content", ""):
-        print(f"✅ Verified! Found memory: {results[0]['content'][:80]}...")
-        return True
+        parsed = _parse_json(body)
+        if parsed is None:
+            print(f"❌ Verification response was not JSON: {body}")
+            return False
+
+        if isinstance(parsed, dict):
+            results = parsed.get("results") or parsed.get("memories") or []
+        else:
+            results = parsed
+
+        if results and content in results[0].get("content", ""):
+            print(f"✅ Verified via {path}. Found memory: {results[0]['content'][:80]}...")
+            return True
 
     print("❌ Verification failed: newly written memory not found.")
+    return False
+
+
+def _check_recall(api_url: str, api_key: str, query: str) -> bool:
+    print("\n🧠 Verifying /search/recall...")
+    status, body = _request("POST", f"{api_url}/search/recall", api_key=api_key, json_body={"query": query, "limit": 1})
+    if status in {404, 405}:
+        print("⚠️ Recall endpoint not deployed on this target; core search verification already passed.")
+        return True
+    if status != 200:
+        print(f"❌ Recall query failed: {status} - {body}")
+        return False
+
+    results = _parse_json(body)
+    if results is None:
+        print(f"❌ Recall response was not JSON: {body}")
+        return False
+
+    if isinstance(results, list):
+        print(f"✅ Recall endpoint responded with {len(results)} result(s).")
+        return True
+
+    print(f"❌ Recall response shape was unexpected: {body}")
     return False
 
 
@@ -151,6 +199,9 @@ def main() -> int:
 
     content = _write_sync_memory(api_url, api_key)
     if not content or not _verify_ingestion(api_url, api_key, content):
+        return 1
+
+    if not _check_recall(api_url, api_key, content):
         return 1
 
     if args.check_async and not _check_async(api_url, api_key):
