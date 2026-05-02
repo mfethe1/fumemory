@@ -5,12 +5,13 @@ import json
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Dict, Optional, Union
 
 
-HealthCheckCallable = Callable[[dict[str, Any]], Awaitable[bool | dict[str, Any]]]
-RepairCallable = Callable[[dict[str, Any]], Awaitable[bool | dict[str, Any]]]
-EventCallback = Callable[[dict[str, Any]], Awaitable[None] | None]
+HealthCheckResult = Union[bool, Dict[str, Any]]
+HealthCheckCallable = Callable[[dict[str, Any]], Awaitable[HealthCheckResult]]
+RepairCallable = Callable[[dict[str, Any]], Awaitable[HealthCheckResult]]
+EventCallback = Callable[[dict[str, Any]], Optional[Awaitable[None]]]
 
 
 @dataclass
