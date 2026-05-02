@@ -16,7 +16,7 @@ from __future__ import annotations
 import os
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
 # These will be injected at import time from api.py's module-level objects
@@ -29,10 +29,13 @@ _verify_key_fn = None  # set via set_verify_key_fn()
 router = APIRouter(tags=["enhanced-search"])
 
 
-async def _require_api_key():
+async def _require_api_key(request: Request):
     if _verify_key_fn is None:
         raise HTTPException(503, "Auth verifier not configured")
-    return await _verify_key_fn()
+    return await _verify_key_fn(
+        memu_key=request.headers.get("X-MemU-Key"),
+        legacy_key=request.headers.get("X-API-Key"),
+    )
 
 
 def configure(pool, get_embedding, verify_api_key):

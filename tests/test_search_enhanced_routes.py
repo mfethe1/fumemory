@@ -5,11 +5,11 @@ from memu.api import app as memu_app
 from memu.search_enhanced import configure, router
 
 
-async def _fake_verify_api_key():
+async def _fake_verify_api_key(**_kwargs):
     return "ok"
 
 
-async def _reject_api_key():
+async def _reject_api_key(**_kwargs):
     raise HTTPException(status_code=401, detail="Missing authentication credentials")
 
 
@@ -65,3 +65,25 @@ def test_enhanced_routes_work_when_configured():
     assert body["ok"] is True
     assert body["method"] == "hybrid-rrf"
     assert body["results"] == []
+
+
+def test_enhanced_routes_forward_auth_headers_to_verifier():
+    captured = {}
+
+    async def _capture_verify_api_key(**kwargs):
+        captured.update(kwargs)
+        return "ok"
+
+    test_app = FastAPI()
+    test_app.include_router(router)
+    configure(_DummyPool(), _fake_get_embedding, _capture_verify_api_key)
+
+    client = TestClient(test_app)
+    response = client.post(
+        "/search/recall",
+        json={"query": "heartbeat test", "limit": 1},
+        headers={"X-API-Key": "legacy-key", "X-MemU-Key": "memu-key"},
+    )
+
+    assert response.status_code == 200
+    assert captured == {"memu_key": "memu-key", "legacy_key": "legacy-key"}
