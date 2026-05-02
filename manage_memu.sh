@@ -6,8 +6,12 @@ cd "$(dirname "$0")"
 export PATH="/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
 
 ACTION=$1
-PID_FILE="memu.pid"
+RUNTIME_DIR=".state/runtime"
+PID_FILE="$RUNTIME_DIR/memu.pid"
+LOG_FILE="$RUNTIME_DIR/memu_api.log"
 SECRET_MEMU_KEY_FILE="$HOME/.openclaw/secrets/memu_api_key"
+
+mkdir -p "$RUNTIME_DIR"
 
 load_runtime_env() {
     if [ -f .env ]; then
@@ -35,13 +39,13 @@ function start_memu() {
     echo "Starting memU..."
     load_runtime_env
     export UV_PROJECT_ENVIRONMENT=.venv
-    nohup uv run uvicorn memu.api:app --host 0.0.0.0 --port 8000 > memu_api.log 2>&1 &
+    nohup uv run uvicorn memu.api:app --host 0.0.0.0 --port 8000 > "$LOG_FILE" 2>&1 &
     echo $! > $PID_FILE
     sleep 3
     if check_status; then
         echo "memU started successfully."
     else
-        echo "Failed to start memU. Check memu_api.log"
+        echo "Failed to start memU. Check $LOG_FILE"
         exit 1
     fi
 }
