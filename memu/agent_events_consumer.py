@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from nats.js import JetStreamContext
+from nats.js.api import AckPolicy, ConsumerConfig, ReplayPolicy
 from memu.cluster import NATSClusterManager
 
 logger = logging.getLogger(__name__)
@@ -95,9 +96,15 @@ class AgentEventsConsumer:
             self.subject,
             durable=self.consumer_name,
             stream=self.stream,
+            config=ConsumerConfig(
+                durable_name=self.consumer_name,
+                ack_wait=ACK_WAIT_SECONDS,
+                max_ack_pending=MAX_ACK_PENDING,
+                ack_policy=AckPolicy.EXPLICIT,
+                replay_policy=ReplayPolicy.INSTANT,
+                filter_subject=self.subject,
+            ),
             manual_ack=True,
-            ack_wait=ACK_WAIT_SECONDS,
-            max_ack_pending=MAX_ACK_PENDING,
         )
 
         self._task = asyncio.create_task(self._consume())
@@ -150,20 +157,12 @@ class AgentEventsConsumer:
 
         try:
             await self._js.consumer_info(self.stream, self.consumer_name)
-            return
         except Exception:
             logger.info(
-                "Creating durable consumer %s on %s", self.consumer_name, self.stream
+                "Durable consumer %s will be auto-created on subscribe for %s",
+                self.consumer_name,
+                self.stream,
             )
-
-        await self._js.add_consumer(
-            stream=self.stream,
-            durable=self.consumer_name,
-            ack_wait=ACK_WAIT_SECONDS,
-            max_ack_pending=MAX_ACK_PENDING,
-            ack_policy="explicit",
-            replay_policy="instant",
-        )
 
     async def _consume(self):
         try:

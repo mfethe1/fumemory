@@ -21,6 +21,7 @@ from typing import Any, Callable, Coroutine
 import asyncpg
 
 from nats.js import JetStreamContext
+from nats.js.api import AckPolicy, ConsumerConfig, DeliverPolicy, ReplayPolicy
 from memu.backlog_projection import infer_lane
 from memu.cluster import NATSClusterManager
 
@@ -122,9 +123,16 @@ class StateProjectorConsumer:
             self.subject,
             durable=self.consumer_name,
             stream=self.stream,
+            config=ConsumerConfig(
+                durable_name=self.consumer_name,
+                ack_wait=STATE_EVENTS_ACK_WAIT_SECONDS,
+                max_ack_pending=STATE_EVENTS_MAX_ACK_PENDING,
+                ack_policy=AckPolicy.EXPLICIT,
+                replay_policy=ReplayPolicy.ORIGINAL,
+                deliver_policy=DeliverPolicy.ALL,
+                filter_subject=self.subject,
+            ),
             manual_ack=True,
-            ack_wait=STATE_EVENTS_ACK_WAIT_SECONDS,
-            max_ack_pending=STATE_EVENTS_MAX_ACK_PENDING,
         )
 
         self._task = asyncio.create_task(self._consume())
@@ -178,23 +186,12 @@ class StateProjectorConsumer:
 
         try:
             await self._js.consumer_info(self.stream, self.consumer_name)
-            return
         except Exception:
             logger.info(
-                "Creating durable consumer %s on %s", self.consumer_name, self.stream
+                "Durable consumer %s will be auto-created on subscribe for %s",
+                self.consumer_name,
+                self.stream,
             )
-
-        await self._js.add_consumer(
-            stream=self.stream,
-            durable=self.consumer_name,
-            ack_wait=STATE_EVENTS_ACK_WAIT_SECONDS,
-            max_ack_pending=STATE_EVENTS_MAX_ACK_PENDING,
-            ack_policy="explicit",
-            # Replay original sequence to support guaranteed post-restart replay
-            replay_policy="original",
-            deliver_policy="all",
-            filter_subject=self.subject,
-        )
 
     async def _consume(self):
         try:
