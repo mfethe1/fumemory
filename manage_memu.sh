@@ -9,9 +9,11 @@ ACTION=$1
 RUNTIME_DIR=".state/runtime"
 PID_FILE="$RUNTIME_DIR/memu.pid"
 LOG_FILE="$RUNTIME_DIR/memu_api.log"
+STATE_EVENTS_RUNTIME_DIR="$RUNTIME_DIR/state-events"
+MEMU_LOG_RUNTIME_DIR="$RUNTIME_DIR/logs"
 SECRET_MEMU_KEY_FILE="$HOME/.openclaw/secrets/memu_api_key"
 
-mkdir -p "$RUNTIME_DIR"
+mkdir -p "$RUNTIME_DIR" "$STATE_EVENTS_RUNTIME_DIR" "$MEMU_LOG_RUNTIME_DIR"
 
 load_runtime_env() {
     if [ -f .env ]; then
@@ -39,6 +41,8 @@ function start_memu() {
     echo "Starting memU..."
     load_runtime_env
     export UV_PROJECT_ENVIRONMENT=.venv
+    export MEMU_LOG_DIR="${MEMU_LOG_DIR:-$MEMU_LOG_RUNTIME_DIR}"
+    export STATE_EVENTS_EVIDENCE_PATH="${STATE_EVENTS_EVIDENCE_PATH:-$STATE_EVENTS_RUNTIME_DIR/live-emits.jsonl}"
     nohup uv run uvicorn memu.api:app --host 0.0.0.0 --port 8000 > "$LOG_FILE" 2>&1 &
     echo $! > $PID_FILE
     sleep 3
