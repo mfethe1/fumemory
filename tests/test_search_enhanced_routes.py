@@ -5,11 +5,13 @@ from memu.api import app as memu_app
 from memu.search_enhanced import configure, router
 
 
-async def _fake_verify_api_key():
-    return "ok"
+async def _fake_verify_api_key(memu_key=None, legacy_key=None):
+    if memu_key == "test-key" or legacy_key == "test-key":
+        return "ok"
+    raise HTTPException(status_code=401, detail="Missing authentication credentials")
 
 
-async def _reject_api_key():
+async def _reject_api_key(memu_key=None, legacy_key=None):
     raise HTTPException(status_code=401, detail="Missing authentication credentials")
 
 
@@ -52,16 +54,36 @@ def test_enhanced_routes_require_auth_before_querying():
     assert response.json()["detail"] == "Missing authentication credentials"
 
 
-def test_enhanced_routes_work_when_configured():
+def test_enhanced_routes_work_when_configured_with_x_memu_key():
     test_app = FastAPI()
     test_app.include_router(router)
     configure(_DummyPool(), _fake_get_embedding, _fake_verify_api_key)
 
     client = TestClient(test_app)
-    response = client.post("/search/recall", json={"query": "heartbeat test", "limit": 1})
+    response = client.post(
+        "/search/recall",
+        json={"query": "heartbeat test", "limit": 1},
+        headers={"X-MemU-Key": "test-key"},
+    )
 
     assert response.status_code == 200
     body = response.json()
     assert body["ok"] is True
     assert body["method"] == "hybrid-rrf"
     assert body["results"] == []
+
+
+def test_enhanced_routes_work_when_configured_with_legacy_key():
+    test_app = FastAPI()
+    test_app.include_router(router)
+    configure(_DummyPool(), _fake_get_embedding, _fake_verify_api_key)
+
+    client = TestClient(test_app)
+    response = client.post(
+        "/search/recall",
+        json={"query": "heartbeat test", "limit": 1},
+        headers={"X-API-Key": "test-key"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["ok"] is True
