@@ -89,6 +89,12 @@ class Memory(BaseModel):
     created_at: datetime
     updated_at: datetime
 
+class RecallMode(str, Enum):
+    """Explicit recall mode. learning is the default; forensic must be requested."""
+    learning = "learning"
+    forensic = "forensic"
+
+
 class SearchRequest(BaseModel):
     query: str
     limit: int = 10
@@ -104,6 +110,55 @@ class SearchRequest(BaseModel):
     time_window_end: datetime | None = None
     entity_weight: float = 0.15
     agent_roles: list[str] | None = Field(None, description="ABAC: caller's roles for access filtering. None = no filtering.")
+
+
+class ForensicRecallRequest(BaseModel):
+    """Request shape for Forensic Recall — returns Evidence Memory with replay-grade provenance."""
+    query: Optional[str] = Field(None, description="Optional semantic/lexical query to narrow evidence records.")
+    task_id: Optional[str] = Field(None, description="Filter by OpenClaw task ID stored in metadata.")
+    session_id: Optional[str] = Field(None, description="Filter by session ID stored in metadata.")
+    gateway_id: Optional[str] = Field(None, description="Filter by gateway ID stored in metadata.")
+    agent_id: Optional[str] = Field(None, description="Filter by agent_id column.")
+    event_type: Optional[str] = Field(None, description="Filter by event_type stored in metadata.")
+    time_window_start: Optional[datetime] = Field(None, description="Earliest created_at to include.")
+    time_window_end: Optional[datetime] = Field(None, description="Latest created_at to include.")
+    artifact_ref: Optional[str] = Field(None, description="Filter evidence whose artifact_refs contain this value.")
+    limit: int = Field(20, ge=1, le=200)
+    cursor: Optional[str] = Field(None, description="Opaque pagination cursor from a previous response.")
+    include_content: bool = Field(True, description="When False, content is redacted from all items.")
+    agent_roles: Optional[list[str]] = Field(None, description="ABAC: caller roles for per-record access filtering.")
+
+
+class ForensicRecallItem(BaseModel):
+    """Single evidence record returned by Forensic Recall with replay-grade provenance."""
+    evidence_id: UUID
+    memory_kind: str
+    memory_type: str
+    content: Optional[str] = None
+    redacted: bool = False
+    redaction_reason: Optional[str] = None
+    event_type: Optional[str] = None
+    event_at: Optional[datetime] = None
+    task_id: Optional[str] = None
+    session_id: Optional[str] = None
+    gateway_id: Optional[str] = None
+    agent_id: str
+    source: Optional[str] = None
+    source_ref: Optional[str] = None
+    artifact_refs: list[str] = Field(default_factory=list)
+    allowed_roles: list[str] = Field(default_factory=lambda: ["*"])
+    provenance_links: list[str] = Field(
+        default_factory=list,
+        description="Source evidence IDs for learning records or correction record IDs for evidence.",
+    )
+    created_at: datetime
+
+
+class ForensicRecallResponse(BaseModel):
+    """Paginated response for Forensic Recall."""
+    items: list[ForensicRecallItem]
+    next_cursor: Optional[str] = None
+    total_count: Optional[int] = None
 
 class SearchResult(BaseModel):
     memory: Memory
