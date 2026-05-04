@@ -54,7 +54,7 @@ try {
         onSandboxReady: [
           {
             command:
-              "git config core.filemode false && git config core.autocrlf false && git reset --hard HEAD && python3 -m pip install --user --disable-pip-version-check --no-deps -e .",
+              "git config core.filemode false && git config core.autocrlf false && git reset --hard HEAD && python3 -c \"import memu, pytest\"",
             timeoutMs: 1800000,
           },
         ],
