@@ -39,13 +39,7 @@ Read these before making changes:
 
 # Verification
 
-Use the local Python environment created by the Sandcastle setup hook:
-
-```sh
-. .venv/bin/activate
-```
-
-Run focused tests for the behavior you touched. If the issue touches shared API, deployment, readiness, schema, or recall behavior, also run the most relevant existing tests. If a test is already blocked by an external service or import-time server dependency, document the exact command and failure in your final response.
+The sandbox image already contains the project dependencies. Run focused tests with `python3 -m pytest` for the behavior you touched. If the issue touches shared API, deployment, readiness, schema, or recall behavior, also run the most relevant existing tests. If a test is already blocked by an external service or import-time server dependency, document the exact command and failure in your final response.
 
 # Final Response
 

@@ -54,7 +54,7 @@ try {
         onSandboxReady: [
           {
             command:
-              "git config core.filemode false && git config core.autocrlf false && git reset --hard HEAD && python3 -m venv .venv && . .venv/bin/activate && python -m pip install --disable-pip-version-check --upgrade pip && python -m pip install --disable-pip-version-check --prefer-binary -e \".[dev]\"",
+              "git config core.filemode false && git config core.autocrlf false && git reset --hard HEAD && python3 -m pip install --user --disable-pip-version-check --no-deps -e .",
             timeoutMs: 1800000,
           },
         ],

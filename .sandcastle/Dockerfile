@@ -19,6 +19,12 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
   && apt-get update && apt-get install -y gh \
   && rm -rf /var/lib/apt/lists/*
 
+WORKDIR /tmp/fumemory-deps
+COPY pyproject.toml requirements.txt README.md ./
+COPY memu ./memu
+RUN python3 -m pip install --break-system-packages --disable-pip-version-check --upgrade pip \
+  && python3 -m pip install --break-system-packages --disable-pip-version-check --prefer-binary -e ".[dev]"
+
 RUN usermod -d /home/agent -m -l agent node
 USER agent
 
