@@ -4,11 +4,13 @@ import pytest
 
 from memu.gateway_federation import (
     FederationConfig,
+    SmokeResult,
     allowed_subject,
     build_dispatch_envelope,
     build_gateway_announce,
     durable_consumer_name,
     response_subject,
+    results_to_json,
     validate_gateway_id,
 )
 
@@ -69,3 +71,52 @@ def test_federation_config_validation_requires_nats_url() -> None:
     cfg.validate()
     with pytest.raises(ValueError):
         FederationConfig(gateway_id="mac-mini-main", nats_railway_url="").validate()
+
+
+# --- results_to_json proof format ---
+
+def test_results_to_json_includes_gateway_and_nats_fields() -> None:
+    results = [SmokeResult(name="config", ok=True, detail="ok")]
+    out = results_to_json(results, gateway_id="test-gw", nats_railway_url="nats://token@host:4222")
+    assert out["gateway_id"] == "test-gw"
+    assert "[REDACTED]" in out["nats_railway_url"]
+    assert "token" not in out["nats_railway_url"]
+    assert "evidence_memory_ids" in out
+
+
+def test_results_to_json_redacts_nats_url_with_credentials() -> None:
+    results = [SmokeResult(name="config", ok=True, detail="ok")]
+    out = results_to_json(results, gateway_id="test-gw", nats_railway_url="nats://secret@railway-host:4222")
+    assert out["nats_railway_url"] == "nats://[REDACTED]@railway-host:4222"
+    assert "secret" not in out["nats_railway_url"]
+
+
+def test_results_to_json_keeps_nats_url_without_credentials() -> None:
+    results = [SmokeResult(name="config", ok=True, detail="ok")]
+    out = results_to_json(results, gateway_id="test-gw", nats_railway_url="nats://railway-host:4222")
+    assert out["nats_railway_url"] == "nats://railway-host:4222"
+
+
+def test_results_to_json_extracts_evidence_memory_ids() -> None:
+    results = [
+        SmokeResult(name="memu-write", ok=True, detail="ok", data={"id": "mem-abc-123", "content": "smoke"}),
+    ]
+    out = results_to_json(results, gateway_id="test-gw")
+    assert "mem-abc-123" in out["evidence_memory_ids"]
+
+
+def test_results_to_json_excludes_memory_id_from_failed_write() -> None:
+    results = [
+        SmokeResult(name="memu-write", ok=False, detail="write status=500", data=None),
+    ]
+    out = results_to_json(results, gateway_id="test-gw")
+    assert out["evidence_memory_ids"] == []
+
+
+def test_results_to_json_overall_false_when_any_check_fails() -> None:
+    results = [
+        SmokeResult(name="config", ok=True, detail="ok"),
+        SmokeResult(name="connect", ok=False, detail="connection refused"),
+    ]
+    out = results_to_json(results, gateway_id="test-gw")
+    assert out["ok"] is False

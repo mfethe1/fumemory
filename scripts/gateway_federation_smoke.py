@@ -37,7 +37,7 @@ async def _main() -> int:
     args = parse_args()
     cfg = FederationConfig.from_env()
     results = await run_smoke_checks(cfg, run_memu_check=not args.skip_memu)
-    payload = results_to_json(results)
+    payload = results_to_json(results, gateway_id=cfg.gateway_id, nats_railway_url=cfg.nats_railway_url)
 
     if args.json:
         print(json.dumps(payload, indent=2))
