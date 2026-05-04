@@ -56,6 +56,11 @@ from memu.models import (
     MemoryKind,
     MemoryType,
     RecallMode,
+    ReflectionAction,
+    ReflectionActionRequest,
+    ReflectionActionResponse,
+    ReflectionProposal,
+    ReflectionProposalCreate,
     SearchRequest,
     SearchResult,
     Task,
@@ -65,6 +70,7 @@ from memu.models import (
     TaskReviewRequest,
 )
 from memu.schema_contract import compute_canonical_payload_hash
+from memu.reflection import compute_proposal_expiry, is_proposal_expired
 
 from memu.notion_bridge import create_bridge_from_env, NotionBridge
 from memu.migrations import run_migrations
@@ -1658,6 +1664,460 @@ async def forensic_recall(req: ForensicRecallRequest, _key: str = Depends(verify
         next_cursor = f"{last['created_at'].isoformat()}__{last['id']}"
 
     return ForensicRecallResponse(items=items, next_cursor=next_cursor)
+
+
+# ---------------------------------------------------------------------------
+# Reflection Review Queue endpoints (Issue #28)
+# ---------------------------------------------------------------------------
+
+def _row_to_proposal(row: Any) -> ReflectionProposal:
+    """Convert a reflection_proposals DB row to a ReflectionProposal model."""
+    risk_flags = row.get("risk_flags") or []
+    if isinstance(risk_flags, str):
+        risk_flags = json.loads(risk_flags)
+
+    source_evidence_ids = row.get("source_evidence_ids") or []
+    if isinstance(source_evidence_ids, str):
+        source_evidence_ids = json.loads(source_evidence_ids)
+
+    return ReflectionProposal(
+        proposal_id=row["proposal_id"],
+        tenant_id=str(row["tenant_id"]),
+        status=row["status"],
+        source=row["source"],
+        summary=row["summary"],
+        content=row["content"],
+        confidence=float(row["confidence"]),
+        risk_flags=list(risk_flags),
+        source_task_id=row.get("source_task_id"),
+        source_session_id=row.get("source_session_id"),
+        source_evidence_ids=list(source_evidence_ids),
+        expires_at=row["expires_at"],
+        telegram_message_id=row.get("telegram_message_id"),
+        memory_id=row.get("memory_id"),
+        superseded_by=row.get("superseded_by"),
+        agent_id=row.get("agent_id") or "unknown",
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
+
+
+async def _write_accepted_learning_memory(
+    conn: Any,
+    proposal: Any,
+    content: str,
+    review_status: str,
+    tenant_id: str,
+    supersedes_id: Optional[UUID] = None,
+) -> UUID:
+    """Write a Learning Memory to the memories table for an accepted proposal.
+
+    Returns the new memory's UUID. Sets review_status explicitly so the memory
+    is immediately eligible for default (learning) recall.
+    """
+    meta: dict[str, Any] = {
+        "source": "reflection",
+        "proposal_id": str(proposal["proposal_id"]),
+        "source_task_id": proposal.get("source_task_id"),
+        "source_session_id": proposal.get("source_session_id"),
+        "source_evidence_ids": list(proposal.get("source_evidence_ids") or []),
+        "allowed_roles": ["*"],
+    }
+    if supersedes_id:
+        meta["supersedes"] = str(supersedes_id)
+
+    c_hash = content_hash(content)
+    row = await conn.fetchrow(
+        """
+        INSERT INTO memories (
+            content, memory_type, memory_kind, agent_id, metadata,
+            confidence, content_hash, tenant_id, review_status
+        )
+        VALUES ($1, 'lesson', 'learning', $2, $3::jsonb, $4, $5, $6, $7)
+        RETURNING id
+        """,
+        content,
+        proposal.get("agent_id") or "reflection-worker",
+        json.dumps(meta),
+        float(proposal["confidence"]),
+        c_hash,
+        tenant_id,
+        review_status,
+    )
+    new_id = row["id"]
+
+    # If this supersedes an earlier memory, mark that memory invalid
+    if supersedes_id:
+        now = datetime.now(timezone.utc)
+        await conn.execute(
+            """
+            UPDATE memories
+            SET valid_to = COALESCE(valid_to, $2),
+                metadata = COALESCE(metadata, '{}'::jsonb)
+                    || jsonb_build_object('invalidated_by', $1::text, 'invalidated_at', $2::text),
+                updated_at = NOW()
+            WHERE id = $3
+              AND (valid_to IS NULL OR valid_to > $2)
+            """,
+            str(new_id),
+            now,
+            supersedes_id,
+        )
+
+    return new_id
+
+
+@app.post("/api/v1/reflections/proposals", response_model=ReflectionProposal)
+async def create_reflection_proposal(
+    req: ReflectionProposalCreate,
+    _key: str = Depends(verify_api_key),
+):
+    """Create a reflection proposal entering the 6-hour review window.
+
+    The proposal is stored as 'pending' until approved, denied, edited,
+    or automatically integrated after the review window expires.
+    """
+    tenant_id = str(getattr(_key, "tenant_id", DEFAULT_TENANT_ID))
+    now = datetime.now(timezone.utc)
+    expires_at = compute_proposal_expiry(now)
+
+    async with _tenant_conn(_key) as conn:
+        row = await conn.fetchrow(
+            """
+            INSERT INTO reflection_proposals (
+                tenant_id, status, source, summary, content, confidence,
+                risk_flags, source_task_id, source_session_id,
+                source_evidence_ids, expires_at, agent_id
+            )
+            VALUES ($1, 'pending', $2, $3, $4, $5, $6::jsonb, $7, $8, $9::jsonb, $10, $11)
+            RETURNING *
+            """,
+            tenant_id,
+            req.source.value,
+            req.summary,
+            req.content,
+            req.confidence,
+            json.dumps(req.risk_flags),
+            req.source_task_id,
+            req.source_session_id,
+            json.dumps(req.source_evidence_ids),
+            expires_at,
+            req.agent_id,
+        )
+
+    return _row_to_proposal(row)
+
+
+@app.get("/api/v1/reflections/proposals", response_model=list[ReflectionProposal])
+async def list_reflection_proposals(
+    status: Optional[str] = None,
+    source: Optional[str] = None,
+    limit: int = 20,
+    _key: str = Depends(verify_api_key),
+):
+    """List reflection proposals for the current tenant.
+
+    Defaults to pending proposals. Supports status and source filters.
+    """
+    tenant_id = str(getattr(_key, "tenant_id", DEFAULT_TENANT_ID))
+    filters = ["tenant_id = $1"]
+    params: list[Any] = [tenant_id]
+    idx = 2
+
+    if status:
+        filters.append(f"status = ${idx}")
+        params.append(status)
+        idx += 1
+    else:
+        filters.append("status = 'pending'")
+
+    if source:
+        filters.append(f"source = ${idx}")
+        params.append(source)
+        idx += 1
+
+    where = " AND ".join(filters)
+    async with _tenant_conn(_key) as conn:
+        rows = await conn.fetch(
+            f"""
+            SELECT * FROM reflection_proposals
+            WHERE {where}
+            ORDER BY expires_at ASC
+            LIMIT {limit}
+            """,
+            *params,
+        )
+
+    return [_row_to_proposal(row) for row in rows]
+
+
+@app.get("/api/v1/reflections/proposals/{proposal_id}", response_model=ReflectionProposal)
+async def get_reflection_proposal(
+    proposal_id: UUID,
+    _key: str = Depends(verify_api_key),
+):
+    """Fetch a single reflection proposal by ID."""
+    tenant_id = str(getattr(_key, "tenant_id", DEFAULT_TENANT_ID))
+    async with _tenant_conn(_key) as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM reflection_proposals WHERE proposal_id = $1 AND tenant_id = $2",
+            proposal_id,
+            tenant_id,
+        )
+    if not row:
+        raise HTTPException(status_code=404, detail="Proposal not found")
+    return _row_to_proposal(row)
+
+
+@app.post(
+    "/api/v1/reflections/proposals/{proposal_id}/action",
+    response_model=ReflectionActionResponse,
+)
+async def take_reflection_action(
+    proposal_id: UUID,
+    req: ReflectionActionRequest,
+    _key: str = Depends(verify_api_key),
+):
+    """Take action on a reflection proposal: approve, deny, edit, or inspect.
+
+    approve  — accepts the proposal and writes the Learning Memory.
+    deny     — rejects the proposal; no memory is written.
+    edit     — accepts with modified content and writes the Learning Memory.
+               If the proposal is already accepted/accepted_by_timeout,
+               creates a superseding Learning Memory (late feedback) without
+               mutating the original accepted record.
+    inspect  — logs the review action; proposal status is unchanged.
+               Returns the proposal with source evidence IDs for forensic recall.
+    """
+    tenant_id = str(getattr(_key, "tenant_id", DEFAULT_TENANT_ID))
+    decision = req.decision
+
+    async with _tenant_conn(_key) as conn:
+        proposal_row = await conn.fetchrow(
+            "SELECT * FROM reflection_proposals WHERE proposal_id = $1 AND tenant_id = $2",
+            proposal_id,
+            tenant_id,
+        )
+        if not proposal_row:
+            raise HTTPException(status_code=404, detail="Proposal not found")
+
+        current_status = proposal_row["status"]
+        memory_id: Optional[UUID] = None
+        supersedes_id: Optional[UUID] = None
+        new_status = current_status
+
+        if decision == ReflectionAction.inspect:
+            # inspect: record the action, leave status unchanged
+            await conn.execute(
+                """
+                INSERT INTO reflection_actions (proposal_id, actor, decision, notes)
+                VALUES ($1, $2, 'inspect', $3)
+                """,
+                proposal_id,
+                req.actor,
+                req.notes,
+            )
+            return ReflectionActionResponse(
+                proposal_id=proposal_id,
+                decision="inspect",
+                status=current_status,
+                memory_id=proposal_row.get("memory_id"),
+            )
+
+        if decision == ReflectionAction.deny:
+            if current_status not in ("pending",):
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Cannot deny a proposal with status '{current_status}'.",
+                )
+            new_status = "rejected"
+            await conn.execute(
+                "UPDATE reflection_proposals SET status = 'rejected', updated_at = NOW() "
+                "WHERE proposal_id = $1",
+                proposal_id,
+            )
+            await conn.execute(
+                """
+                INSERT INTO reflection_actions (proposal_id, actor, decision, notes)
+                VALUES ($1, $2, 'deny', $3)
+                """,
+                proposal_id,
+                req.actor,
+                req.notes,
+            )
+            return ReflectionActionResponse(
+                proposal_id=proposal_id,
+                decision="deny",
+                status=new_status,
+            )
+
+        if decision == ReflectionAction.approve:
+            if current_status != "pending":
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Cannot approve a proposal with status '{current_status}'.",
+                )
+            new_status = "accepted"
+            memory_id = await _write_accepted_learning_memory(
+                conn=conn,
+                proposal=proposal_row,
+                content=proposal_row["content"],
+                review_status="accepted",
+                tenant_id=tenant_id,
+            )
+            await conn.execute(
+                "UPDATE reflection_proposals SET status = 'accepted', memory_id = $2, "
+                "updated_at = NOW() WHERE proposal_id = $1",
+                proposal_id,
+                memory_id,
+            )
+            await conn.execute(
+                """
+                INSERT INTO reflection_actions (proposal_id, actor, decision, notes)
+                VALUES ($1, $2, 'approve', $3)
+                """,
+                proposal_id,
+                req.actor,
+                req.notes,
+            )
+            return ReflectionActionResponse(
+                proposal_id=proposal_id,
+                decision="approve",
+                status=new_status,
+                memory_id=memory_id,
+            )
+
+        if decision == ReflectionAction.edit:
+            edited = req.edited_content
+            if not edited:
+                raise HTTPException(
+                    status_code=422,
+                    detail="edited_content is required for the 'edit' action.",
+                )
+
+            if current_status == "pending":
+                # Normal edit-and-accept path
+                new_status = "accepted"
+                memory_id = await _write_accepted_learning_memory(
+                    conn=conn,
+                    proposal=proposal_row,
+                    content=edited,
+                    review_status="accepted",
+                    tenant_id=tenant_id,
+                )
+                await conn.execute(
+                    "UPDATE reflection_proposals SET status = 'accepted', memory_id = $2, "
+                    "updated_at = NOW() WHERE proposal_id = $1",
+                    proposal_id,
+                    memory_id,
+                )
+            elif current_status in ("accepted", "accepted_by_timeout"):
+                # Late feedback: create superseding memory without mutating history
+                original_memory_id: Optional[UUID] = proposal_row.get("memory_id")
+                supersedes_id = original_memory_id
+                new_status = "superseded"
+                memory_id = await _write_accepted_learning_memory(
+                    conn=conn,
+                    proposal=proposal_row,
+                    content=edited,
+                    review_status="accepted",
+                    tenant_id=tenant_id,
+                    supersedes_id=original_memory_id,
+                )
+                await conn.execute(
+                    "UPDATE reflection_proposals SET status = 'superseded', superseded_by = $2, "
+                    "updated_at = NOW() WHERE proposal_id = $1",
+                    proposal_id,
+                    proposal_id,
+                )
+            else:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Cannot edit a proposal with status '{current_status}'.",
+                )
+
+            await conn.execute(
+                """
+                INSERT INTO reflection_actions
+                    (proposal_id, actor, decision, notes, edited_content)
+                VALUES ($1, $2, 'edit', $3, $4)
+                """,
+                proposal_id,
+                req.actor,
+                req.notes,
+                edited,
+            )
+            return ReflectionActionResponse(
+                proposal_id=proposal_id,
+                decision="edit",
+                status=new_status,
+                memory_id=memory_id,
+                supersedes_id=supersedes_id,
+            )
+
+    # Should not reach here
+    raise HTTPException(status_code=422, detail="Unrecognised action.")  # pragma: no cover
+
+
+@app.post("/api/v1/reflections/process-timeouts")
+async def process_reflection_timeouts(_key: str = Depends(verify_api_key)):
+    """Process expired pending proposals and integrate them as accepted_by_timeout.
+
+    For each proposal whose review window has closed and is still pending:
+      1. Writes the Learning Memory with review_status='accepted_by_timeout'.
+      2. Updates the proposal status to 'accepted_by_timeout'.
+      3. Records a 'timeout_accept' action in the audit trail.
+
+    Returns the count of proposals processed.
+    """
+    tenant_id = str(getattr(_key, "tenant_id", DEFAULT_TENANT_ID))
+    now = datetime.now(timezone.utc)
+    processed = 0
+
+    async with _tenant_conn(_key) as conn:
+        expired_rows = await conn.fetch(
+            """
+            SELECT * FROM reflection_proposals
+            WHERE tenant_id = $1
+              AND status = 'pending'
+              AND expires_at <= $2
+            ORDER BY expires_at ASC
+            """,
+            tenant_id,
+            now,
+        )
+
+        for row in expired_rows:
+            pid = row["proposal_id"]
+            try:
+                memory_id = await _write_accepted_learning_memory(
+                    conn=conn,
+                    proposal=row,
+                    content=row["content"],
+                    review_status="accepted_by_timeout",
+                    tenant_id=tenant_id,
+                )
+                await conn.execute(
+                    "UPDATE reflection_proposals "
+                    "SET status = 'accepted_by_timeout', memory_id = $2, updated_at = NOW() "
+                    "WHERE proposal_id = $1",
+                    pid,
+                    memory_id,
+                )
+                await conn.execute(
+                    """
+                    INSERT INTO reflection_actions
+                        (proposal_id, actor, decision, notes)
+                    VALUES ($1, 'system', 'timeout_accept', $2)
+                    """,
+                    pid,
+                    f"Review window expired at {now.isoformat()}",
+                )
+                processed += 1
+            except Exception as exc:
+                logger.error("Failed to process timeout for proposal %s: %s", pid, exc)
+
+    return {"processed": processed, "timestamp": now.isoformat()}
 
 
 @app.get("/search-text")

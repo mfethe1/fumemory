@@ -327,3 +327,78 @@ class GatewayLeaseAcquireResponse(BaseModel):
     ok: bool = True
     status: str
     lease: GatewayLease
+
+
+# ---------------------------------------------------------------------------
+# Reflection Review Queue models (Issue #28)
+# ---------------------------------------------------------------------------
+
+class ReflectionSource(str, Enum):
+    """Origin of a reflection proposal."""
+    task_close = "task_close"
+    idle_dream = "idle_dream"
+
+
+class ReflectionProposalStatus(str, Enum):
+    """Lifecycle state for a reflection proposal."""
+    pending = "pending"
+    accepted = "accepted"
+    accepted_by_timeout = "accepted_by_timeout"
+    rejected = "rejected"
+    superseded = "superseded"
+
+
+class ReflectionAction(str, Enum):
+    """Actions a reviewer can take on a pending proposal."""
+    approve = "approve"
+    deny = "deny"
+    edit = "edit"
+    inspect = "inspect"
+
+
+class ReflectionProposal(BaseModel):
+    proposal_id: UUID
+    tenant_id: str
+    status: str
+    source: str
+    summary: str
+    content: str
+    confidence: float
+    risk_flags: list[str]
+    source_task_id: Optional[str]
+    source_session_id: Optional[str]
+    source_evidence_ids: list[str]
+    expires_at: datetime
+    telegram_message_id: Optional[str]
+    memory_id: Optional[UUID]
+    superseded_by: Optional[UUID]
+    agent_id: str
+    created_at: datetime
+    updated_at: datetime
+
+
+class ReflectionProposalCreate(BaseModel):
+    source: ReflectionSource
+    summary: str
+    content: str
+    confidence: float = Field(0.7, ge=0.0, le=1.0)
+    risk_flags: list[str] = Field(default_factory=list)
+    source_task_id: Optional[str] = None
+    source_session_id: Optional[str] = None
+    source_evidence_ids: list[str] = Field(default_factory=list)
+    agent_id: str
+
+
+class ReflectionActionRequest(BaseModel):
+    actor: str
+    decision: ReflectionAction
+    notes: Optional[str] = None
+    edited_content: Optional[str] = None
+
+
+class ReflectionActionResponse(BaseModel):
+    proposal_id: UUID
+    decision: str
+    status: str
+    memory_id: Optional[UUID] = None
+    supersedes_id: Optional[UUID] = None
