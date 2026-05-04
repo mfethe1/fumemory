@@ -48,8 +48,8 @@ log = logging.getLogger("memory_agent")
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://memu:memu@localhost:5432/memu")
 OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
-EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "qwen3-embedding")
-EMBEDDING_DIMS = int(os.environ.get("EMBEDDING_DIMS", "4096"))
+EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "text-embedding-3-small")
+EMBEDDING_DIMS = int(os.environ.get("EMBEDDING_DIMS", "1536"))
 
 # Text model preference — we probe ollama and use the first available
 LLM_PREFERENCE = os.environ.get(

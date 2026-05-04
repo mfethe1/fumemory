@@ -18,9 +18,9 @@ railway link  # pick your project
 railway variables set DATABASE_URL="<postgresql-url-from-railway-postgres>"
 railway variables set MEMU_API_KEY="<strong-random-key>"
 
-# Optional — use fastembed (local, no ollama) if not set
+# Optional — enable semantic embeddings via OpenAI or a compatible provider
 # railway variables set OPENAI_API_KEY="<key>"
-# railway variables set EMBEDDING_BASE_URL="https://api.openai.com/v1"
+# railway variables set EMBEDDING_API_BASE="https://api.openai.com"
 # railway variables set EMBEDDING_MODEL="text-embedding-3-small"
 # railway variables set EMBEDDING_DIMS="1536"
 
@@ -48,9 +48,9 @@ curl https://<your-app>.up.railway.app/health
 | `DATABASE_URL` | ✅ | `postgresql://memu:memu@localhost:5432/memu` | Must be postgres+pgvector |
 | `MEMU_API_KEY` | ✅ | `memu-dev-key` | Change in production |
 | `OPENAI_API_KEY` | Optional | — | For OpenAI embeddings / chat |
-| `EMBEDDING_BASE_URL` | Optional | `""` | Ollama or OpenAI-compat base URL |
-| `EMBEDDING_MODEL` | Optional | `BAAI/bge-small-en-v1.5` | fastembed model (local, no URL needed) |
-| `EMBEDDING_DIMS` | Optional | `384` | Must match model dims |
+| `EMBEDDING_API_BASE` | Optional | `https://api.openai.com` | Embedding provider base URL. `EMBEDDING_BASE_URL` is a deprecated alias. |
+| `EMBEDDING_MODEL` | Optional | `text-embedding-3-small` | Embedding model name |
+| `EMBEDDING_DIMS` | Optional | `1536` | Must match model and schema dims |
 | `NATS_RAILWAY_URL` | Optional | — | Event streaming; API works without it |
 | `NATS_LOCAL_URL` | Optional | — | Only for local dev |
 | `TEMPORAL_HOST` | Optional | — | Required for async workflow routes only |
@@ -66,5 +66,5 @@ curl https://<your-app>.up.railway.app/health
 ## Notes
 - NATS is optional — API starts and operates fully without it (events are silently skipped)
 - Temporal is optional — async routes return 503 if `TEMPORAL_HOST` is not set
-- fastembed uses `BAAI/bge-small-en-v1.5` (384-dim) by default — no external embedding service needed
+- Production defaults are `text-embedding-3-small` / `1536` via `EMBEDDING_API_BASE`. Set `OPENAI_API_KEY` to enable them.
 - Migrations run automatically on startup via `memu/migrations/`

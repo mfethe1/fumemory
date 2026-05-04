@@ -22,6 +22,18 @@
     },
     "DATABASE_URL": {
       "required": true
+    },
+    "EMBEDDING_API_BASE": {
+      "required": false,
+      "description": "Canonical embedding provider base URL (e.g. https://api.openai.com). EMBEDDING_BASE_URL is a deprecated alias."
+    },
+    "EMBEDDING_MODEL": {
+      "required": false,
+      "description": "Embedding model name. Default: text-embedding-3-small"
+    },
+    "EMBEDDING_DIMS": {
+      "required": false,
+      "description": "Embedding vector dimension. Default: 1536. Must match the model and the schema."
     }
   }
 }
