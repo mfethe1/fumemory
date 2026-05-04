@@ -110,6 +110,20 @@ is_shutting_down: bool = False  # Set True on SIGTERM; triggers 503 for new requ
 logger = logging.getLogger(__name__)
 
 
+def _make_startup_nats_cluster() -> NATSClusterManager:
+    """Create the API startup NATS client.
+
+    API boot must prove NATS availability quickly and then degrade to Core API
+    mode if NATS is down. Long-lived mesh processes can keep infinite reconnects,
+    but FastAPI lifespan cannot wait on them or Railway healthchecks fail.
+    """
+    return NATSClusterManager(
+        connect_timeout_s=float(os.environ.get("MEMU_NATS_STARTUP_CONNECT_TIMEOUT_S", "2")),
+        max_reconnect_attempts=int(os.environ.get("MEMU_NATS_STARTUP_RECONNECT_ATTEMPTS", "0")),
+        allow_reconnect=False,
+    )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global pool, _fastembed_model, _nats_cluster, _nats_publisher, _core_memory_mgr, _implicit_profiler
@@ -149,7 +163,7 @@ async def lifespan(app: FastAPI):
 
     # Connect NATS cluster (non-blocking â€” API works without NATS)
     try:
-        _nats_cluster = NATSClusterManager()
+        _nats_cluster = _make_startup_nats_cluster()
         await _nats_cluster.connect()
         _nats_publisher = NATSEventPublisher(_nats_cluster, gateway_id="memu-api")
         logger.info("NATS event publisher connected")

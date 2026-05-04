@@ -87,7 +87,7 @@ python scripts/verify_deployment.py --api-url https://<your-app>.up.railway.app 
 - **Endpoint:** `GET /health`
 - **Healthy response:** `200 {"status":"healthy","version":"0.1.0"}`
 - **Unhealthy:** `503` — means DB connection is down
-- Railway healthcheck uses `/health` with 30s timeout (see `railway.toml`)
+- Railway healthcheck uses `/health` with 90s timeout (see `railway.toml`)
 
 ## Notes
 - NATS is optional — API starts and operates fully without it (events are silently skipped). Required only for Federation Readiness.

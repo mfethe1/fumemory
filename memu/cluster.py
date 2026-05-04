@@ -82,12 +82,18 @@ class NATSClusterManager:
         ping_interval_s: float = 5.0,
         failover_threshold_ms: float = 500.0,
         auth_token: str | None = None,
+        connect_timeout_s: float = 5.0,
+        max_reconnect_attempts: int = -1,
+        allow_reconnect: bool = True,
     ):
         self.local_url = self._clean_url(local_url or os.environ.get("NATS_LOCAL_URL"))
         self.railway_url = self._clean_url(railway_url or os.environ.get("NATS_RAILWAY_URL"))
         self.ping_interval_s = ping_interval_s
         self.failover_threshold_ms = failover_threshold_ms
         self.auth_token = auth_token or os.environ.get("NATS_AUTH_TOKEN")
+        self.connect_timeout_s = connect_timeout_s
+        self.max_reconnect_attempts = max_reconnect_attempts
+        self.allow_reconnect = allow_reconnect
 
         self._connections: dict[ClusterNode, NATSClient] = {}
         self._jetstreams: dict[ClusterNode, JetStreamContext] = {}
@@ -227,12 +233,12 @@ class NATSClusterManager:
 
             connect_opts: dict[str, Any] = {
                 "servers": [url],
-                "connect_timeout": 5,
+                "connect_timeout": self.connect_timeout_s,
                 "reconnect_time_wait": 2,
-                "max_reconnect_attempts": -1,  # infinite reconnects to survive VPN/Tailscale micro-drops
+                "max_reconnect_attempts": self.max_reconnect_attempts,
                 "ping_interval": 10,
                 "max_outstanding_pings": 3,
-                "allow_reconnect": True,
+                "allow_reconnect": self.allow_reconnect,
             }
 
             if self.auth_token:
