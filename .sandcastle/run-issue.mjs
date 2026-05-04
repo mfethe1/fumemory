@@ -113,6 +113,9 @@ if (!process.env.ANTHROPIC_API_KEY) {
 }
 
 const setupCommand = [
+  "git config core.filemode false",
+  "git config core.autocrlf false",
+  "git reset --hard HEAD",
   "python3 -m venv .venv",
   ". .venv/bin/activate",
   "python -m pip install --disable-pip-version-check --upgrade pip",
