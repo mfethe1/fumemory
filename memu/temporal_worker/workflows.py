@@ -4,7 +4,16 @@ from temporalio import workflow
 @workflow.defn
 class MemoryIngestionWorkflow:
     @workflow.run
-    async def run(self, content: str, agent_id: str, metadata: dict) -> str:
+    async def run(self, req_dict: dict) -> str:
+        """Ingest a memory preserving all canonical evidence fields.
+
+        req_dict must carry all MemoryCreate-equivalent fields so the async
+        path never silently drops memory_type, memory_kind, idempotency_key,
+        or provenance metadata.
+        """
+        content = req_dict.get("content", "")
+        agent_id = req_dict.get("agent_id", "system")
+
         # 0. Generate embedding (durable)
         embedding = await workflow.execute_activity(
             "generate_embedding",
@@ -12,17 +21,24 @@ class MemoryIngestionWorkflow:
             start_to_close_timeout=timedelta(seconds=60),
         )
 
-        # 1. Store memory
-        memory_id = await workflow.execute_activity(
+        # 1. Store memory with all canonical fields
+        result = await workflow.execute_activity(
             "store_memory",
-            args=[content, agent_id, metadata, embedding],
+            args=[req_dict, embedding],
             start_to_close_timeout=timedelta(seconds=120),
         )
+
+        memory_id = result["memory_id"] if isinstance(result, dict) else str(result)
+        idempotency_status = result.get("idempotency_status", "new") if isinstance(result, dict) else "new"
 
         # 2. Log audit
         await workflow.execute_activity(
             "log_audit",
-            args=["MEMORY_STORED", agent_id, {"memory_id": memory_id}],
+            args=["MEMORY_STORED", agent_id, {
+                "memory_id": memory_id,
+                "idempotency_status": idempotency_status,
+                "memory_kind": req_dict.get("memory_kind", "learning"),
+            }],
             start_to_close_timeout=timedelta(seconds=30),
         )
 
