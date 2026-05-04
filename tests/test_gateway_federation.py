@@ -8,6 +8,7 @@ from memu.gateway_federation import (
     allowed_subject,
     build_dispatch_envelope,
     build_gateway_announce,
+    build_memu_smoke_write_payload,
     durable_consumer_name,
     response_subject,
     results_to_json,
@@ -64,6 +65,16 @@ def test_build_dispatch_envelope_contains_required_fields() -> None:
     assert payload["payload"]["budget"]["max_agents"] == 3
     assert payload["idempotency_key"].startswith(payload["root_task_id"])
     assert payload["idempotency_key"].endswith("run-qa-sweep")
+
+
+def test_memu_smoke_write_payload_uses_evidence_memory_for_idempotency() -> None:
+    cfg = FederationConfig(gateway_id="mac-mini-main", nats_railway_url="nats://railway:4222")
+
+    payload = build_memu_smoke_write_payload(cfg, marker="smoke-123")
+
+    assert payload["memory_kind"] == "evidence"
+    assert payload["idempotency_key"] == "gateway-smoke-mac-mini-main-smoke-123"
+    assert payload["metadata"]["source"] == "gateway-federation-smoke"
 
 
 def test_federation_config_validation_requires_nats_url() -> None:

@@ -331,14 +331,7 @@ async def run_memu_smoke(cfg: FederationConfig, *, marker: str) -> list[SmokeRes
             )
         )
 
-        idempotency_key = f"gateway-smoke-{cfg.gateway_id}-{marker}"
-        write_payload = {
-            "content": f"{marker} gateway federation smoke write",
-            "agent_id": cfg.gateway_id,
-            "memory_type": "observation",
-            "idempotency_key": idempotency_key,
-            "metadata": {"marker": marker, "source": "gateway-federation-smoke"},
-        }
+        write_payload = build_memu_smoke_write_payload(cfg, marker=marker)
         write = await client.post(f"{base}/api/v1/memu/add", headers=headers, json=write_payload)
         results.append(
             SmokeResult(
@@ -386,6 +379,17 @@ async def run_memu_smoke(cfg: FederationConfig, *, marker: str) -> list[SmokeRes
         )
 
         return results
+
+
+def build_memu_smoke_write_payload(cfg: FederationConfig, *, marker: str) -> dict[str, Any]:
+    return {
+        "content": f"{marker} gateway federation smoke write",
+        "agent_id": cfg.gateway_id,
+        "memory_type": "observation",
+        "memory_kind": "evidence",
+        "idempotency_key": f"gateway-smoke-{cfg.gateway_id}-{marker}",
+        "metadata": {"marker": marker, "source": "gateway-federation-smoke"},
+    }
 
 
 def safe_json(response: httpx.Response) -> dict[str, Any] | None:
