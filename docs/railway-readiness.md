@@ -100,8 +100,11 @@ Required:
 
 Behavior notes:
 - Use `infra/railway-nats/start-nats.sh` as the start command.
-- Do not override it with a conflicting `railway.json` inline command.
+- Deploy from the service subdirectory so `infra/railway-nats/railway.json`
+  is applied: `railway up infra/railway-nats --path-as-root --service nats-jetstream`.
+- Do not override it with a conflicting inline start command.
 - JetStream storage path and port selection must stay consistent across Dockerfile + Railway config.
+  Attach a Railway volume at `/data` before claiming durable JetStream persistence.
 
 ### `temporal-worker` service
 Required only for async endpoints:

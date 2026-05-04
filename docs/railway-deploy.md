@@ -67,6 +67,11 @@ python scripts/verify_deployment.py --api-url https://<your-app>.up.railway.app 
 python scripts/verify_deployment.py --api-url https://<your-app>.up.railway.app --proof-out proof-core.json
 ```
 
+Deploy the NATS service from its own Railway config:
+```bash
+railway up infra/railway-nats --path-as-root --service nats-jetstream
+```
+
 ## Environment Variable Reference
 
 | Variable | Required | Default | Notes |
