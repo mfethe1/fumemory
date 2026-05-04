@@ -88,9 +88,9 @@ from memu.tenancy import (
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://memu:memu@localhost:5432/memu")
 MEMU_API_KEY = os.environ.get("MEMU_API_KEY", "memu-dev-key")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
-EMBEDDING_BASE_URL = os.environ.get("EMBEDDING_BASE_URL", "")
-EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
-EMBEDDING_DIMS = int(os.environ.get("EMBEDDING_DIMS", "4096"))
+EMBEDDING_API_BASE = os.environ.get("EMBEDDING_API_BASE", "https://api.openai.com")
+EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "text-embedding-3-small")
+EMBEDDING_DIMS = int(os.environ.get("EMBEDDING_DIMS", "1536"))
 DEDUP_THRESHOLD = float(os.environ.get("DEDUP_THRESHOLD", "0.95"))
 DECAY_RATE = float(os.environ.get("DECAY_RATE", "0.01"))
 HNSW_ITERATIVE_SCAN = os.environ.get("HNSW_ITERATIVE_SCAN", "strict_order")
@@ -105,6 +105,7 @@ _nats_publisher: NATSEventPublisher | None = None
 _core_memory_mgr: CoreMemoryManager | None = None
 _implicit_profiler: Any = None  # ImplicitProfiler (lazy import)
 _semantic_router: SemanticRouter | None = None
+_embedding_schema_ok: bool = True  # Set False when configured dims ≠ schema dims
 is_shutting_down: bool = False  # Set True on SIGTERM; triggers 503 for new requests
 logger = logging.getLogger(__name__)
 
@@ -128,6 +129,16 @@ async def lifespan(app: FastAPI):
         await run_migrations(pool)
     except Exception as e:
         logger.error(f"Migration startup failed: {e}")
+
+    # Verify embedding contract: configured dims must match schema
+    global _embedding_schema_ok
+    try:
+        from memu.embedding_contract import verify_embedding_schema, resolve_embedding_api_base
+        resolve_embedding_api_base()  # logs alias warning if EMBEDDING_BASE_URL is used
+        _embedding_schema_ok = await verify_embedding_schema(pool, EMBEDDING_DIMS)
+    except Exception as e:
+        logger.error("Embedding contract check failed: %s. Semantic recall may be degraded.", e)
+        _embedding_schema_ok = False
     
     # Pre-warm fastembed model
     try:

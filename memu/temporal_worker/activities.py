@@ -19,19 +19,30 @@ def get_db_url():
 
 # --- Embedding helpers (OpenAI-compatible + local fallback) ---
 
-EMBEDDING_BASE_URL = os.environ.get("EMBEDDING_BASE_URL", "")
-EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
-EMBEDDING_DIMS = int(os.environ.get("EMBEDDING_DIMS", "4096"))
+# EMBEDDING_API_BASE is canonical; EMBEDDING_BASE_URL is a deprecated alias.
+_embedding_api_base_canonical = os.environ.get("EMBEDDING_API_BASE", "")
+_embedding_base_url_alias = os.environ.get("EMBEDDING_BASE_URL", "")
+if not _embedding_api_base_canonical and _embedding_base_url_alias:
+    import logging as _logging
+    _logging.getLogger(__name__).warning(
+        "EMBEDDING_BASE_URL is a deprecated alias for EMBEDDING_API_BASE. "
+        "Update your deployment configuration to use EMBEDDING_API_BASE instead."
+    )
+    _embedding_api_base_canonical = _embedding_base_url_alias
+
+EMBEDDING_API_BASE = _embedding_api_base_canonical or "https://api.openai.com"
+EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "text-embedding-3-small")
+EMBEDDING_DIMS = int(os.environ.get("EMBEDDING_DIMS", "1536"))
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 
 
 async def _embedding_from_http(text: str) -> list[float] | None:
     """Try OpenAI-compatible endpoint (/v1/embeddings), including Ollama compatibility."""
     # Only attempt remote embedding call for explicit providers.
-    if not OPENAI_API_KEY and "ollama" not in EMBEDDING_BASE_URL:
+    if not OPENAI_API_KEY and "ollama" not in EMBEDDING_API_BASE:
         return None
 
-    base = EMBEDDING_BASE_URL.rstrip("/")
+    base = EMBEDDING_API_BASE.rstrip("/")
     headers = {"Content-Type": "application/json"}
     if OPENAI_API_KEY:
         headers["Authorization"] = f"Bearer {OPENAI_API_KEY}"

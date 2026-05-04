@@ -341,26 +341,29 @@ MEMU_API_URL=http://127.0.0.1:8000  # scripts/hooks target this base URL
 # Legacy alias still accepted by some older helpers: MEMU_BASE_URL
 
 # Embeddings (any OpenAI-compatible endpoint)
-OPENAI_API_KEY=          # optional, for OpenAI
-EMBEDDING_BASE_URL=http://localhost:11434  # Ollama default
-EMBEDDING_MODEL=qwen3-embedding
-EMBEDDING_DIMS=4096
+# Canonical variable: EMBEDDING_API_BASE (EMBEDDING_BASE_URL is a deprecated alias)
+OPENAI_API_KEY=          # required when EMBEDDING_API_BASE points to OpenAI
+
+# Default (OpenAI-compatible):
+EMBEDDING_API_BASE=https://api.openai.com
+EMBEDDING_MODEL=text-embedding-3-small
+EMBEDDING_DIMS=1536
 
 # Decay
 DECAY_RATE=0.01
 DEDUP_THRESHOLD=0.95
 
 # Embedding provider for production (do NOT point to local laptop from Railway)
-# Option A: OpenAI-compatible API
+# Option A: OpenAI-compatible API (default)
 # OPENAI_API_KEY=sk-...
-# EMBEDDING_BASE_URL=https://api.openai.com/v1  # or compatible endpoint
+# EMBEDDING_API_BASE=https://api.openai.com
 # EMBEDDING_MODEL=text-embedding-3-small
 # EMBEDDING_DIMS=1536
 
-# Option B: hosted Ollama service on Railway (recommended for self-hosted path)
-EMBEDDING_BASE_URL=http://<railway-ollama-service>.railway.internal:11434
-EMBEDDING_MODEL=qwen3-embedding
-EMBEDDING_DIMS=4096
+# Option B: hosted Ollama service on Railway (self-hosted path — set all three)
+# EMBEDDING_API_BASE=http://<railway-ollama-service>.railway.internal:11434
+# EMBEDDING_MODEL=nomic-embed-text
+# EMBEDDING_DIMS=768
 
 # NATS clustering
 NATS_LOCAL_URL=nats://localhost:4222
