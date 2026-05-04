@@ -20,9 +20,18 @@ if (!issueArg) {
 }
 
 const issueNumber = issueArg.replace(/^#/, "");
+const baseBranch = process.env.SANDCASTLE_BASE_BRANCH || defaultBaseBranch;
 
 function gh(args) {
   return execFileSync("gh", args, {
+    cwd: repoDir,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+}
+
+function git(args) {
+  return execFileSync("git", args, {
     cwd: repoDir,
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
@@ -55,12 +64,31 @@ function blockerNumbers(body) {
   return [...section.matchAll(/#(\d+)/g)].map((m) => Number(m[1]));
 }
 
+function blockerCompletedLocally(number) {
+  const branches = git(["branch", "--list", `sandcastle/issue-${number}-*`])
+    .split("\n")
+    .map((line) => line.replace(/^[*+\s]+/, "").trim().split(/\s+/)[0])
+    .filter(Boolean);
+
+  return branches.some((branch) => {
+    try {
+      execFileSync("git", ["merge-base", "--is-ancestor", branch, baseBranch], {
+        cwd: repoDir,
+        stdio: "ignore",
+      });
+      return true;
+    } catch {
+      return false;
+    }
+  });
+}
+
 function openBlockers(numbers) {
   return numbers.filter((number) => {
     try {
-      return getIssue(number).state === "OPEN";
+      return getIssue(number).state === "OPEN" && !blockerCompletedLocally(number);
     } catch {
-      return true;
+      return !blockerCompletedLocally(number);
     }
   });
 }
@@ -82,7 +110,6 @@ if (blockers.length && !force) {
 }
 
 const branch = process.env.SANDCASTLE_BRANCH || `sandcastle/issue-${issue.number}-${slug(issue.title)}`;
-const baseBranch = process.env.SANDCASTLE_BASE_BRANCH || defaultBaseBranch;
 const logPath = join(logDir, `issue-${issue.number}-${slug(issue.title)}.log`);
 const maxIterations = Number(process.env.SANDCASTLE_MAX_ITERATIONS || "8");
 const idleTimeoutSeconds = Number(process.env.SANDCASTLE_IDLE_TIMEOUT_SECONDS || "900");
