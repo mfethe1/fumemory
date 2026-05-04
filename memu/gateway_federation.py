@@ -331,10 +331,12 @@ async def run_memu_smoke(cfg: FederationConfig, *, marker: str) -> list[SmokeRes
             )
         )
 
+        idempotency_key = f"gateway-smoke-{cfg.gateway_id}-{marker}"
         write_payload = {
             "content": f"{marker} gateway federation smoke write",
             "agent_id": cfg.gateway_id,
             "memory_type": "observation",
+            "idempotency_key": idempotency_key,
             "metadata": {"marker": marker, "source": "gateway-federation-smoke"},
         }
         write = await client.post(f"{base}/api/v1/memu/add", headers=headers, json=write_payload)
@@ -347,17 +349,39 @@ async def run_memu_smoke(cfg: FederationConfig, *, marker: str) -> list[SmokeRes
             )
         )
 
+        # Idempotency replay: same key must return 409 (deduplication proof)
+        replay = await client.post(f"{base}/api/v1/memu/add", headers=headers, json=write_payload)
+        replay_ok = replay.status_code == 409
+        results.append(
+            SmokeResult(
+                name="memu-idempotency-replay",
+                ok=replay_ok,
+                detail="409 dedup confirmed" if replay_ok else f"expected 409 got {replay.status_code}",
+            )
+        )
+
+        # Searchable memory proof: verify the marker appears in search results
         search = await client.post(
             f"{base}/api/v1/memu/search-text",
             headers=headers,
             json={"query": marker, "k": 5},
         )
+        search_data = safe_json(search)
+        found_in_results = False
+        if search.status_code == 200 and search_data:
+            items = search_data.get("results") or search_data.get("memories") or []
+            if not items and isinstance(search_data.get("value"), list):
+                items = search_data["value"]
+            found_in_results = any(
+                marker in (r.get("content", "") if isinstance(r, dict) else "")
+                for r in items
+            )
         results.append(
             SmokeResult(
                 name="memu-search-text",
-                ok=search.status_code == 200,
-                detail=f"search-text status={search.status_code}",
-                data=safe_json(search),
+                ok=found_in_results,
+                detail="marker found in search results" if found_in_results else f"marker not found in results (status={search.status_code})",
+                data=search_data,
             )
         )
 
@@ -374,8 +398,31 @@ def safe_json(response: httpx.Response) -> dict[str, Any] | None:
         return None
 
 
-def results_to_json(results: list[SmokeResult]) -> dict[str, Any]:
+def _redact_nats_url(url: str) -> str:
+    """Keep scheme+host, redact auth credentials embedded in the URL."""
+    if "@" in url:
+        scheme_end = url.find("//") + 2
+        at_pos = url.rfind("@")
+        return url[:scheme_end] + "[REDACTED]@" + url[at_pos + 1:]
+    return url
+
+
+def results_to_json(
+    results: list[SmokeResult],
+    *,
+    gateway_id: str = "",
+    nats_railway_url: str = "",
+) -> dict[str, Any]:
+    evidence_memory_ids: list[str] = []
+    for r in results:
+        if r.name == "memu-write" and r.ok and r.data:
+            mem_id = r.data.get("id")
+            if mem_id:
+                evidence_memory_ids.append(str(mem_id))
     return {
         "ok": all(item.ok for item in results),
+        "gateway_id": gateway_id,
+        "nats_railway_url": _redact_nats_url(nats_railway_url),
+        "evidence_memory_ids": evidence_memory_ids,
         "results": [asdict(item) for item in results],
     }

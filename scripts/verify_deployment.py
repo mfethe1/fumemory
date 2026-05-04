@@ -206,15 +206,37 @@ def _verify_search_recall(api_url: str, api_key: str, content: str) -> tuple[boo
     return False, "memory not found in recall results"
 
 
+def _redact_nats_url(url: str) -> str:
+    """Keep scheme+host, redact auth credentials embedded in the URL."""
+    if "@" in url:
+        scheme_end = url.find("//") + 2
+        at_pos = url.rfind("@")
+        return url[:scheme_end] + "[REDACTED]@" + url[at_pos + 1:]
+    return url
+
+
 def _check_federation(api_url: str, api_key: str) -> tuple[bool, list[dict]]:
     """Federation Readiness gate.
 
-    Proves idempotency-keyed evidence write and replay on the memory plane.
+    Requires NATS_RAILWAY_URL to be present — federation readiness cannot pass
+    without NATS. Also proves idempotency-keyed evidence write and replay on
+    the memory plane.
     NATS/JetStream publish/consume and directed response are proved by the
-    test suite (test_gateway_federation.py, test_nats_config_contract.py).
+    gateway smoke (gateway_federation_smoke.py) and test suite.
     """
-    print("\n🔗 Testing Federation Readiness (idempotency write + replay + searchable proof)...")
+    print("\n🔗 Testing Federation Readiness (NATS required + idempotency write + replay + searchable proof)...")
     checks: list[dict] = []
+
+    nats_url = os.environ.get("NATS_RAILWAY_URL", "").strip()
+    nats_present = bool(nats_url)
+    checks.append({
+        "name": "nats_railway_url",
+        "passed": nats_present,
+        "detail": "NATS_RAILWAY_URL present" if nats_present else "NATS_RAILWAY_URL missing - federation readiness requires NATS",
+    })
+    if not nats_present:
+        print("  ❌ NATS_RAILWAY_URL not set — federation readiness requires NATS.")
+        return False, checks
 
     idempotency_key = f"verify-federation-{int(time.time())}"
     content = f"Federation Readiness Proof {idempotency_key}"
@@ -236,15 +258,23 @@ def _check_federation(api_url: str, api_key: str) -> tuple[bool, list[dict]]:
         json_body=evidence_payload,
     )
     write_ok = status == 200
-    checks.append({
+    write_check: dict = {
         "name": "idempotency_write",
         "passed": write_ok,
         "detail": f"status={status}" if not write_ok else "evidence memory written",
-    })
+    }
     if write_ok:
+        try:
+            memory_id = json.loads(body).get("id")
+            if memory_id:
+                write_check["evidence_memory_id"] = str(memory_id)
+        except Exception:
+            pass
         print("  ✅ Idempotency write succeeded.")
     else:
         print(f"  ❌ Idempotency write failed: {status} - {body}")
+    checks.append(write_check)
+    if not write_ok:
         return False, checks
 
     # 2. Idempotency replay — same key must return 409 (deduplication proof)
@@ -320,7 +350,7 @@ def _build_proof(
     overall: bool,
 ) -> dict:
     """Build a machine-readable proof artifact with secrets redacted."""
-    return {
+    proof: dict = {
         "schema_version": 1,
         "gate": gate,
         "api_url": api_url,
@@ -329,6 +359,17 @@ def _build_proof(
         "checks": checks,
         "overall": "pass" if overall else "fail",
     }
+    if gate == "federation":
+        gateway_id = os.environ.get("GATEWAY_ID", "").strip()
+        nats_url = os.environ.get("NATS_RAILWAY_URL", "").strip()
+        if gateway_id:
+            proof["gateway_id"] = gateway_id
+        if nats_url:
+            proof["nats_railway_url"] = _redact_nats_url(nats_url)
+        proof["evidence_memory_ids"] = [
+            c["evidence_memory_id"] for c in checks if "evidence_memory_id" in c
+        ]
+    return proof
 
 
 def _write_proof(proof: dict, path: str) -> None:

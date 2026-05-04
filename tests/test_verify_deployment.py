@@ -101,6 +101,7 @@ def test_check_health_returns_false_on_503(monkeypatch):
 
 def test_check_federation_passes_on_write_then_409_then_search(monkeypatch):
     """Federation gate: write succeeds, replay returns 409, recall finds the memory."""
+    monkeypatch.setenv("NATS_RAILWAY_URL", "nats://railway-nats:4222")
     call_log = []
 
     content_holder: list[str] = []
@@ -135,9 +136,13 @@ def test_check_federation_passes_on_write_then_409_then_search(monkeypatch):
 
     assert ok is True
     names = [c["name"] for c in checks]
+    assert "nats_railway_url" in names
     assert "idempotency_write" in names
     assert "idempotency_replay" in names
     assert "federation_searchable_proof" in names
+
+    nats_check = next(c for c in checks if c["name"] == "nats_railway_url")
+    assert nats_check["passed"] is True
 
     write_check = next(c for c in checks if c["name"] == "idempotency_write")
     assert write_check["passed"] is True
@@ -150,8 +155,22 @@ def test_check_federation_passes_on_write_then_409_then_search(monkeypatch):
     assert search_check["passed"] is True
 
 
+def test_check_federation_fails_when_nats_url_missing(monkeypatch):
+    """Federation readiness gate must fail when NATS_RAILWAY_URL is not set."""
+    monkeypatch.delenv("NATS_RAILWAY_URL", raising=False)
+
+    ok, checks = vd._check_federation("http://memu.test", "secret")
+
+    assert ok is False
+    nats_check = next(c for c in checks if c["name"] == "nats_railway_url")
+    assert nats_check["passed"] is False
+    assert "NATS_RAILWAY_URL" in nats_check["detail"]
+
+
 def test_check_federation_fails_when_write_fails(monkeypatch):
     """Federation gate stops immediately if the idempotency write fails."""
+    monkeypatch.setenv("NATS_RAILWAY_URL", "nats://railway-nats:4222")
+
     def fake_urlopen(req, timeout=15):
         err = vd.urllib.error.HTTPError(req.full_url, 500, "Internal Server Error", {}, None)
         err.read = lambda: b"server error"
@@ -168,6 +187,7 @@ def test_check_federation_fails_when_write_fails(monkeypatch):
 
 def test_check_federation_fails_when_replay_not_deduplicated(monkeypatch):
     """Federation gate fails if replay returns 200 instead of 409."""
+    monkeypatch.setenv("NATS_RAILWAY_URL", "nats://railway-nats:4222")
     call_count = [0]
 
     def fake_urlopen(req, timeout=15):
@@ -289,6 +309,44 @@ def test_write_proof_writes_valid_json(tmp_path):
     assert loaded["gate"] == "core"
     assert loaded["overall"] == "pass"
     assert loaded["api_key"] == "[REDACTED]"
+
+
+def test_build_proof_federation_includes_gateway_and_nats_fields(monkeypatch):
+    """Federation proof includes gateway_id, redacted nats_url, and evidence_memory_ids."""
+    monkeypatch.setenv("GATEWAY_ID", "test-gw")
+    monkeypatch.setenv("NATS_RAILWAY_URL", "nats://secret-token@railway-host:4222")
+
+    checks = [
+        {"name": "nats_railway_url", "passed": True, "detail": "present"},
+        {"name": "idempotency_write", "passed": True, "detail": "ok", "evidence_memory_id": "mem-abc-123"},
+        {"name": "idempotency_replay", "passed": True, "detail": "409 dedup confirmed"},
+    ]
+    proof = vd._build_proof("federation", "http://memu.test", "key", checks, True)
+
+    assert proof["gateway_id"] == "test-gw"
+    assert proof["nats_railway_url"] == "nats://[REDACTED]@railway-host:4222"
+    assert "mem-abc-123" in proof["evidence_memory_ids"]
+    assert "secret-token" not in json.dumps(proof)
+
+
+def test_build_proof_federation_nats_url_without_credentials(monkeypatch):
+    """Federation proof keeps NATS URL as-is when no auth credentials are embedded."""
+    monkeypatch.setenv("GATEWAY_ID", "test-gw")
+    monkeypatch.setenv("NATS_RAILWAY_URL", "nats://railway-host:4222")
+
+    proof = vd._build_proof("federation", "http://memu.test", "key", [], True)
+    assert proof["nats_railway_url"] == "nats://railway-host:4222"
+
+
+def test_build_proof_core_gate_omits_federation_fields(monkeypatch):
+    """Core gate proof does not include federation-specific fields."""
+    monkeypatch.setenv("GATEWAY_ID", "test-gw")
+    monkeypatch.setenv("NATS_RAILWAY_URL", "nats://railway-host:4222")
+
+    proof = vd._build_proof("core", "http://memu.test", "key", [], True)
+    assert "gateway_id" not in proof
+    assert "nats_railway_url" not in proof
+    assert "evidence_memory_ids" not in proof
 
 
 def test_optional_services_absent_does_not_block_core(monkeypatch):
