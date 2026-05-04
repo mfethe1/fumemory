@@ -72,6 +72,16 @@ Deploy the NATS service from its own Railway config:
 railway up infra/railway-nats --path-as-root --service nats-jetstream
 ```
 
+Deploy the Temporal worker from its own Railway config:
+```bash
+railway up infra/railway-temporal-worker --path-as-root --service temporal-worker
+```
+
+The Temporal worker config is self-contained under `infra/railway-temporal-worker/`.
+Because `--path-as-root` uploads only that directory, its Dockerfile fetches the
+fumemory source from the configured Git ref during image build instead of relying
+on temporary staging folders.
+
 ## Environment Variable Reference
 
 | Variable | Required | Default | Notes |
