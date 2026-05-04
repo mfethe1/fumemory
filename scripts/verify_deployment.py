@@ -29,7 +29,6 @@ from datetime import datetime, timezone
 
 
 COMPAT_BASE_SUFFIX = "/api/v1/memu"
-PRODUCTION_DEFAULT_API_URL = "https://api-production-86f5.up.railway.app/api/v1/memu"
 
 
 def _default_api_url() -> str:
@@ -41,17 +40,12 @@ def _default_api_url() -> str:
     ).rstrip("/")
 
 
-def _api_candidates(api_url: str) -> list[str]:
+def _api_candidates(api_url: str | None) -> list[str]:
     requested = (api_url or "").rstrip("/")
     if requested and requested.lower() != "auto":
         return [requested]
 
-    candidates: list[str] = []
-    for url in (_default_api_url(), PRODUCTION_DEFAULT_API_URL):
-        normalized = url.rstrip("/")
-        if normalized and normalized not in candidates:
-            candidates.append(normalized)
-    return candidates
+    return [_default_api_url()]
 
 
 def _resolve_api_key(explicit: str | None) -> str:
@@ -443,7 +437,14 @@ def _verify_single(
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Verify a memU deployment without mutating infra config.")
-    parser.add_argument("--api-url", default="auto", help="Base URL for memU API, or 'auto' to try local then production")
+    parser.add_argument(
+        "--api-url",
+        default=None,
+        help=(
+            "Base URL for memU API. Defaults to MEMU_VERIFY_BASE_URL, "
+            "MEMU_API_URL, MEMU_BASE_URL, then http://127.0.0.1:8000."
+        ),
+    )
     parser.add_argument("--api-key", default=None, help="memU API key (defaults to env/secrets lookup)")
     parser.add_argument("--check-federation", action="store_true", help="Also verify Federation Readiness gate (idempotency write/replay, searchable memory proof)")
     parser.add_argument("--check-async", action="store_true", help="Also verify Temporal-backed async endpoints")

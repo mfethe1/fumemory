@@ -10,7 +10,7 @@ description: Connect to and operate the fumemory distributed swarm OS. Use when 
 ```
 NATS JetStream (dual-cluster)
 ├─ Primary: Lenny's Linux (100.76.63.58:4222 via Tailscale)
-├─ Fallback: Railway (gondola.proxy.rlwy.net:22393)
+├─ Fallback: Railway (`NATS_RAILWAY_URL` from environment)
 └─ Auto-failover: <100ms
 
 WebSocket Bridge (port 8001)
@@ -25,7 +25,7 @@ Glass Box UI (port 3001)
 └─ Compute budget meter
 
 memU API (Railway)
-└─ https://api-production-86f5.up.railway.app
+└─ `MEMU_API_URL` from environment
 ```
 
 ## Quick Start
@@ -85,7 +85,7 @@ curl -X POST http://127.0.0.1:8001/api/amend/{task_id} -H "Content-Type: applica
 
 ### URLs (from .env or environment)
 - `NATS_LOCAL_URL=nats://100.76.63.58:4222` (Lenny, Tailscale)
-- `NATS_RAILWAY_URL=nats://gondola.proxy.rlwy.net:22393` (Railway fallback)
+- `NATS_RAILWAY_URL=nats://<railway-nats-host>:<railway-nats-port>` (Railway fallback)
 
 ### Subject Hierarchy
 | Subject | Purpose |
@@ -121,7 +121,7 @@ curl -X POST http://127.0.0.1:8001/api/amend/{task_id} -H "Content-Type: applica
 ### NATS not reachable
 1. Check Tailscale: `tailscale status` — is Lenny's node online?
 2. TCP test: `python -c "import socket; s=socket.create_connection(('100.76.63.58', 4222), 5); print('OK'); s.close()"`
-3. If local down, verify Railway fallback: `python -c "import asyncio,nats; asyncio.run(nats.connect('nats://gondola.proxy.rlwy.net:22393'))"`
+3. If local down, set `NATS_RAILWAY_URL` and verify Railway fallback with that value.
 
 ### Bridge not processing events
 - The bridge must be running BEFORE events are published (NATS pub/sub is real-time, not replayed)
@@ -132,7 +132,7 @@ curl -X POST http://127.0.0.1:8001/api/amend/{task_id} -H "Content-Type: applica
 # Bridge (Windows)
 cd C:\Users\mfeth\.openclaw\workspace\fumemory
 $env:NATS_LOCAL_URL="nats://100.76.63.58:4222"
-$env:NATS_RAILWAY_URL="nats://gondola.proxy.rlwy.net:22393"
+$env:NATS_RAILWAY_URL="nats://<railway-nats-host>:<railway-nats-port>"
 python -c "import uvicorn; uvicorn.run('memu.ws_bridge:app', host='0.0.0.0', port=8001)"
 
 # Glass Box UI (Windows)
@@ -144,7 +144,7 @@ npx vite --port 3001
 # Bridge (Linux — Lenny)
 cd /home/michael-fethe/.openclaw/workspace/memu-oss
 export NATS_LOCAL_URL=nats://localhost:4222
-export NATS_RAILWAY_URL=nats://gondola.proxy.rlwy.net:22393
+export NATS_RAILWAY_URL=nats://<railway-nats-host>:<railway-nats-port>
 python -c "import uvicorn; uvicorn.run('memu.ws_bridge:app', host='0.0.0.0', port=8001)"
 ```
 

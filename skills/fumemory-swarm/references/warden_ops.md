@@ -17,6 +17,7 @@ REQUESTED → SPAWNING → RUNNING → (HEALTHY | UNHEALTHY) → STOPPED
 
 ```python
 import docker
+import os
 
 client = docker.from_env()
 
@@ -27,8 +28,8 @@ container = client.containers.run(
     environment={
         "GATEWAY_ID": gateway_id,
         "NATS_LOCAL_URL": "nats://host.docker.internal:4222",
-        "NATS_RAILWAY_URL": "nats://gondola.proxy.rlwy.net:22393",
-        "MEMU_API_URL": "https://api-production-86f5.up.railway.app",
+        "NATS_RAILWAY_URL": os.environ["NATS_RAILWAY_URL"],
+        "MEMU_API_URL": os.environ["MEMU_API_URL"],
         "MEMU_API_KEY": "${MEMU_API_KEY}",  # Set via environment variable, never hardcode
         "MAX_HYDRATION_TOKENS": "8000",
         "WARDEN_WARM_POOL_MODE": "cold",
@@ -101,7 +102,8 @@ docker build -t fumemory-gateway:latest -f Dockerfile.gateway .
 docker run -d --name gw-lenny \
   -e GATEWAY_ID=lenny \
   -e NATS_LOCAL_URL=nats://host.docker.internal:4222 \
-  -e NATS_RAILWAY_URL=nats://gondola.proxy.rlwy.net:22393 \
+  -e NATS_RAILWAY_URL="$NATS_RAILWAY_URL" \
+  -e MEMU_API_URL="$MEMU_API_URL" \
   --memory=512m --cpus=0.5 \
   fumemory-gateway:latest
 ```

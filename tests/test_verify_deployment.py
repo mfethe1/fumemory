@@ -55,16 +55,18 @@ def test_endpoint_uses_compat_suffix_for_production_api_base():
     assert vd._endpoint("http://localhost:8000", "/memories", "/add") == "http://localhost:8000/memories"
 
 
-def test_api_candidates_auto_prioritizes_local_then_production(monkeypatch):
+def test_api_candidates_auto_uses_only_default_env_or_local(monkeypatch):
     monkeypatch.setattr(vd, "_default_api_url", lambda: "http://127.0.0.1:8000")
-    assert vd._api_candidates("auto") == [
-        "http://127.0.0.1:8000",
-        "https://api-production-86f5.up.railway.app/api/v1/memu",
-    ]
+    assert vd._api_candidates("auto") == ["http://127.0.0.1:8000"]
+
+
+def test_api_candidates_missing_url_uses_only_default_env_or_local(monkeypatch):
+    monkeypatch.setattr(vd, "_default_api_url", lambda: "http://127.0.0.1:8000")
+    assert vd._api_candidates(None) == ["http://127.0.0.1:8000"]
 
 
 def test_api_candidates_explicit_url_disables_fallback():
-    assert vd._api_candidates("http://memu.test") == ["http://memu.test"]
+    assert vd._api_candidates("https://api.example.com/api/v1/memu") == ["https://api.example.com/api/v1/memu"]
 
 
 # --- Core readiness returns (bool, str) tuples ---
