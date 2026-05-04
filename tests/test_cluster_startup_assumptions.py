@@ -47,6 +47,18 @@ def test_api_startup_cluster_uses_one_shot_nats_connection(monkeypatch):
     assert manager.allow_reconnect is False
 
 
+def test_api_startup_nats_is_disabled_by_default(monkeypatch):
+    monkeypatch.delenv("MEMU_ENABLE_STARTUP_NATS", raising=False)
+
+    assert api._startup_nats_enabled() is False
+
+
+def test_api_startup_nats_can_be_explicitly_enabled(monkeypatch):
+    monkeypatch.setenv("MEMU_ENABLE_STARTUP_NATS", "1")
+
+    assert api._startup_nats_enabled() is True
+
+
 def test_connect_node_passes_nonblocking_options_to_nats(monkeypatch):
     seen: dict[str, object] = {}
 

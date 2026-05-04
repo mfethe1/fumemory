@@ -4,6 +4,7 @@ from __future__ import annotations
 from datetime import datetime, timezone, timedelta
 
 import hashlib
+import asyncio
 import json
 from memu.web_search_ingest import ingest_web_search
 import os
@@ -124,6 +125,15 @@ def _make_startup_nats_cluster() -> NATSClusterManager:
     )
 
 
+def _env_flag(name: str, default: str = "0") -> bool:
+    return os.environ.get(name, default).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _startup_nats_enabled() -> bool:
+    """Whether the API should connect to NATS during FastAPI startup."""
+    return _env_flag("MEMU_ENABLE_STARTUP_NATS")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global pool, _fastembed_model, _nats_cluster, _nats_publisher, _core_memory_mgr, _implicit_profiler
@@ -161,44 +171,57 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning("FastEmbed pre-warm failed: %s", e)
 
-    # Connect NATS cluster (non-blocking â€” API works without NATS)
-    try:
-        _nats_cluster = _make_startup_nats_cluster()
-        await _nats_cluster.connect()
-        _nats_publisher = NATSEventPublisher(_nats_cluster, gateway_id="memu-api")
-        logger.info("NATS event publisher connected")
-
-        # Start OTel Exporter
+    # Connect NATS cluster only when explicitly enabled. Core API Readiness
+    # must not wait on NATS, because Railway healthchecks depend on lifespan
+    # completing before /health is served.
+    if _startup_nats_enabled():
         try:
-            from memu.otel_exporter import OTelExporterTask
-            import asyncio
-            otel_task = OTelExporterTask(_nats_cluster)
-            asyncio.create_task(otel_task.start())
-            logger.info("OTel Exporter started")
-        except Exception as e:
-            logger.error(f"Failed to start OTel Exporter: {e}")
+            _nats_cluster = _make_startup_nats_cluster()
+            connect_budget_s = float(os.environ.get("MEMU_NATS_STARTUP_BUDGET_S", "5"))
+            await asyncio.wait_for(_nats_cluster.connect(), timeout=connect_budget_s)
+            _nats_publisher = NATSEventPublisher(_nats_cluster, gateway_id="memu-api")
+            logger.info("NATS event publisher connected")
 
-        # Initialize Core Memory Manager (NATS KV)
-        try:
-            _core_memory_mgr = CoreMemoryManager(_nats_cluster.jetstream)
-            await _core_memory_mgr.ensure_bucket()
-            logger.info("Core Memory Manager initialized (NATS KV)")
+            # Start OTel Exporter
+            try:
+                from memu.otel_exporter import OTelExporterTask
+                otel_task = OTelExporterTask(_nats_cluster)
+                asyncio.create_task(otel_task.start())
+                logger.info("OTel Exporter started")
+            except Exception as e:
+                logger.error(f"Failed to start OTel Exporter: {e}")
+
+            # Initialize Core Memory Manager (NATS KV)
+            try:
+                _core_memory_mgr = CoreMemoryManager(_nats_cluster.jetstream)
+                await _core_memory_mgr.ensure_bucket()
+                logger.info("Core Memory Manager initialized (NATS KV)")
+            except Exception as e:
+                logger.warning("Core Memory Manager init failed: %s", e)
+                _core_memory_mgr = None
+
+            # Start Implicit Profiling Daemon
+            try:
+                from memu.implicit_profiler import ImplicitProfiler
+                if _core_memory_mgr:
+                    _implicit_profiler = ImplicitProfiler(_nats_cluster, _core_memory_mgr)
+                    asyncio.create_task(_implicit_profiler.start())
+                    logger.info("Implicit Profiler daemon started")
+            except Exception as e:
+                logger.warning("Implicit Profiler startup failed: %s", e)
+
         except Exception as e:
-            logger.warning("Core Memory Manager init failed: %s", e)
+            logger.warning("NATS connection failed (API will work without events): %s", e)
+            if _nats_cluster:
+                try:
+                    await _nats_cluster.close()
+                except Exception:
+                    pass
+            _nats_cluster = None
+            _nats_publisher = None
             _core_memory_mgr = None
-
-        # Start Implicit Profiling Daemon
-        try:
-            from memu.implicit_profiler import ImplicitProfiler
-            if _core_memory_mgr:
-                _implicit_profiler = ImplicitProfiler(_nats_cluster, _core_memory_mgr)
-                asyncio.create_task(_implicit_profiler.start())
-                logger.info("Implicit Profiler daemon started")
-        except Exception as e:
-            logger.warning("Implicit Profiler startup failed: %s", e)
-
-    except Exception as e:
-        logger.warning("NATS connection failed (API will work without events): %s", e)
+    else:
+        logger.info("NATS startup disabled; Core API will run without event publishing.")
         _nats_cluster = None
         _nats_publisher = None
         _core_memory_mgr = None

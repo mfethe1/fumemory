@@ -78,6 +78,7 @@ python scripts/verify_deployment.py --api-url https://<your-app>.up.railway.app 
 | `EMBEDDING_MODEL` | Optional | `text-embedding-3-small` | Embedding model name |
 | `EMBEDDING_DIMS` | Optional | `1536` | Must match model and schema dims |
 | `NATS_RAILWAY_URL` | Optional | — | Event streaming; API works without it |
+| `MEMU_ENABLE_STARTUP_NATS` | Optional | `0` | Set to `1` only for Federation Readiness after NATS is healthy |
 | `NATS_LOCAL_URL` | Optional | — | Only for local dev |
 | `TEMPORAL_HOST` | Optional | — | Required for async workflow routes only |
 | `LOG_LEVEL` | Optional | `INFO` | DEBUG/INFO/WARNING/ERROR |

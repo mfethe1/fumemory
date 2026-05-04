@@ -85,6 +85,7 @@ Required env vars at boot:
 
 Optional env vars:
 - `NATS_RAILWAY_URL` — enables mesh publish/subscribe and cluster status endpoints
+- `MEMU_ENABLE_STARTUP_NATS=1` — opt in to API startup NATS connection after `nats-jetstream` is healthy; leave unset for Core API Readiness
 - `EMBEDDING_API_BASE` / `EMBEDDING_MODEL` / `EMBEDDING_DIMS` — enables semantic embeddings; `EMBEDDING_BASE_URL` is a deprecated alias for `EMBEDDING_API_BASE`
 - `OPENAI_API_KEY` — required for OpenAI-hosted embeddings and chat features
 
