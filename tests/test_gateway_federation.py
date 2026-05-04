@@ -13,6 +13,7 @@ from memu.gateway_federation import (
     response_subject,
     results_to_json,
     validate_gateway_id,
+    verify_memu_replay_response,
 )
 
 
@@ -75,6 +76,39 @@ def test_memu_smoke_write_payload_uses_evidence_memory_for_idempotency() -> None
     assert payload["memory_kind"] == "evidence"
     assert payload["idempotency_key"] == "gateway-smoke-mac-mini-main-smoke-123"
     assert payload["metadata"]["source"] == "gateway-federation-smoke"
+
+
+def test_memu_replay_accepts_same_id_200() -> None:
+    ok, detail = verify_memu_replay_response(
+        200,
+        {"id": "mem-123"},
+        original_id="mem-123",
+    )
+
+    assert ok is True
+    assert "same id" in detail
+
+
+def test_memu_replay_accepts_legacy_409() -> None:
+    ok, detail = verify_memu_replay_response(
+        409,
+        {"error_code": "IDEMPOTENCY_CONFLICT"},
+        original_id="mem-123",
+    )
+
+    assert ok is True
+    assert "409" in detail
+
+
+def test_memu_replay_rejects_different_200_id() -> None:
+    ok, detail = verify_memu_replay_response(
+        200,
+        {"id": "different"},
+        original_id="mem-123",
+    )
+
+    assert ok is False
+    assert "different" in detail
 
 
 def test_federation_config_validation_requires_nats_url() -> None:

@@ -123,8 +123,8 @@ def test_check_health_returns_false_on_503(monkeypatch):
 
 # --- Federation gate ---
 
-def test_check_federation_passes_on_write_then_409_then_search(monkeypatch):
-    """Federation gate: write succeeds, replay returns 409, recall finds the memory."""
+def test_check_federation_passes_on_write_then_same_id_replay_then_search(monkeypatch):
+    """Federation gate: write succeeds, replay returns same ID, search finds memory."""
     monkeypatch.setenv("NATS_RAILWAY_URL", "nats://railway-nats:4222")
     call_log = []
 
@@ -139,12 +139,10 @@ def test_check_federation_passes_on_write_then_409_then_search(monkeypatch):
             body = json.dumps({"id": "abc-123", "content": "Federation Readiness Proof"})
             return _FakeResponse(200, body)
 
-        # Second POST /memories → 409 (idempotency replay dedup proof)
+        # Second POST /memories -> 200 exact replay with same ID
         if "/memories" in url and len([u for u in call_log if "/memories" in u]) == 2:
-            body = json.dumps({"detail": "An Evidence Memory with this idempotency_key already exists"})
-            err = vd.urllib.error.HTTPError(url, 409, "Conflict", {}, None)
-            err.read = lambda: body.encode("utf-8")
-            raise err
+            body = json.dumps({"id": "abc-123", "content": "Federation Readiness Proof"})
+            return _FakeResponse(200, body)
 
         # POST /search -> 200 with the written memory
         if url.endswith("/search"):
@@ -175,7 +173,7 @@ def test_check_federation_passes_on_write_then_409_then_search(monkeypatch):
 
     replay_check = next(c for c in checks if c["name"] == "idempotency_replay")
     assert replay_check["passed"] is True
-    assert "409" in replay_check["detail"]
+    assert "same id" in replay_check["detail"]
 
     search_check = next(c for c in checks if c["name"] == "federation_searchable_proof")
     assert search_check["passed"] is True
@@ -211,16 +209,16 @@ def test_check_federation_fails_when_write_fails(monkeypatch):
     assert write_check["passed"] is False
 
 
-def test_check_federation_fails_when_replay_not_deduplicated(monkeypatch):
-    """Federation gate fails if replay returns 200 instead of 409."""
+def test_check_federation_fails_when_replay_returns_different_id(monkeypatch):
+    """Federation gate fails if replay returns 200 with a different memory id."""
     monkeypatch.setenv("NATS_RAILWAY_URL", "nats://railway-nats:4222")
     call_count = [0]
 
     def fake_urlopen(req, timeout=15):
         call_count[0] += 1
         if "/memories" in req.full_url:
-            # Both writes return 200 — no dedup
-            return _FakeResponse(200, json.dumps({"id": "abc-123", "content": "proof"}))
+            replay_id = "abc-123" if call_count[0] == 1 else "different-id"
+            return _FakeResponse(200, json.dumps({"id": replay_id, "content": "proof"}))
         if req.full_url.endswith("/search"):
             return _FakeResponse(200, json.dumps([{"memory": {"content": "proof"}}]))
         return _FakeResponse(200, json.dumps([]))
@@ -232,7 +230,13 @@ def test_check_federation_fails_when_replay_not_deduplicated(monkeypatch):
     assert ok is False
     replay_check = next(c for c in checks if c["name"] == "idempotency_replay")
     assert replay_check["passed"] is False
-    assert "200" in replay_check["detail"]
+    assert "different-id" in replay_check["detail"]
+
+
+def test_verify_idempotency_replay_accepts_legacy_409():
+    ok, detail = vd._verify_idempotency_replay(409, "{}", expected_id="abc-123")
+    assert ok is True
+    assert "409" in detail
 
 
 def test_core_readiness_does_not_call_federation(monkeypatch):
@@ -345,7 +349,7 @@ def test_build_proof_federation_includes_gateway_and_nats_fields(monkeypatch):
     checks = [
         {"name": "nats_railway_url", "passed": True, "detail": "present"},
         {"name": "idempotency_write", "passed": True, "detail": "ok", "evidence_memory_id": "mem-abc-123"},
-        {"name": "idempotency_replay", "passed": True, "detail": "409 dedup confirmed"},
+        {"name": "idempotency_replay", "passed": True, "detail": "200 exact replay returned same id"},
     ]
     proof = vd._build_proof("federation", "http://memu.test", "key", checks, True)
 

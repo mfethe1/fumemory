@@ -342,14 +342,22 @@ async def run_memu_smoke(cfg: FederationConfig, *, marker: str) -> list[SmokeRes
             )
         )
 
-        # Idempotency replay: same key must return 409 (deduplication proof)
+        # Idempotency replay: exact replay returns the same memory id.
+        # Older compat paths may return 409, so keep that as an accepted proof.
         replay = await client.post(f"{base}/api/v1/memu/add", headers=headers, json=write_payload)
-        replay_ok = replay.status_code == 409
+        replay_data = safe_json(replay)
+        original_id = (safe_json(write) or {}).get("id")
+        replay_ok, replay_detail = verify_memu_replay_response(
+            replay.status_code,
+            replay_data,
+            original_id=original_id,
+        )
         results.append(
             SmokeResult(
                 name="memu-idempotency-replay",
                 ok=replay_ok,
-                detail="409 dedup confirmed" if replay_ok else f"expected 409 got {replay.status_code}",
+                detail=replay_detail,
+                data=replay_data,
             )
         )
 
@@ -390,6 +398,22 @@ def build_memu_smoke_write_payload(cfg: FederationConfig, *, marker: str) -> dic
         "idempotency_key": f"gateway-smoke-{cfg.gateway_id}-{marker}",
         "metadata": {"marker": marker, "source": "gateway-federation-smoke"},
     }
+
+
+def verify_memu_replay_response(
+    status_code: int,
+    replay_data: dict[str, Any] | None,
+    *,
+    original_id: str | None,
+) -> tuple[bool, str]:
+    if status_code == 409:
+        return True, "409 conflict/dedup confirmed"
+    if status_code != 200:
+        return False, f"expected same-id 200 or 409, got {status_code}"
+    replay_id = str((replay_data or {}).get("id") or "")
+    if original_id and replay_id == str(original_id):
+        return True, "200 exact replay returned same id"
+    return False, f"expected replay id {original_id or '<missing>'}, got {replay_id or '<missing>'}"
 
 
 def safe_json(response: httpx.Response) -> dict[str, Any] | None:

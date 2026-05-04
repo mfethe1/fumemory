@@ -301,7 +301,8 @@ def _check_federation(api_url: str, api_key: str) -> tuple[bool, list[dict]]:
     if not write_ok:
         return False, checks
 
-    # 2. Idempotency replay — same key must return 409 (deduplication proof)
+    # 2. Idempotency replay — exact replay returns the same memory id.
+    # Older compat paths may return 409, so keep that as an accepted proof.
     print("  🔁 Replaying same idempotency_key to prove deduplication...")
     status2, body2 = _request(
         "POST",
@@ -309,16 +310,20 @@ def _check_federation(api_url: str, api_key: str) -> tuple[bool, list[dict]]:
         api_key=api_key,
         json_body=evidence_payload,
     )
-    replay_ok = status2 == 409
+    replay_ok, replay_detail = _verify_idempotency_replay(
+        status2,
+        body2,
+        expected_id=str(write_check.get("evidence_memory_id") or ""),
+    )
     checks.append({
         "name": "idempotency_replay",
         "passed": replay_ok,
-        "detail": "409 dedup confirmed" if replay_ok else f"expected 409 got {status2}",
+        "detail": replay_detail,
     })
     if replay_ok:
-        print("  ✅ Idempotency replay confirmed (409 dedup).")
+        print(f"  ✅ Idempotency replay confirmed ({replay_detail}).")
     else:
-        print(f"  ❌ Idempotency replay failed: expected 409, got {status2} - {body2}")
+        print(f"  ❌ Idempotency replay failed: {replay_detail} - {body2}")
 
     # 3. Searchable memory proof via /search
     print("  🧠 Proving searchable memory via /search...")
@@ -335,6 +340,23 @@ def _check_federation(api_url: str, api_key: str) -> tuple[bool, list[dict]]:
     else:
         print("❌ Federation Readiness gate failed.")
     return overall, checks
+
+
+def _verify_idempotency_replay(status: int, body: str, *, expected_id: str) -> tuple[bool, str]:
+    if status == 409:
+        return True, "409 conflict/dedup confirmed"
+    if status != 200:
+        return False, f"expected same-id 200 or 409, got {status}"
+
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError:
+        return False, "replay returned non-JSON 200"
+
+    replay_id = str(payload.get("id") or "")
+    if expected_id and replay_id == expected_id:
+        return True, "200 exact replay returned same id"
+    return False, f"expected replay id {expected_id or '<missing>'}, got {replay_id or '<missing>'}"
 
 
 def _check_async(api_url: str, api_key: str) -> tuple[bool, list[dict]]:
