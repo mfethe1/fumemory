@@ -391,7 +391,12 @@ async def get_embedding(text: str) -> list[float] | None:
     No ML models are loaded in the Gateway pod. NATS KV provides L1 semantic caching.
     """
     from memu.embeddings_client import get_embedding as _get_embedding
-    nc = _nats_cluster.active_connection if _nats_cluster else None
+    nc = None
+    if _nats_cluster:
+        try:
+            nc = _nats_cluster.active_connection
+        except Exception as e:
+            logger.warning("NATS embedding cache unavailable; continuing without cache: %s", e)
     return await _get_embedding(text, nc=nc)
 
 
