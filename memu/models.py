@@ -21,6 +21,27 @@ class MemoryType(str, Enum):
     # Procedural memory — parameterized skill templates (Phase 3)
     procedural = "procedural"
 
+
+class MemoryKind(str, Enum):
+    """Primary discriminator between immutable execution proof and reusable knowledge.
+
+    evidence — append-only, task-bound execution proof written by OpenClaw gateways.
+    learning — derived, reusable knowledge distilled from one or more evidence records.
+
+    Distinct from memory_type, which is a semantic taxonomy (decision, lesson, etc.).
+    """
+    evidence = "evidence"
+    learning = "learning"
+
+
+class ReviewStatus(str, Enum):
+    """Lifecycle state for Learning Memory, tracking reflection review progress."""
+    proposed = "proposed"
+    accepted = "accepted"
+    accepted_by_timeout = "accepted_by_timeout"
+    rejected = "rejected"
+    legacy = "legacy"
+
 class Relationship(BaseModel):
     """Graph-Lite entity/relationship tag for memory connections."""
     entity: str = Field(..., description="Entity name or ID being referenced")
@@ -31,6 +52,7 @@ class Relationship(BaseModel):
 class MemoryCreate(BaseModel):
     content: str
     memory_type: MemoryType = MemoryType.observation
+    memory_kind: MemoryKind = MemoryKind.learning
     agent_id: str
     metadata: Optional[dict] = None
     parent_id: Optional[UUID] = None
@@ -40,11 +62,21 @@ class MemoryCreate(BaseModel):
     invalidates: list[UUID] = Field(default_factory=list)
     salience_score: float = Field(0.5, ge=0.0, le=1.0, description="Salience: 0.0=routine, 1.0=critical")
     allowed_roles: list[str] = Field(default_factory=lambda: ["*"], description="ABAC: roles that may access this memory. ['*'] = unrestricted.")
+    idempotency_key: Optional[str] = Field(
+        None,
+        max_length=255,
+        description=(
+            "Tenant-scoped idempotency key for Evidence Memory. "
+            "Exact replay returns the same ID; same key with a different canonical "
+            "payload returns 409 Conflict."
+        ),
+    )
 
 class Memory(BaseModel):
     id: UUID
     content: str
     memory_type: str
+    memory_kind: str = "learning"
     agent_id: str
     metadata: dict
     parent_id: Optional[UUID]
@@ -53,6 +85,7 @@ class Memory(BaseModel):
     decay_score: Optional[float] = None
     salience_score: float = 0.5
     searchable: bool = True
+    review_status: Optional[str] = None
     created_at: datetime
     updated_at: datetime
 

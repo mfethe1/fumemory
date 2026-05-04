@@ -50,6 +50,7 @@ from memu.models import (
     GatewayLeaseRenewRequest,
     Memory,
     MemoryCreate,
+    MemoryKind,
     MemoryType,
     SearchRequest,
     SearchResult,
@@ -59,6 +60,7 @@ from memu.models import (
     TaskUpdate,
     TaskReviewRequest,
 )
+from memu.schema_contract import compute_canonical_payload_hash
 
 from memu.notion_bridge import create_bridge_from_env, NotionBridge
 from memu.migrations import run_migrations
@@ -350,14 +352,16 @@ def _row_to_memory(row) -> Memory:
         id=row["id"],
         content=row["content"],
         memory_type=row["memory_type"],
+        memory_kind=_record_value(row, "memory_kind", "learning"),
         agent_id=row["agent_id"],
         metadata=metadata,
         parent_id=row["parent_id"],
         confidence=row["confidence"],
         access_count=row["access_count"],
         decay_score=row["decay_score"],
-        salience_score=float(row.get("salience_score", 0.5) or 0.5),
-        searchable=bool(row.get("searchable", True)),
+        salience_score=float(_record_value(row, "salience_score", 0.5) or 0.5),
+        searchable=bool(_record_value(row, "searchable", True)),
+        review_status=_record_value(row, "review_status", None),
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )
@@ -687,65 +691,128 @@ async def create_memory(req: MemoryCreate, _key: str = Depends(verify_api_key)):
         invalidates=req.invalidates,
     )
     normalized_metadata = _apply_superseding_metadata(normalized_metadata, superseded_ids)
+
+    memory_kind = req.memory_kind.value
+    is_evidence = (memory_kind == MemoryKind.evidence.value)
+    idempotency_key = req.idempotency_key or None
+
+    # Canonical payload hash — only computed for evidence writes with an idempotency key.
+    # Excludes transport-only fields so retries with the same payload produce the same hash.
+    canonical_hash: str | None = None
+    if is_evidence and idempotency_key:
+        canonical_hash = compute_canonical_payload_hash(
+            content=req.content,
+            memory_type=req.memory_type.value,
+            agent_id=req.agent_id,
+            metadata=normalized_metadata,
+        )
+
     embedding = await get_embedding(req.content)
     c_hash = content_hash(req.content)
+    tenant_id = getattr(_key, 'tenant_id', DEFAULT_TENANT_ID)
 
     async with _tenant_conn(_key) as conn:
-        # Check for duplicates (content hash always works; vector similarity only when embedding available)
-        if embedding is not None:
-            vec = f"vector({EMBEDDING_DIMS})"
-            existing = await conn.fetchrow(
-                f"""
-                SELECT id, 1 - (embedding <=> $1::{vec}) AS similarity
+        # --- Evidence Memory: idempotency check ---
+        # Evidence rows are never content-deduped across distinct events.
+        # Dedup is handled exclusively via (tenant_id, idempotency_key).
+        if is_evidence and idempotency_key:
+            existing_idem = await conn.fetchrow(
+                """
+                SELECT id, canonical_payload_hash
                 FROM memories
-                WHERE content_hash = $2 OR (1 - (embedding <=> $1::{vec})) > $3
-                ORDER BY similarity DESC
+                WHERE tenant_id = $1 AND idempotency_key = $2
                 LIMIT 1
                 """,
-                str(embedding),
-                c_hash,
-                DEDUP_THRESHOLD,
+                tenant_id,
+                idempotency_key,
             )
-        else:
-            existing = await conn.fetchrow(
-                "SELECT id, 1.0::float AS similarity FROM memories WHERE content_hash = $1 LIMIT 1",
-                c_hash,
-            )
+            if existing_idem:
+                stored_hash = existing_idem["canonical_payload_hash"]
+                if stored_hash == canonical_hash:
+                    # Exact replay — return the original memory unchanged
+                    row = await conn.fetchrow(
+                        "SELECT * FROM memories WHERE id = $1",
+                        existing_idem["id"],
+                    )
+                    return _row_to_memory(row)
+                else:
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "error": "idempotency_conflict",
+                            "message": (
+                                "An Evidence Memory with this idempotency_key already exists "
+                                "but its canonical payload hash differs from this request."
+                            ),
+                            "existing_id": str(existing_idem["id"]),
+                        },
+                    )
 
-        if existing and should_deduplicate(existing["similarity"], DEDUP_THRESHOLD):
-            # Update existing memory instead of duplicating
+        # --- Learning Memory: content-hash / vector dedup ---
+        # Evidence Memory skips this block — distinct task/session/gateway events
+        # must remain separate records even when their content is identical.
+        row = None
+        if not is_evidence:
+            if embedding is not None:
+                vec = f"vector({EMBEDDING_DIMS})"
+                existing = await conn.fetchrow(
+                    f"""
+                    SELECT id, 1 - (embedding <=> $1::{vec}) AS similarity
+                    FROM memories
+                    WHERE content_hash = $2 OR (1 - (embedding <=> $1::{vec})) > $3
+                    ORDER BY similarity DESC
+                    LIMIT 1
+                    """,
+                    str(embedding),
+                    c_hash,
+                    DEDUP_THRESHOLD,
+                )
+            else:
+                existing = await conn.fetchrow(
+                    "SELECT id, 1.0::float AS similarity FROM memories WHERE content_hash = $1 LIMIT 1",
+                    c_hash,
+                )
+
+            if existing and should_deduplicate(existing["similarity"], DEDUP_THRESHOLD):
+                row = await conn.fetchrow(
+                    """
+                    UPDATE memories SET
+                        access_count = access_count + 1,
+                        confidence = GREATEST(confidence, $2),
+                        metadata = metadata || $3::jsonb,
+                        updated_at = NOW()
+                    WHERE id = $1
+                    RETURNING *
+                    """,
+                    existing["id"],
+                    req.confidence,
+                    json.dumps(normalized_metadata),
+                )
+
+        # --- Insert new memory (evidence always reaches here; learning only when no dedup hit) ---
+        if row is None:
             row = await conn.fetchrow(
                 """
-                UPDATE memories SET
-                    access_count = access_count + 1,
-                    confidence = GREATEST(confidence, $2),
-                    metadata = metadata || $3::jsonb,
-                    updated_at = NOW()
-                WHERE id = $1
-                RETURNING *
-                """,
-                existing["id"],
-                req.confidence,
-                json.dumps(normalized_metadata),
-            )
-        else:
-            # Include tenant_id for RLS multi-tenancy
-            tenant_id = getattr(_key, 'tenant_id', DEFAULT_TENANT_ID)
-            row = await conn.fetchrow(
-                """
-                INSERT INTO memories (content, embedding, memory_type, agent_id, metadata, parent_id, confidence, content_hash, tenant_id)
-                VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9)
+                INSERT INTO memories (
+                    content, embedding, memory_type, memory_kind,
+                    agent_id, metadata, parent_id, confidence,
+                    content_hash, tenant_id, idempotency_key, canonical_payload_hash
+                )
+                VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $10, $11, $12)
                 RETURNING *
                 """,
                 req.content,
                 str(embedding) if embedding is not None else None,
                 req.memory_type.value,
+                memory_kind,
                 req.agent_id,
                 json.dumps(normalized_metadata),
                 req.parent_id,
                 req.confidence,
                 c_hash,
                 tenant_id,
+                idempotency_key,
+                canonical_hash,
             )
 
         superseded_ids = [value for value in superseded_ids if value != row["id"]]
@@ -817,8 +884,10 @@ class MemUAddCompatRequest(BaseModel):
     text: str | None = None
     agent_id: str = "unknown"
     memory_type: MemoryType = MemoryType.observation
+    memory_kind: MemoryKind = MemoryKind.learning
     metadata: dict[str, Any] | None = None
     confidence: float = 1.0
+    idempotency_key: str | None = None
 
 
 class MemUAddCompatResponse(BaseModel):
@@ -844,16 +913,29 @@ async def memu_add_compat(req: MemUAddCompatRequest, _key: str = Depends(verify_
             message="Missing required field: content",
         )
 
-    memory = await create_memory(
-        MemoryCreate(
-            content=req.content,
-            agent_id=req.agent_id,
-            memory_type=req.memory_type,
-            metadata=req.metadata,
-            confidence=req.confidence,
-        ),
-        _key=_key,
-    )
+    try:
+        memory = await create_memory(
+            MemoryCreate(
+                content=req.content,
+                agent_id=req.agent_id,
+                memory_type=req.memory_type,
+                memory_kind=req.memory_kind,
+                metadata=req.metadata,
+                confidence=req.confidence,
+                idempotency_key=req.idempotency_key,
+            ),
+            _key=_key,
+        )
+    except HTTPException as exc:
+        if exc.status_code == 409:
+            detail = exc.detail if isinstance(exc.detail, dict) else {}
+            return MemUAddCompatResponse(
+                ok=False,
+                id=detail.get("existing_id"),
+                error_code="IDEMPOTENCY_CONFLICT",
+                message=detail.get("message", "Idempotency conflict"),
+            )
+        raise
     return MemUAddCompatResponse(ok=True, id=str(memory.id), message="Memory stored")
 
 
