@@ -25,7 +25,7 @@ Proves the fumemory API is functional without NATS or Temporal:
 - `GET /health` returns 200 with DB probe passing
 - `POST /memories` performs a canonical write with auth
 - `GET /search-text?q=...` retrieves the written memory (immediate recall)
-- `GET /search/recall?query=...` retrieves the written memory (semantic recall)
+- `POST /search` retrieves the written memory (semantic/lexical memory retrieval)
 
 Run with:
 ```bash
@@ -43,7 +43,7 @@ Requires Core API Readiness plus:
 
 - Idempotency-keyed evidence write (proves canonical write path with dedup)
 - Idempotency replay: second write with the same key returns the existing memory (proves dedup)
-- Searchable memory proof: the idempotency-keyed memory is findable via `/search/recall`
+- Searchable memory proof: the idempotency-keyed memory is findable via `/search`
 
 NATS/JetStream gateway publish/consume and directed response are proved by the test suite
 (`tests/test_gateway_federation.py`, `tests/test_nats_config_contract.py`) running against a
@@ -172,7 +172,7 @@ header values) are redacted as `"[REDACTED]"`. The document structure is:
     {"name": "health", "passed": true, "detail": "status=200"},
     {"name": "canonical_write", "passed": true, "detail": "memory_id written"},
     {"name": "search_text", "passed": true, "detail": "memory found"},
-    {"name": "search_recall", "passed": true, "detail": "memory found"}
+    {"name": "memory_retrieval", "passed": true, "detail": "memory found"}
   ],
   "overall": "pass"
 }

@@ -30,23 +30,45 @@ def test_verify_search_text_success(monkeypatch):
     assert ok is True
 
 
-def test_verify_search_recall_success(monkeypatch):
+def test_verify_memory_retrieval_success(monkeypatch):
     def fake_urlopen(req, timeout=15):
-        assert req.full_url == "http://memu.test/search/recall?query=needle&limit=3"
+        assert req.full_url == "http://memu.test/search"
         assert req.headers["X-memu-key"] == "secret"
-        return _FakeResponse(200, json.dumps({"results": [{"content": "needle in a haystack"}]}))
+        body = json.loads(req.data.decode("utf-8"))
+        assert body["query"] == "needle"
+        assert body["lexical_fallback"] is True
+        return _FakeResponse(200, json.dumps([{"memory": {"content": "needle in a haystack"}}]))
 
     monkeypatch.setattr(vd.urllib.request, "urlopen", fake_urlopen)
-    ok, detail = vd._verify_search_recall("http://memu.test", "secret", "needle")
+    ok, detail = vd._verify_memory_retrieval("http://memu.test", "secret", "needle")
     assert ok is True
 
 
-def test_verify_search_recall_rejects_unexpected_payload(monkeypatch):
+def test_verify_memory_retrieval_falls_back_to_legacy_recall(monkeypatch):
+    calls = []
+
     def fake_urlopen(req, timeout=15):
-        return _FakeResponse(200, json.dumps({"ok": True}))
+        calls.append(req.full_url)
+        if req.full_url == "http://memu.test/search":
+            return _FakeResponse(200, json.dumps([]))
+        assert req.full_url == "http://memu.test/search/recall?query=needle&limit=3"
+        return _FakeResponse(200, json.dumps({"results": [{"content": "needle in a haystack"}]}))
 
     monkeypatch.setattr(vd.urllib.request, "urlopen", fake_urlopen)
-    ok, detail = vd._verify_search_recall("http://memu.test", "secret", "needle")
+    ok, detail = vd._verify_memory_retrieval("http://memu.test", "secret", "needle")
+    assert ok is True
+    assert calls == [
+        "http://memu.test/search",
+        "http://memu.test/search/recall?query=needle&limit=3",
+    ]
+
+
+def test_verify_memory_retrieval_rejects_search_history_payload(monkeypatch):
+    def fake_urlopen(req, timeout=15):
+        return _FakeResponse(200, json.dumps([{"query": "needle"}]))
+
+    monkeypatch.setattr(vd.urllib.request, "urlopen", fake_urlopen)
+    ok, detail = vd._verify_memory_retrieval("http://memu.test", "secret", "needle")
     assert ok is False
 
 
@@ -124,9 +146,11 @@ def test_check_federation_passes_on_write_then_409_then_search(monkeypatch):
             err.read = lambda: body.encode("utf-8")
             raise err
 
-        # GET /search/recall → 200 with the written memory
-        if "/search/recall" in url:
-            body = json.dumps({"results": [{"content": "Federation Readiness Proof verify-federation-1234567890"}]})
+        # POST /search -> 200 with the written memory
+        if url.endswith("/search"):
+            body = json.dumps([
+                {"memory": {"content": "Federation Readiness Proof verify-federation-1234567890"}}
+            ])
             return _FakeResponse(200, body)
 
         return _FakeResponse(200, json.dumps([]))
@@ -197,8 +221,8 @@ def test_check_federation_fails_when_replay_not_deduplicated(monkeypatch):
         if "/memories" in req.full_url:
             # Both writes return 200 — no dedup
             return _FakeResponse(200, json.dumps({"id": "abc-123", "content": "proof"}))
-        if "/search/recall" in req.full_url:
-            return _FakeResponse(200, json.dumps({"results": [{"content": "proof"}]}))
+        if req.full_url.endswith("/search"):
+            return _FakeResponse(200, json.dumps([{"memory": {"content": "proof"}}]))
         return _FakeResponse(200, json.dumps([]))
 
     monkeypatch.setattr(vd.urllib.request, "urlopen", fake_urlopen)
@@ -232,8 +256,8 @@ def test_core_readiness_does_not_call_federation(monkeypatch):
             return _FakeResponse(200, json.dumps({"id": "x", "content": "probe"}))
         if "/search-text" in req.full_url:
             return _FakeResponse(200, json.dumps([{"content": "probe"}]))
-        if "/search/recall" in req.full_url:
-            return _FakeResponse(200, json.dumps({"results": [{"content": "probe"}]}))
+        if req.full_url.endswith("/search"):
+            return _FakeResponse(200, json.dumps([{"memory": {"content": "probe"}}]))
         return _FakeResponse(200, json.dumps([]))
 
     monkeypatch.setattr(vd.urllib.request, "urlopen", fake_urlopen)
@@ -363,8 +387,8 @@ def test_optional_services_absent_does_not_block_core(monkeypatch):
             return _FakeResponse(200, json.dumps({"id": "x", "content": "core-probe"}))
         if "/search-text" in req.full_url:
             return _FakeResponse(200, json.dumps([{"content": "core-probe"}]))
-        if "/search/recall" in req.full_url:
-            return _FakeResponse(200, json.dumps({"results": [{"content": "core-probe"}]}))
+        if req.full_url.endswith("/search"):
+            return _FakeResponse(200, json.dumps([{"memory": {"content": "core-probe"}}]))
         return _FakeResponse(200, json.dumps([]))
 
     monkeypatch.setattr(vd.urllib.request, "urlopen", fake_urlopen)

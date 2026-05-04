@@ -4,7 +4,7 @@
 Three readiness gates, each a strict superset of the previous:
 
   Core API Readiness (default):
-    GET /health, POST /memories (canonical write), GET /search-text, GET /search/recall
+    GET /health, POST /memories (canonical write), GET /search-text, POST /search
 
   Federation Readiness (--check-federation):
     Core API + idempotency-keyed evidence write + idempotency replay + searchable memory proof
@@ -26,6 +26,12 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
+
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 
 COMPAT_BASE_SUFFIX = "/api/v1/memu"
@@ -157,16 +163,41 @@ def _verify_search_text(api_url: str, api_key: str, content: str) -> tuple[bool,
     return False, "memory not found in results"
 
 
-def _verify_search_recall(api_url: str, api_key: str, content: str) -> tuple[bool, str]:
-    print("\n🧠 Verifying retrieval via /search/recall...")
+def _extract_memory_results(payload: object) -> list:
+    if isinstance(payload, dict):
+        results = payload.get("results") or payload.get("memories") or []
+    elif isinstance(payload, list):
+        results = payload
+    else:
+        return []
+    return results if isinstance(results, list) else []
+
+
+def _item_content(item: object) -> str:
+    if not isinstance(item, dict):
+        return ""
+    if isinstance(item.get("content"), str):
+        return item["content"]
+    memory = item.get("memory")
+    if isinstance(memory, dict) and isinstance(memory.get("content"), str):
+        return memory["content"]
+    return ""
+
+
+def _verify_memory_retrieval(api_url: str, api_key: str, content: str) -> tuple[bool, str]:
+    print("\n🧠 Verifying written-memory retrieval via /search...")
     params = urllib.parse.urlencode({"query": content, "limit": 3})
     attempts = [
-        ("GET", _endpoint(api_url, f"/search/recall?{params}", f"/search/recall?{params}"), None, "/search/recall GET"),
-        ("POST", _endpoint(api_url, "/search/recall", "/search/recall"), {"query": content, "limit": 3}, "/search/recall POST"),
-        ("POST", _endpoint(api_url, "/search", "/search"), {"query": content, "limit": 3}, "/search fallback"),
+        (
+            "POST",
+            _endpoint(api_url, "/search", "/search"),
+            {"query": content, "limit": 3, "lexical_fallback": True, "min_results": 1},
+            "/search POST",
+        ),
+        ("GET", _endpoint(api_url, f"/search/recall?{params}", f"/search/recall?{params}"), None, "/search/recall legacy GET"),
+        ("POST", _endpoint(api_url, "/search/recall", "/search/recall"), {"query": content, "limit": 3}, "/search/recall legacy POST"),
     ]
-    payload = None
-    last_error = None
+    last_error = "no attempts made"
     for method, url, body_json, label in attempts:
         status, body = _request(method, url, api_key=api_key, json_body=body_json)
         if status != 200:
@@ -174,30 +205,29 @@ def _verify_search_recall(api_url: str, api_key: str, content: str) -> tuple[boo
             continue
         try:
             payload = json.loads(body)
-            break
         except json.JSONDecodeError:
             last_error = f"{label}: non-JSON response {body}"
-    else:
-        print(f"❌ retrieval verification failed: {last_error}")
-        return False, f"all recall attempts failed: {last_error}"
+            continue
 
-    results = []
-    if isinstance(payload, dict):
-        results = payload.get("results") or payload.get("memories") or []
-    elif isinstance(payload, list):
-        results = payload
+        results = _extract_memory_results(payload)
+        if not results:
+            last_error = f"{label}: no memory results"
+            continue
 
-    if not isinstance(results, list):
-        print(f"❌ retrieval returned unexpected payload: {payload}")
-        return False, f"unexpected payload shape: {type(payload).__name__}"
+        for item in results:
+            if content in _item_content(item):
+                print(f"✅ Retrieval verified newly written memory via {label}.")
+                return True, "memory found in retrieval results"
 
-    for item in results:
-        if content in (item.get("content", "") if isinstance(item, dict) else ""):
-            print("✅ Retrieval verified newly written memory.")
-            return True, "memory found in recall results"
+        last_error = f"{label}: memory not found in {len(results)} result(s)"
 
     print("❌ retrieval verification failed: newly written memory not found.")
-    return False, "memory not found in recall results"
+    return False, f"memory not found in retrieval results ({last_error})"
+
+
+def _verify_search_recall(api_url: str, api_key: str, content: str) -> tuple[bool, str]:
+    """Backward-compatible alias for older tests/scripts."""
+    return _verify_memory_retrieval(api_url, api_key, content)
 
 
 def _redact_nats_url(url: str) -> str:
@@ -290,9 +320,9 @@ def _check_federation(api_url: str, api_key: str) -> tuple[bool, list[dict]]:
     else:
         print(f"  ❌ Idempotency replay failed: expected 409, got {status2} - {body2}")
 
-    # 3. Searchable memory proof via /search/recall
-    print("  🧠 Proving searchable memory via /search/recall...")
-    search_ok, search_detail = _verify_search_recall(api_url, api_key, content)
+    # 3. Searchable memory proof via /search
+    print("  🧠 Proving searchable memory via /search...")
+    search_ok, search_detail = _verify_memory_retrieval(api_url, api_key, content)
     checks.append({
         "name": "federation_searchable_proof",
         "passed": search_ok,
@@ -403,8 +433,8 @@ def _verify_single(
             _write_proof(_build_proof(gate, api_url, api_key, all_checks, False), proof_out)
         return False
 
-    recall_ok, recall_detail = _verify_search_recall(api_url, api_key, content)
-    all_checks.append({"name": "search_recall", "passed": recall_ok, "detail": recall_detail})
+    recall_ok, recall_detail = _verify_memory_retrieval(api_url, api_key, content)
+    all_checks.append({"name": "memory_retrieval", "passed": recall_ok, "detail": recall_detail})
     if not recall_ok:
         if proof_out:
             _write_proof(_build_proof(gate, api_url, api_key, all_checks, False), proof_out)

@@ -20,3 +20,4 @@ ui/dist/
 tmp/
 .pytest_cache/
 .railway/
+reports/railway-*-proof-*.json
