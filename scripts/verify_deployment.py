@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 """Deployment verification for memU.
 
-Default mode verifies the core API only:
-- GET /health
-- POST /memories
-- GET /search-text
-- GET /search/recall
+Three readiness gates, each a strict superset of the previous:
 
-Async/Temporal checks are optional and only run when --check-async is passed.
-This avoids false negatives on Railway when Temporal is not part of the current deploy.
+  Core API Readiness (default):
+    GET /health, POST /memories (canonical write), GET /search-text, GET /search/recall
+
+  Federation Readiness (--check-federation):
+    Core API + idempotency-keyed evidence write + idempotency replay + searchable memory proof
+
+  Async Readiness (--check-async):
+    Core API + POST /memories/async + POST /search/async (Temporal required)
+
+Use --proof-out FILE to emit a machine-readable JSON proof artifact with secrets redacted.
 """
 
 from __future__ import annotations
@@ -21,6 +25,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime, timezone
 
 
 COMPAT_BASE_SUFFIX = "/api/v1/memu"
@@ -90,18 +95,18 @@ def _endpoint(api_url: str, path: str, compat_path: str | None = None) -> str:
     return f"{api_url}{suffix}"
 
 
-def _check_health(api_url: str) -> bool:
+def _check_health(api_url: str) -> tuple[bool, str]:
     health_url = _endpoint(api_url, "/health", "/health")
     print(f"🏥 Checking health at {health_url}...")
     status, body = _request("GET", health_url)
     if status == 200:
         print(f"✅ Healthy: {body}")
-        return True
+        return True, f"status={status}"
     print(f"❌ Unhealthy: {status} - {body}")
-    return False
+    return False, f"status={status} body={body[:120]}"
 
 
-def _write_sync_memory(api_url: str, api_key: str) -> str | None:
+def _write_sync_memory(api_url: str, api_key: str) -> tuple[str | None, str]:
     print("\n✍️ Testing sync memory write...")
     content = f"Deployment Verification Test {time.time()}"
     payload = {
@@ -118,12 +123,12 @@ def _write_sync_memory(api_url: str, api_key: str) -> str | None:
     )
     if status == 200:
         print("✅ Sync write succeeded.")
-        return content
+        return content, "canonical write succeeded"
     print(f"❌ Sync write failed: {status} - {body}")
-    return None
+    return None, f"status={status} body={body[:120]}"
 
 
-def _verify_search_text(api_url: str, api_key: str, content: str) -> bool:
+def _verify_search_text(api_url: str, api_key: str, content: str) -> tuple[bool, str]:
     print("\n🔍 Verifying ingestion via /search-text...")
     if _compat_mode(api_url):
         status, body = _request(
@@ -137,13 +142,13 @@ def _verify_search_text(api_url: str, api_key: str, content: str) -> bool:
         status, body = _request("GET", _endpoint(api_url, f"/search-text?{params}", f"/search-text?{params}"), api_key=api_key)
     if status != 200:
         print(f"❌ /search-text failed: {status} - {body}")
-        return False
+        return False, f"status={status} body={body[:120]}"
 
     try:
         payload = json.loads(body)
     except json.JSONDecodeError:
         print(f"❌ /search-text response was not JSON: {body}")
-        return False
+        return False, "non-JSON response"
 
     if isinstance(payload, dict):
         results = payload.get("results") or payload.get("memories") or []
@@ -152,13 +157,13 @@ def _verify_search_text(api_url: str, api_key: str, content: str) -> bool:
 
     if results and content in results[0].get("content", ""):
         print(f"✅ /search-text verified: {results[0]['content'][:80]}...")
-        return True
+        return True, "memory found in results"
 
     print("❌ /search-text verification failed: newly written memory not found.")
-    return False
+    return False, "memory not found in results"
 
 
-def _verify_search_recall(api_url: str, api_key: str, content: str) -> bool:
+def _verify_search_recall(api_url: str, api_key: str, content: str) -> tuple[bool, str]:
     print("\n🧠 Verifying retrieval via /search/recall...")
     params = urllib.parse.urlencode({"query": content, "limit": 3})
     attempts = [
@@ -180,7 +185,7 @@ def _verify_search_recall(api_url: str, api_key: str, content: str) -> bool:
             last_error = f"{label}: non-JSON response {body}"
     else:
         print(f"❌ retrieval verification failed: {last_error}")
-        return False
+        return False, f"all recall attempts failed: {last_error}"
 
     results = []
     if isinstance(payload, dict):
@@ -190,19 +195,97 @@ def _verify_search_recall(api_url: str, api_key: str, content: str) -> bool:
 
     if not isinstance(results, list):
         print(f"❌ retrieval returned unexpected payload: {payload}")
-        return False
+        return False, f"unexpected payload shape: {type(payload).__name__}"
 
     for item in results:
         if content in (item.get("content", "") if isinstance(item, dict) else ""):
             print("✅ Retrieval verified newly written memory.")
-            return True
+            return True, "memory found in recall results"
 
     print("❌ retrieval verification failed: newly written memory not found.")
-    return False
+    return False, "memory not found in recall results"
 
 
-def _check_async(api_url: str, api_key: str) -> bool:
+def _check_federation(api_url: str, api_key: str) -> tuple[bool, list[dict]]:
+    """Federation Readiness gate.
+
+    Proves idempotency-keyed evidence write and replay on the memory plane.
+    NATS/JetStream publish/consume and directed response are proved by the
+    test suite (test_gateway_federation.py, test_nats_config_contract.py).
+    """
+    print("\n🔗 Testing Federation Readiness (idempotency write + replay + searchable proof)...")
+    checks: list[dict] = []
+
+    idempotency_key = f"verify-federation-{int(time.time())}"
+    content = f"Federation Readiness Proof {idempotency_key}"
+    evidence_payload = {
+        "content": content,
+        "agent_id": "macklemore-qa",
+        "memory_type": "fact",
+        "memory_kind": "evidence",
+        "idempotency_key": idempotency_key,
+        "metadata": {"source": "federation_readiness_test", "gate": "federation"},
+    }
+
+    # 1. Idempotency-keyed evidence write
+    print("  ✍️  Writing idempotency-keyed evidence memory...")
+    status, body = _request(
+        "POST",
+        _endpoint(api_url, "/memories", "/add"),
+        api_key=api_key,
+        json_body=evidence_payload,
+    )
+    write_ok = status == 200
+    checks.append({
+        "name": "idempotency_write",
+        "passed": write_ok,
+        "detail": f"status={status}" if not write_ok else "evidence memory written",
+    })
+    if write_ok:
+        print("  ✅ Idempotency write succeeded.")
+    else:
+        print(f"  ❌ Idempotency write failed: {status} - {body}")
+        return False, checks
+
+    # 2. Idempotency replay — same key must return 409 (deduplication proof)
+    print("  🔁 Replaying same idempotency_key to prove deduplication...")
+    status2, body2 = _request(
+        "POST",
+        _endpoint(api_url, "/memories", "/add"),
+        api_key=api_key,
+        json_body=evidence_payload,
+    )
+    replay_ok = status2 == 409
+    checks.append({
+        "name": "idempotency_replay",
+        "passed": replay_ok,
+        "detail": "409 dedup confirmed" if replay_ok else f"expected 409 got {status2}",
+    })
+    if replay_ok:
+        print("  ✅ Idempotency replay confirmed (409 dedup).")
+    else:
+        print(f"  ❌ Idempotency replay failed: expected 409, got {status2} - {body2}")
+
+    # 3. Searchable memory proof via /search/recall
+    print("  🧠 Proving searchable memory via /search/recall...")
+    search_ok, search_detail = _verify_search_recall(api_url, api_key, content)
+    checks.append({
+        "name": "federation_searchable_proof",
+        "passed": search_ok,
+        "detail": search_detail,
+    })
+
+    overall = all(c["passed"] for c in checks)
+    if overall:
+        print("✅ Federation Readiness gate passed.")
+    else:
+        print("❌ Federation Readiness gate failed.")
+    return overall, checks
+
+
+def _check_async(api_url: str, api_key: str) -> tuple[bool, list[dict]]:
     print("\n🚀 Testing async endpoints (Temporal required)...")
+    checks: list[dict] = []
 
     ingest_payload = {
         "content": f"Async Deployment Verification Test {time.time()}",
@@ -211,38 +294,109 @@ def _check_async(api_url: str, api_key: str) -> bool:
         "metadata": {"source": "deployment_test", "mode": "async"},
     }
     status, body = _request("POST", _endpoint(api_url, "/memories/async", "/memories/async"), api_key=api_key, json_body=ingest_payload)
-    if status != 200:
+    ingest_ok = status == 200
+    checks.append({"name": "async_ingest", "passed": ingest_ok, "detail": f"status={status}" if not ingest_ok else "accepted"})
+    if not ingest_ok:
         print(f"❌ Async ingestion failed: {status} - {body}")
-        return False
+        return False, checks
 
     search_payload = {"query": "deployment_test", "agent_id": "macklemore-qa", "limit": 1}
     status, body = _request("POST", _endpoint(api_url, "/search/async", "/search/async"), api_key=api_key, json_body=search_payload)
-    if status != 200:
+    search_ok = status == 200
+    checks.append({"name": "async_search", "passed": search_ok, "detail": f"status={status}" if not search_ok else "accepted"})
+    if not search_ok:
         print(f"❌ Async search failed: {status} - {body}")
-        return False
+        return False, checks
 
     print("✅ Async endpoints accepted requests.")
-    return True
+    return True, checks
 
 
-def _verify_single(api_url: str, api_key: str, check_async: bool) -> bool:
-    if not _check_health(api_url):
+def _build_proof(
+    gate: str,
+    api_url: str,
+    api_key: str,
+    checks: list[dict],
+    overall: bool,
+) -> dict:
+    """Build a machine-readable proof artifact with secrets redacted."""
+    return {
+        "schema_version": 1,
+        "gate": gate,
+        "api_url": api_url,
+        "api_key": "[REDACTED]",
+        "timestamp_utc": datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "checks": checks,
+        "overall": "pass" if overall else "fail",
+    }
+
+
+def _write_proof(proof: dict, path: str) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(proof, f, indent=2)
+    print(f"\n📄 Proof artifact written to {path}")
+
+
+def _verify_single(
+    api_url: str,
+    api_key: str,
+    check_federation: bool,
+    check_async: bool,
+    proof_out: str | None,
+) -> bool:
+    gate = "core"
+    all_checks: list[dict] = []
+
+    health_ok, health_detail = _check_health(api_url)
+    all_checks.append({"name": "health", "passed": health_ok, "detail": health_detail})
+    if not health_ok:
+        if proof_out:
+            _write_proof(_build_proof(gate, api_url, api_key, all_checks, False), proof_out)
         return False
 
-    content = _write_sync_memory(api_url, api_key)
+    content, write_detail = _write_sync_memory(api_url, api_key)
+    all_checks.append({"name": "canonical_write", "passed": content is not None, "detail": write_detail})
     if not content:
+        if proof_out:
+            _write_proof(_build_proof(gate, api_url, api_key, all_checks, False), proof_out)
         return False
 
-    if not _verify_search_text(api_url, api_key, content):
+    search_ok, search_detail = _verify_search_text(api_url, api_key, content)
+    all_checks.append({"name": "search_text", "passed": search_ok, "detail": search_detail})
+    if not search_ok:
+        if proof_out:
+            _write_proof(_build_proof(gate, api_url, api_key, all_checks, False), proof_out)
         return False
 
-    if not _verify_search_recall(api_url, api_key, content):
+    recall_ok, recall_detail = _verify_search_recall(api_url, api_key, content)
+    all_checks.append({"name": "search_recall", "passed": recall_ok, "detail": recall_detail})
+    if not recall_ok:
+        if proof_out:
+            _write_proof(_build_proof(gate, api_url, api_key, all_checks, False), proof_out)
         return False
 
-    if check_async and not _check_async(api_url, api_key):
-        return False
+    if check_federation:
+        gate = "federation"
+        fed_ok, fed_checks = _check_federation(api_url, api_key)
+        all_checks.extend(fed_checks)
+        if not fed_ok:
+            if proof_out:
+                _write_proof(_build_proof(gate, api_url, api_key, all_checks, False), proof_out)
+            return False
+
+    if check_async:
+        if gate == "core":
+            gate = "async"
+        async_ok, async_checks = _check_async(api_url, api_key)
+        all_checks.extend(async_checks)
+        if not async_ok:
+            if proof_out:
+                _write_proof(_build_proof(gate, api_url, api_key, all_checks, False), proof_out)
+            return False
 
     print(f"\n🎉 Deployment verification complete: SUCCESS ({api_url})")
+    if proof_out:
+        _write_proof(_build_proof(gate, api_url, api_key, all_checks, True), proof_out)
     return True
 
 
@@ -250,14 +404,16 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Verify a memU deployment without mutating infra config.")
     parser.add_argument("--api-url", default="auto", help="Base URL for memU API, or 'auto' to try local then production")
     parser.add_argument("--api-key", default=None, help="memU API key (defaults to env/secrets lookup)")
+    parser.add_argument("--check-federation", action="store_true", help="Also verify Federation Readiness gate (idempotency write/replay, searchable memory proof)")
     parser.add_argument("--check-async", action="store_true", help="Also verify Temporal-backed async endpoints")
+    parser.add_argument("--proof-out", default=None, metavar="FILE", help="Write machine-readable JSON proof artifact to FILE (secrets redacted)")
     args = parser.parse_args()
 
     api_key = _resolve_api_key(args.api_key)
     failures: list[str] = []
     for api_url in _api_candidates(args.api_url):
         print(f"\n=== Verifying {api_url} ===")
-        if _verify_single(api_url, api_key, args.check_async):
+        if _verify_single(api_url, api_key, args.check_federation, args.check_async, args.proof_out):
             return 0
         failures.append(api_url)
 
