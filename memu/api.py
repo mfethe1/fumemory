@@ -43,6 +43,9 @@ from memu.models import (
     BulkImportResponse,
     ChatRequest,
     ChatResponse,
+    ForensicRecallItem,
+    ForensicRecallRequest,
+    ForensicRecallResponse,
     GatewayLease,
     GatewayLeaseAcquireRequest,
     GatewayLeaseAcquireResponse,
@@ -52,6 +55,7 @@ from memu.models import (
     MemoryCreate,
     MemoryKind,
     MemoryType,
+    RecallMode,
     SearchRequest,
     SearchResult,
     Task,
@@ -1293,6 +1297,367 @@ async def memu_search_post_compat(req: MemUSearchCompatRequest, _key: str = Depe
         entity_weight=req.entity_weight,
     )
     return await search_memories(search_req, _key=_key)
+
+
+# ---------------------------------------------------------------------------
+# Recall contract helpers
+# ---------------------------------------------------------------------------
+
+# review_status values that are eligible for default Learning recall.
+_LEARNING_RECALL_REVIEW_STATUSES: tuple[str, ...] = (
+    "accepted",
+    "legacy",
+    "accepted_by_timeout",
+)
+
+
+def _has_role_access(allowed_roles: list[str], agent_roles: list[str] | None) -> bool:
+    """Return True if the caller's roles grant access to the memory.
+
+    A memory with ['*'] in allowed_roles is accessible to everyone.
+    When agent_roles is None, no role filtering is applied (trusted caller).
+    """
+    if agent_roles is None:
+        return True
+    if "*" in allowed_roles:
+        return True
+    return bool(set(allowed_roles) & set(agent_roles))
+
+
+def _build_forensic_item(
+    row: Any,
+    include_content: bool,
+    agent_roles: list[str] | None,
+) -> ForensicRecallItem:
+    """Construct a ForensicRecallItem from a DB row, applying redaction rules."""
+    metadata: dict[str, Any] = row.get("metadata") or {}
+    if isinstance(metadata, str):
+        metadata = json.loads(metadata)
+
+    allowed_roles: list[str] = metadata.get("allowed_roles") or ["*"]
+
+    # Determine redaction
+    redacted = False
+    redaction_reason: str | None = None
+    content: str | None = row.get("content")
+
+    if not include_content:
+        redacted = True
+        redaction_reason = "content_excluded_by_request"
+        content = None
+    elif not _has_role_access(allowed_roles, agent_roles):
+        redacted = True
+        redaction_reason = "role_access_denied"
+        content = None
+
+    # Extract provenance links from metadata (source evidence IDs, correction chains)
+    provenance_links: list[str] = []
+    for key in ("source_evidence_ids", "superseded_ids", "correction_of"):
+        val = metadata.get(key)
+        if isinstance(val, list):
+            provenance_links.extend(str(v) for v in val)
+        elif isinstance(val, str) and val:
+            provenance_links.append(val)
+
+    # artifact_refs may be a list or a comma-separated string in metadata
+    artifact_refs: list[str] = []
+    raw_refs = metadata.get("artifact_refs")
+    if isinstance(raw_refs, list):
+        artifact_refs = [str(r) for r in raw_refs]
+    elif isinstance(raw_refs, str) and raw_refs:
+        artifact_refs = [raw_refs]
+
+    event_at_raw = metadata.get("event_at")
+    event_at: datetime | None = None
+    if event_at_raw:
+        try:
+            event_at = datetime.fromisoformat(str(event_at_raw).replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            pass
+
+    return ForensicRecallItem(
+        evidence_id=row["id"],
+        memory_kind=row.get("memory_kind") or "evidence",
+        memory_type=row.get("memory_type") or "unknown",
+        content=content,
+        redacted=redacted,
+        redaction_reason=redaction_reason,
+        event_type=metadata.get("event_type"),
+        event_at=event_at,
+        task_id=metadata.get("task_id"),
+        session_id=metadata.get("session_id"),
+        gateway_id=metadata.get("gateway_id"),
+        agent_id=row.get("agent_id") or "",
+        source=metadata.get("source"),
+        source_ref=metadata.get("source_ref"),
+        artifact_refs=artifact_refs,
+        allowed_roles=allowed_roles,
+        provenance_links=provenance_links,
+        created_at=row["created_at"],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Learning Recall endpoint — default recall mode, Learning Memory only
+# ---------------------------------------------------------------------------
+
+@app.post("/api/v1/recall", response_model=list[SearchResult])
+async def learning_recall(req: SearchRequest, _key: str = Depends(verify_api_key)):
+    """Default recall: returns Learning Memory only (accepted, legacy, accepted_by_timeout).
+
+    Evidence Memory is never included.  Supports vector, lexical, and temporal fusion.
+    This is the correct endpoint for injecting reusable guidance into OpenClaw context.
+    """
+    embedding = await get_embedding(req.query)
+
+    # Learnnig-only hard filters appended to every query in this endpoint.
+    learning_kind_sql = "memory_kind = 'learning'"
+    review_statuses_sql = (
+        "review_status IN ('accepted', 'legacy', 'accepted_by_timeout')"
+    )
+
+    async with _tenant_conn(_key) as conn:
+        if embedding is None:
+            logger.warning("Embedding unavailable for /api/v1/recall; falling back to lexical search")
+            filters = [
+                "content ILIKE $1",
+                "valid_to IS NULL",
+                learning_kind_sql,
+                review_statuses_sql,
+            ]
+            params: list[Any] = [f"%{req.query}%"]
+            idx = 2
+            if req.agent_id:
+                filters.append(f"agent_id = ${idx}")
+                params.append(req.agent_id)
+                idx += 1
+            if req.memory_type:
+                filters.append(f"memory_type = ${idx}")
+                params.append(req.memory_type.value)
+                idx += 1
+            where = " AND ".join(filters)
+            rows = await conn.fetch(
+                f"""
+                SELECT *, 0.0::float8 AS similarity
+                FROM memories
+                WHERE {where}
+                ORDER BY updated_at DESC
+                LIMIT {req.limit}
+                """,
+                *params,
+            )
+            results = []
+            for row in rows:
+                score = compute_final_score(
+                    similarity=0.5,
+                    created_at=row["created_at"],
+                    access_count=row["access_count"],
+                    decay_rate=DECAY_RATE,
+                    temporal_weight=req.temporal_weight,
+                    salience_score=float(row.get("salience_score", 0.5) or 0.5),
+                )
+                results.append(SearchResult(memory=_row_to_memory(row), similarity=0.0, final_score=score))
+            results.sort(key=lambda r: r.final_score, reverse=True)
+            return results[: req.limit]
+
+        # Vector search path
+        filters = [
+            "valid_to IS NULL",
+            learning_kind_sql,
+            review_statuses_sql,
+        ]
+        params = [str(embedding)]
+        idx = 2
+        if req.agent_id:
+            filters.append(f"agent_id = ${idx}")
+            params.append(req.agent_id)
+            idx += 1
+        if req.memory_type:
+            filters.append(f"memory_type = ${idx}")
+            params.append(req.memory_type.value)
+            idx += 1
+        if req.min_confidence > 0:
+            filters.append(f"confidence >= ${idx}")
+            params.append(req.min_confidence)
+            idx += 1
+        if req.time_window_start:
+            filters.append(f"created_at >= ${idx}")
+            params.append(req.time_window_start)
+            idx += 1
+        if req.time_window_end:
+            filters.append(f"created_at <= ${idx}")
+            params.append(req.time_window_end)
+            idx += 1
+        if req.agent_roles:
+            filters.append(
+                f"(metadata->'allowed_roles' @> '\"*\"'::jsonb "
+                f"OR metadata->'allowed_roles' && ${idx}::jsonb)"
+            )
+            params.append(json.dumps(req.agent_roles))
+            idx += 1
+
+        where = " AND ".join(filters)
+        vec = f"vector({EMBEDDING_DIMS})"
+        rows = []
+        min_results = max(1, min(req.limit, req.min_results))
+        for current_limit in _expansion_schedule(req.limit * 2, req.max_expansion_steps):
+            rows = await conn.fetch(
+                f"""
+                SELECT *, 1 - (embedding <=> $1::{vec}) AS similarity
+                FROM memories
+                WHERE embedding IS NOT NULL AND {where}
+                ORDER BY embedding <=> $1::{vec}
+                LIMIT {current_limit}
+                """,
+                *params,
+            )
+            if len(rows) >= min_results:
+                break
+
+        # Lexical fallback when vector results are sparse
+        if req.lexical_fallback and len(rows) < min_results:
+            lex_filters = [
+                "content ILIKE $1",
+                "valid_to IS NULL",
+                learning_kind_sql,
+                review_statuses_sql,
+            ]
+            lex_params: list[Any] = [f"%{req.query}%"]
+            lidx = 2
+            if req.agent_id:
+                lex_filters.append(f"agent_id = ${lidx}")
+                lex_params.append(req.agent_id)
+                lidx += 1
+            if req.memory_type:
+                lex_filters.append(f"memory_type = ${lidx}")
+                lex_params.append(req.memory_type.value)
+                lidx += 1
+            lex_rows = await conn.fetch(
+                f"""
+                SELECT *, 0.45::float8 AS similarity
+                FROM memories
+                WHERE {" AND ".join(lex_filters)}
+                ORDER BY updated_at DESC
+                LIMIT {req.limit}
+                """,
+                *lex_params,
+            )
+            existing_ids = {r["id"] for r in rows}
+            for r in lex_rows:
+                if r["id"] not in existing_ids:
+                    rows.append(r)
+
+    results = []
+    for row in rows:
+        score = compute_final_score(
+            similarity=row["similarity"],
+            created_at=row["created_at"],
+            access_count=row["access_count"],
+            decay_rate=DECAY_RATE,
+            temporal_weight=req.temporal_weight,
+            salience_score=float(row.get("salience_score", 0.5) or 0.5),
+        )
+        entity_overlap = _entity_overlap_score(req.query, row["content"])
+        score = (1 - req.entity_weight) * score + (req.entity_weight * entity_overlap)
+        results.append(SearchResult(memory=_row_to_memory(row), similarity=row["similarity"], final_score=score))
+    results.sort(key=lambda r: r.final_score, reverse=True)
+    return results[: req.limit]
+
+
+# ---------------------------------------------------------------------------
+# Forensic Recall endpoint — explicit mode, Evidence Memory with provenance
+# ---------------------------------------------------------------------------
+
+@app.post("/api/v1/recall/forensic", response_model=ForensicRecallResponse)
+async def forensic_recall(req: ForensicRecallRequest, _key: str = Depends(verify_api_key)):
+    """Forensic Recall: returns Evidence Memory with replay-grade provenance.
+
+    Supports task/session/gateway/agent/event-type/artifact filters, cursor-based
+    pagination, ABAC role filtering, and per-record redaction when the caller lacks
+    the required role or explicitly excludes content.
+    """
+    filters: list[str] = [
+        "memory_kind = 'evidence'",
+        "valid_to IS NULL",
+    ]
+    params: list[Any] = []
+    idx = 1
+
+    if req.task_id:
+        filters.append(f"metadata->>'task_id' = ${idx}")
+        params.append(req.task_id)
+        idx += 1
+    if req.session_id:
+        filters.append(f"metadata->>'session_id' = ${idx}")
+        params.append(req.session_id)
+        idx += 1
+    if req.gateway_id:
+        filters.append(f"metadata->>'gateway_id' = ${idx}")
+        params.append(req.gateway_id)
+        idx += 1
+    if req.agent_id:
+        filters.append(f"agent_id = ${idx}")
+        params.append(req.agent_id)
+        idx += 1
+    if req.event_type:
+        filters.append(f"metadata->>'event_type' = ${idx}")
+        params.append(req.event_type)
+        idx += 1
+    if req.time_window_start:
+        filters.append(f"created_at >= ${idx}")
+        params.append(req.time_window_start)
+        idx += 1
+    if req.time_window_end:
+        filters.append(f"created_at <= ${idx}")
+        params.append(req.time_window_end)
+        idx += 1
+    if req.artifact_ref:
+        filters.append(f"metadata->'artifact_refs' @> ${idx}::jsonb")
+        params.append(json.dumps([req.artifact_ref]))
+        idx += 1
+
+    # Cursor-based pagination: cursor encodes "created_at__id" boundary
+    if req.cursor:
+        try:
+            cursor_ts_str, cursor_id = req.cursor.rsplit("__", 1)
+            filters.append(
+                f"(created_at > ${idx}::timestamptz OR "
+                f"(created_at = ${idx}::timestamptz AND id::text > ${idx + 1}))"
+            )
+            params.append(cursor_ts_str)
+            params.append(cursor_id)
+            idx += 2
+        except (ValueError, AttributeError):
+            raise HTTPException(status_code=400, detail="Invalid pagination cursor.")
+
+    where = " AND ".join(filters)
+
+    # Fetch limit+1 to detect whether another page exists
+    fetch_limit = req.limit + 1
+    async with _tenant_conn(_key) as conn:
+        rows = await conn.fetch(
+            f"""
+            SELECT id, content, memory_type, memory_kind, agent_id,
+                   metadata, created_at, valid_to
+            FROM memories
+            WHERE {where}
+            ORDER BY created_at ASC, id ASC
+            LIMIT {fetch_limit}
+            """,
+            *params,
+        )
+
+    has_next = len(rows) > req.limit
+    page_rows = list(rows[: req.limit])
+
+    items = [_build_forensic_item(row, req.include_content, req.agent_roles) for row in page_rows]
+
+    next_cursor: str | None = None
+    if has_next and page_rows:
+        last = page_rows[-1]
+        next_cursor = f"{last['created_at'].isoformat()}__{last['id']}"
+
+    return ForensicRecallResponse(items=items, next_cursor=next_cursor)
 
 
 @app.get("/search-text")
