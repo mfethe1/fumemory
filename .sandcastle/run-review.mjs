@@ -54,8 +54,8 @@ try {
         onSandboxReady: [
           {
             command:
-              "python3 -m venv .venv && . .venv/bin/activate && python -m pip install --upgrade pip && python -m pip install -e \".[dev]\"",
-            timeoutMs: 900000,
+              "python3 -m venv .venv && . .venv/bin/activate && python -m pip install --disable-pip-version-check --upgrade pip && python -m pip install --disable-pip-version-check --prefer-binary -e \".[dev]\"",
+            timeoutMs: 1800000,
           },
         ],
       },

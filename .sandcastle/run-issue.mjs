@@ -115,8 +115,8 @@ if (!process.env.ANTHROPIC_API_KEY) {
 const setupCommand = [
   "python3 -m venv .venv",
   ". .venv/bin/activate",
-  "python -m pip install --upgrade pip",
-  "python -m pip install -e \".[dev]\"",
+  "python -m pip install --disable-pip-version-check --upgrade pip",
+  "python -m pip install --disable-pip-version-check --prefer-binary -e \".[dev]\"",
 ].join(" && ");
 
 try {
@@ -137,7 +137,7 @@ try {
     },
     hooks: {
       sandbox: {
-        onSandboxReady: [{ command: setupCommand, timeoutMs: 900000 }],
+        onSandboxReady: [{ command: setupCommand, timeoutMs: 1800000 }],
       },
     },
     logging: { type: "file", path: logPath },
