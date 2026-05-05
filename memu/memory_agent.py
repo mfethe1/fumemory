@@ -21,19 +21,19 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import hashlib
 import json
 import logging
 import math
 import os
+import re as _re
 import sys
-import time
 import uuid
-from datetime import datetime, timezone
-from typing import Any, Optional
+from enum import Enum as StdEnum
+from typing import Optional
 
 import asyncpg
 import httpx
+from pydantic import BaseModel as PydanticBaseModel, Field as PydanticField
 
 logging.basicConfig(
     level=logging.INFO,
@@ -116,8 +116,6 @@ _INJECTION_PATTERNS: list[str] = [
     "### Instruction:",
     "### System:",
 ]
-
-import re as _re
 
 _COMPILED_PATTERNS = [_re.compile(p, _re.IGNORECASE) for p in _INJECTION_PATTERNS]
 
@@ -730,11 +728,11 @@ async def print_status(pool: asyncpg.Pool):
             log.error("Status query failed: %s", e)
             return
 
-    print(f"\n=== memU Memory Agent Status ===")
+    print("\n=== memU Memory Agent Status ===")
     print(f"Memories:    {mem_count}")
     print(f"Compactions: {comp_count}")
     print(f"Concepts:    {concept_count}")
-    print(f"\nLast 10 runs:")
+    print("\nLast 10 runs:")
     for run in runs:
         duration = ""
         if run["finished_at"] and run["started_at"]:
@@ -870,12 +868,6 @@ if __name__ == "__main__":
 # ===========================================================================
 # Phase 2: Semantic Ingestion Pipeline — Triplet Extraction + Entity Resolution
 # ===========================================================================
-
-from enum import Enum as StdEnum
-from pydantic import BaseModel as PydanticBaseModel, Field as PydanticField
-
-import httpx
-
 
 class RelationshipType(str, StdEnum):
     """Allowed relationship types for the knowledge graph.

@@ -1,7 +1,7 @@
 # memu/temporal_routes.py
 from fastapi import APIRouter, Depends, HTTPException, Security
 from fastapi.security import APIKeyHeader
-from memu.models import MemoryCreate, SearchRequest, SearchResult
+from memu.models import MemoryCreate, SearchRequest
 from memu.temporal_client import store_memory_workflow, search_memory_workflow
 import os
 

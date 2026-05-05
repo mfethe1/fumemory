@@ -10,10 +10,9 @@ Coverage:
 
 from __future__ import annotations
 
-import json
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import pytest
@@ -194,7 +193,7 @@ async def test_mismatched_replay_raises_409(monkeypatch):
 async def test_evidence_memory_inserts_without_content_dedup(monkeypatch):
     """Two distinct evidence writes with identical content must remain separate records."""
     inserted_id = uuid4()
-    now = datetime.now(timezone.utc)
+    datetime.now(timezone.utc)
     inserted_row = _make_row(
         id=inserted_id,
         content="task completed",
@@ -236,7 +235,7 @@ async def test_evidence_memory_inserts_without_content_dedup(monkeypatch):
 async def test_learning_memory_deduplicates_on_content_hash(monkeypatch):
     """Learning Memory with identical content should hit the dedup path."""
     existing_id = uuid4()
-    now = datetime.now(timezone.utc)
+    datetime.now(timezone.utc)
     updated_row = _make_row(id=existing_id, memory_kind="learning")
 
     conn = AsyncMock()

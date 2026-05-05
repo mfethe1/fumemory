@@ -128,7 +128,6 @@ def test_check_federation_passes_on_write_then_same_id_replay_then_search(monkey
     monkeypatch.setenv("NATS_RAILWAY_URL", "nats://railway-nats:4222")
     call_log = []
 
-    content_holder: list[str] = []
 
     def fake_urlopen(req, timeout=15):
         url = req.full_url

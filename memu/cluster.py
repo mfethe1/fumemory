@@ -26,7 +26,7 @@ import time
 from dataclasses import dataclass, field
 from enum import Enum
 from urllib.parse import urlparse
-from typing import Any, Callable, Coroutine
+from typing import Any, Callable
 
 import nats
 from nats.aio.client import Client as NATSClient
@@ -348,7 +348,7 @@ class NATSClusterManager:
 
                 # Auto-recovery: if local is back and healthier, switch back
                 local_h = self._health[ClusterNode.LOCAL]
-                railway_h = self._health[ClusterNode.RAILWAY]
+                self._health[ClusterNode.RAILWAY]
 
                 if (
                     self._active_node == ClusterNode.RAILWAY

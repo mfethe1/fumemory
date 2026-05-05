@@ -28,7 +28,6 @@ from memu.openclaw_hooks import (
     WriteCriticality,
     log_action,
     log_search,
-    recall,
     write_waiver,
 )
 

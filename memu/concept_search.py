@@ -100,7 +100,7 @@ async def trgm_search(
     content_col: str = "content",
 ) -> list[dict]:
     """Trigram similarity search — great for partial/fuzzy keyword matching."""
-    filters = [f"content % $1 OR content ILIKE $2"]
+    filters = ["content % $1 OR content ILIKE $2"]
     params: list[Any] = [query, f"%{query}%"]
     idx = 3
 

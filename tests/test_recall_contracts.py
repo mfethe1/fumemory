@@ -16,18 +16,16 @@ Coverage:
 
 from __future__ import annotations
 
-import json
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from unittest.mock import AsyncMock, MagicMock, patch
-from uuid import uuid4, UUID
+from unittest.mock import AsyncMock
+from uuid import uuid4
 
 import pytest
 
 from memu import api
 from memu.api import _has_role_access, _build_forensic_item
 from memu.models import (
-    ForensicRecallItem,
     ForensicRecallRequest,
     ForensicRecallResponse,
     RecallMode,
@@ -303,7 +301,6 @@ async def test_learning_recall_lexical_fallback_when_embedding_unavailable(monke
 @pytest.mark.asyncio
 async def test_learning_recall_vector_path_applies_learning_filters(monkeypatch):
     """When embedding is available, vector query still filters to learning memory only."""
-    import numpy as np
 
     learning_row = _make_memory_row(review_status="accepted_by_timeout")
     fake_embedding = [0.1] * 8
@@ -473,7 +470,7 @@ async def test_forensic_recall_cursor_pagination_adds_where_clause(monkeypatch):
 
     cursor = "2026-05-04T10:00:00+00:00__some-uuid-value"
     req = ForensicRecallRequest(limit=5, cursor=cursor)
-    resp = await api.forensic_recall(req, _key=api.AuthContext("memu-dev-key"))
+    await api.forensic_recall(req, _key=api.AuthContext("memu-dev-key"))
 
     fetch_sql = conn.fetch.await_args.args[0]
     assert "created_at" in fetch_sql

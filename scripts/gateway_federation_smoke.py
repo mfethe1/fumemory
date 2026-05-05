@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from memu.gateway_federation import FederationConfig, results_to_json, run_smoke_checks
+from memu.gateway_federation import FederationConfig, results_to_json, run_smoke_checks  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:

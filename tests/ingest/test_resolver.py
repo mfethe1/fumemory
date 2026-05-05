@@ -29,7 +29,7 @@ def test_from_import_produces_link():
     })
     resolver = LinkResolver(files)
     links = _links_for(resolver, files, "pkg.caller", "use")
-    assert {l.dst_slug for l in links} == {module_to_slug("pkg.core", "Foo")}
+    assert {link.dst_slug for link in links} == {module_to_slug("pkg.core", "Foo")}
 
 
 def test_aliased_import_produces_link_to_original_name():
@@ -39,7 +39,7 @@ def test_aliased_import_produces_link_to_original_name():
     })
     resolver = LinkResolver(files)
     links = _links_for(resolver, files, "pkg.caller", "make")
-    assert {l.dst_slug for l in links} == {module_to_slug("pkg.core", "Foo")}
+    assert {link.dst_slug for link in links} == {module_to_slug("pkg.core", "Foo")}
 
 
 def test_module_import_and_dotted_access():
@@ -50,7 +50,7 @@ def test_module_import_and_dotted_access():
     resolver = LinkResolver(files)
     links = _links_for(resolver, files, "pkg.caller", "top")
     # Resolves to the specific symbol when we recognize it.
-    assert {l.dst_slug for l in links} == {module_to_slug("pkg.util", "helper")}
+    assert {link.dst_slug for link in links} == {module_to_slug("pkg.util", "helper")}
 
 
 def test_unknown_reference_is_not_linked():
@@ -68,7 +68,7 @@ def test_same_module_reference_resolves():
     })
     resolver = LinkResolver(files)
     links = _links_for(resolver, files, "pkg.only", "top")
-    assert [l.dst_slug for l in links] == [module_to_slug("pkg.only", "helper")]
+    assert [link.dst_slug for link in links] == [module_to_slug("pkg.only", "helper")]
 
 
 def test_self_method_links_to_class_method():
@@ -83,7 +83,7 @@ def test_self_method_links_to_class_method():
     })
     resolver = LinkResolver(files)
     greet_links = _links_for(resolver, files, "pkg.only", "Greeter.greet")
-    assert [l.dst_slug for l in greet_links] == [
+    assert [link.dst_slug for link in greet_links] == [
         module_to_slug("pkg.only", "Greeter.render")
     ]
 

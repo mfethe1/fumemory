@@ -4,14 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import logging
 from datetime import datetime, timezone
 from uuid import UUID
 
 import nats
-from nats.js import JetStreamContext
-from nats.js.kv import KeyValue
 
 from memu.nats_config import primary_nats_url
 from memu.swarm_models import GatewayStatus

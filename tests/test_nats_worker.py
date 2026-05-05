@@ -1,7 +1,6 @@
 import pytest
-import asyncio
 import json
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock
 from memu.nats_worker import process_msg
 
 @pytest.mark.asyncio

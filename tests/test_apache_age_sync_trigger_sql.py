@@ -6,7 +6,6 @@ Validates the SQL structure, Cypher templates, and that the trigger
 definition is well-formed — without requiring a live database.
 """
 import pathlib
-import re
 
 import pytest
 

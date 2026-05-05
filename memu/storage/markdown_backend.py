@@ -19,8 +19,6 @@ from .base import (
     LinkRecord,
     NodeKind,
     SearchHit,
-    SlugRecord,
-    StorageBackend,
     WikiNode,
 )
 
@@ -121,7 +119,7 @@ class MarkdownBackend:
             return
         # De-duplicate by (dst_slug, type)
         key = (link.dst_slug, link.type)
-        src.links = [l for l in src.links if (l.dst_slug, l.type) != key]
+        src.links = [existing for existing in src.links if (existing.dst_slug, existing.type) != key]
         src.links.append(link)
         await self.put_node(src)
 
@@ -199,12 +197,12 @@ class MarkdownBackend:
         links = [
             LinkRecord(
                 src_slug=fm["slug"],
-                dst_slug=l.get("slug", ""),
-                type=l.get("type", "related"),
-                strength=float(l.get("strength", 0.5)),
+                dst_slug=link_data.get("slug", ""),
+                type=link_data.get("type", "related"),
+                strength=float(link_data.get("strength", 0.5)),
             )
-            for l in fm.get("links", [])
-            if l.get("slug")
+            for link_data in fm.get("links", [])
+            if link_data.get("slug")
         ]
         return WikiNode(
             id=str(fm["id"]),

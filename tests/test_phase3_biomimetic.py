@@ -2,12 +2,10 @@
 
 from __future__ import annotations
 
-import math
 import pytest
 from datetime import datetime, timezone, timedelta
-from unittest.mock import AsyncMock, patch
 
-from memu.decay import compute_final_score, compute_effective_decay_rate, should_deduplicate
+from memu.decay import compute_final_score, compute_effective_decay_rate
 from memu.models import MemoryType, MemoryCreate, Memory
 
 

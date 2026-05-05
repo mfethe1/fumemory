@@ -6,10 +6,9 @@ from datetime import datetime, timezone, timedelta
 import hashlib
 import asyncio
 import json
-from memu.web_search_ingest import ingest_web_search
 import os
 import logging
-import signal
+import time
 from contextlib import asynccontextmanager
 from typing import Any, Optional
 from uuid import UUID
@@ -18,26 +17,23 @@ import re
 import asyncpg
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request, Security
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel
 
+from memu.concept_search import (
+    concept_lookup,
+    concept_search_memories,
+    hybrid_search as _hybrid_search_core,
+)
 from memu.decay import compute_final_score, should_deduplicate
-
-# --- Logging Config ---
-LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
-# Reduce noise from verbose libraries
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("httpcore").setLevel(logging.WARNING)
-logging.getLogger("fastembed").setLevel(logging.WARNING)
 from memu.cluster import NATSClusterManager
 from memu.core_memory import (
     Block,
     CoreMemoryManager,
     CASConflictError,
 )
-from memu.semantic_router import SemanticRouter, SearchTarget
+from memu.semantic_router import SemanticRouter
 from memu.nats_publisher import NATSEventPublisher
 from memu.models import (
     BulkImportRequest,
@@ -56,7 +52,6 @@ from memu.models import (
     MemoryCreate,
     MemoryKind,
     MemoryType,
-    RecallMode,
     ReflectionAction,
     ReflectionActionRequest,
     ReflectionActionResponse,
@@ -71,7 +66,7 @@ from memu.models import (
     TaskReviewRequest,
 )
 from memu.schema_contract import compute_canonical_payload_hash
-from memu.reflection import compute_proposal_expiry, is_proposal_expired
+from memu.reflection import compute_proposal_expiry
 
 from memu.notion_bridge import create_bridge_from_env, NotionBridge
 from memu.migrations import run_migrations
@@ -79,10 +74,16 @@ from memu.temporal_routes import router as temporal_router
 from memu.tenancy import (
     resolve_tenant_id,
     tenant_connection,
-    tenant_transaction,
     DEFAULT_TENANT_ID,
-    SINGLE_TENANT_MODE,
 )
+
+# --- Logging Config ---
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
+# Reduce noise from verbose libraries
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("fastembed").setLevel(logging.WARNING)
 
 # --- Config ---
 
@@ -107,8 +108,67 @@ _core_memory_mgr: CoreMemoryManager | None = None
 _implicit_profiler: Any = None  # ImplicitProfiler (lazy import)
 _semantic_router: SemanticRouter | None = None
 _embedding_schema_ok: bool = True  # Set False when configured dims ≠ schema dims
+_migrations_ok: bool = False
+_migration_startup_error: str | None = None
 is_shutting_down: bool = False  # Set True on SIGTERM; triggers 503 for new requests
 logger = logging.getLogger(__name__)
+
+
+def _new_metrics() -> dict[str, Any]:
+    return {
+        "http_requests_total": 0,
+        "http_requests_by_status_class": {},
+        "http_request_errors_total": 0,
+        "http_request_latency_seconds_sum": 0.0,
+        "http_request_latency_seconds_count": 0,
+        "readiness_failures_total": 0,
+    }
+
+
+_metrics: dict[str, Any] = _new_metrics()
+
+
+def _record_http_request(status_code: int, elapsed_seconds: float) -> None:
+    status_class = f"{status_code // 100}xx"
+    _metrics["http_requests_total"] += 1
+    by_status = _metrics["http_requests_by_status_class"]
+    by_status[status_class] = by_status.get(status_class, 0) + 1
+    if status_code >= 500:
+        _metrics["http_request_errors_total"] += 1
+    _metrics["http_request_latency_seconds_sum"] += elapsed_seconds
+    _metrics["http_request_latency_seconds_count"] += 1
+
+
+def _render_metrics() -> str:
+    lines = [
+        "# TYPE memu_http_requests_total counter",
+        f"memu_http_requests_total {_metrics['http_requests_total']}",
+        "# TYPE memu_http_requests_by_status_class_total counter",
+    ]
+    for status_class in sorted(_metrics["http_requests_by_status_class"]):
+        value = _metrics["http_requests_by_status_class"][status_class]
+        lines.append(
+            f'memu_http_requests_by_status_class_total{{status_class="{status_class}"}} {value}'
+        )
+    lines.extend(
+        [
+            "# TYPE memu_http_request_errors_total counter",
+            f"memu_http_request_errors_total {_metrics['http_request_errors_total']}",
+            "# TYPE memu_http_request_latency_seconds_sum counter",
+            (
+                "memu_http_request_latency_seconds_sum "
+                f"{_metrics['http_request_latency_seconds_sum']:.6f}"
+            ),
+            "# TYPE memu_http_request_latency_seconds_count counter",
+            (
+                "memu_http_request_latency_seconds_count "
+                f"{_metrics['http_request_latency_seconds_count']}"
+            ),
+            "# TYPE memu_readiness_failures_total counter",
+            f"memu_readiness_failures_total {_metrics['readiness_failures_total']}",
+        ]
+    )
+    return "\n".join(lines) + "\n"
 
 
 def _make_startup_nats_cluster() -> NATSClusterManager:
@@ -136,7 +196,7 @@ def _startup_nats_enabled() -> bool:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global pool, _fastembed_model, _nats_cluster, _nats_publisher, _core_memory_mgr, _implicit_profiler
+    global pool, _fastembed_model, _nats_cluster, _nats_publisher, _core_memory_mgr, _implicit_profiler, _migrations_ok, _migration_startup_error
     # Conservative pool size: allows 4 pods × 5 = 20 total connections during
     # rolling deploys. statement_cache_size=0 for PgBouncer compatibility.
     pool = await asyncpg.create_pool(
@@ -148,11 +208,19 @@ async def lifespan(app: FastAPI):
         statement_cache_size=0,
     )
     
-    # Run DB migrations
+    # Run DB migrations. Startup must fail if migrations fail; otherwise the
+    # process can present healthy while serving an unsafe schema.
+    _migrations_ok = False
+    _migration_startup_error = None
     try:
         await run_migrations(pool)
+        _migrations_ok = True
     except Exception as e:
-        logger.error(f"Migration startup failed: {e}")
+        _migration_startup_error = str(e)
+        logger.exception("Migration startup failed")
+        await pool.close()
+        pool = None
+        raise
 
     # Verify embedding contract: configured dims must match schema
     global _embedding_schema_ok
@@ -279,6 +347,18 @@ app = FastAPI(
 )
 
 app.include_router(temporal_router, tags=["Async Workflows"])
+
+
+@app.middleware("http")
+async def metrics_middleware(request: Request, call_next):
+    start = time.perf_counter()
+    try:
+        response = await call_next(request)
+    except Exception:
+        _record_http_request(500, time.perf_counter() - start)
+        raise
+    _record_http_request(response.status_code, time.perf_counter() - start)
+    return response
 
 
 @app.middleware("http")
@@ -741,6 +821,109 @@ async def health():
 @app.get("/api/v1/memu/health")
 async def memu_health_compat():
     return await health()
+
+
+async def _database_readiness() -> dict[str, Any]:
+    if pool is None:
+        return {"ok": False, "detail": "database pool is not initialized"}
+    try:
+        async with pool.acquire() as conn:
+            await conn.fetchval("SELECT 1")
+        return {"ok": True}
+    except Exception as exc:
+        return {"ok": False, "detail": str(exc)}
+
+
+async def _migration_readiness() -> dict[str, Any]:
+    if _migration_startup_error:
+        return {"ok": False, "detail": _migration_startup_error}
+    if not _migrations_ok:
+        return {"ok": False, "detail": "migrations have not completed successfully"}
+    if pool is None:
+        return {"ok": False, "detail": "database pool is not initialized"}
+
+    try:
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT
+                    count(*) FILTER (WHERE success IS FALSE) AS failed_count,
+                    count(*) AS applied_count
+                FROM schema_migrations
+                """
+            )
+    except Exception as exc:
+        return {"ok": False, "detail": str(exc)}
+
+    failed_count = int(row["failed_count"] or 0) if row else 0
+    applied_count = int(row["applied_count"] or 0) if row else 0
+    check: dict[str, Any] = {
+        "ok": failed_count == 0,
+        "failed_count": failed_count,
+        "applied_count": applied_count,
+    }
+    if failed_count:
+        check["detail"] = f"{failed_count} migration(s) are marked failed"
+    return check
+
+
+def _embedding_readiness() -> dict[str, Any]:
+    if _embedding_schema_ok:
+        return {"ok": True, "configured_dims": EMBEDDING_DIMS}
+    return {
+        "ok": False,
+        "configured_dims": EMBEDDING_DIMS,
+        "detail": "embedding schema does not match configured embedding contract",
+    }
+
+
+def _nats_startup_readiness() -> dict[str, Any]:
+    if not _startup_nats_enabled():
+        return {"ok": True, "required": False}
+    if _nats_cluster is None:
+        return {"ok": False, "required": True, "detail": "startup NATS is enabled but not connected"}
+    try:
+        _nats_cluster.active_connection
+    except Exception as exc:
+        return {"ok": False, "required": True, "detail": str(exc)}
+    return {"ok": True, "required": True}
+
+
+async def readiness_payload() -> tuple[int, dict[str, Any]]:
+    checks: dict[str, Any] = {
+        "database": await _database_readiness(),
+        "migrations": await _migration_readiness(),
+        "embedding_schema": _embedding_readiness(),
+    }
+
+    if _startup_nats_enabled():
+        checks["nats_startup"] = _nats_startup_readiness()
+
+    ready = all(check.get("ok") is True for check in checks.values())
+    if not ready:
+        _metrics["readiness_failures_total"] += 1
+    payload = {
+        "status": "ready" if ready else "not_ready",
+        "version": "0.1.0",
+        "checks": checks,
+    }
+    return (200 if ready else 503), payload
+
+
+@app.get("/ready")
+async def ready():
+    status_code, payload = await readiness_payload()
+    return JSONResponse(status_code=status_code, content=payload)
+
+
+@app.get("/api/v1/memu/ready")
+async def memu_ready_compat():
+    return await ready()
+
+
+@app.get("/metrics")
+async def metrics():
+    return PlainTextResponse(_render_metrics(), media_type="text/plain; version=0.0.4")
 
 
 @app.post("/memories", response_model=Memory)
@@ -2501,7 +2684,7 @@ async def update_task(task_id: UUID, req: TaskUpdate, _key: str = Depends(verify
     if not updates:
         raise HTTPException(status_code=400, detail="No update fields provided")
 
-    updates.append(f"updated_at = NOW()")
+    updates.append("updated_at = NOW()")
     values.append(task_id)
 
     query = "UPDATE backlog SET " + ", ".join(updates) + f" WHERE id = ${idx} RETURNING *"
@@ -3863,20 +4046,6 @@ async def history_cleanup(
         deleted = int(res.split()[1]) if res.startswith("DELETE") else 0
         return HygieneCleanupResponse(deleted_history_count=deleted, dry_run=False)
 
-# ===========================================================================
-# Memory Agent API endpoints (migration 014)
-# ===========================================================================
-
-from memu.concept_search import (
-    fts_search,
-    trgm_search,
-    concept_lookup,
-    concept_search_memories,
-    hybrid_search as _hybrid_search_core,
-    rrf_fuse,
-)
-
-
 class HybridSearchRequest(BaseModel):
     query: str
     limit: int = 10
@@ -4083,7 +4252,8 @@ async def trigger_agent_run(req: AgentRunRequest, _key: str = Depends(verify_api
     Trigger a memory agent run asynchronously.
     run_type: 'compact' | 'index' | 'distill' | 'full'
     """
-    import subprocess, sys
+    import subprocess
+    import sys
 
     cmd = [sys.executable, "-m", "memu.memory_agent", f"--{req.run_type}"]
     if req.model:

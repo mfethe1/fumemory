@@ -6,11 +6,11 @@ import os
 import sys
 from datetime import datetime, timezone
 
+import nats
+
 # Force unbuffered output
 sys.stdout.reconfigure(line_buffering=True)
 sys.stderr.reconfigure(line_buffering=True)
-
-import nats
 
 NATS_URLS = [
     url

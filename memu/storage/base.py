@@ -12,13 +12,11 @@ from datetime import datetime
 from typing import (
     Any,
     AsyncIterator,
-    Iterable,
     Literal,
     Optional,
     Protocol,
     runtime_checkable,
 )
-from uuid import UUID
 
 
 NodeKind = Literal["note", "code", "paper", "task"]

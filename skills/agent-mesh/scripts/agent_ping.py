@@ -55,7 +55,7 @@ async def ping_all(from_agent: str = "probe"):
     }
 
     await nc.publish("swarm.agent.ping", json.dumps(ping).encode())
-    print(f"Ping sent to all agents. Waiting 5s for responses...\n")
+    print("Ping sent to all agents. Waiting 5s for responses...\n")
 
     await asyncio.sleep(5)
 

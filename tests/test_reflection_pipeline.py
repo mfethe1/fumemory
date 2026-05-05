@@ -14,18 +14,16 @@ Coverage:
 
 from __future__ import annotations
 
-import json
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
-from unittest.mock import AsyncMock, MagicMock, patch
-from uuid import uuid4, UUID
+from unittest.mock import AsyncMock
+from uuid import uuid4
 
 import pytest
 
 from memu import api
 from memu.api import (
     _row_to_proposal,
-    _write_accepted_learning_memory,
     create_reflection_proposal,
     list_reflection_proposals,
     get_reflection_proposal,

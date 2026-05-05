@@ -12,17 +12,15 @@ Coverage:
 
 from __future__ import annotations
 
-import json
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import pytest
 from fastapi import HTTPException
-from fastapi.testclient import TestClient
 
 from memu import temporal_client
 from memu.models import MemoryCreate, MemoryKind, MemoryType
-from memu.temporal_routes import _req_to_dict, router
+from memu.temporal_routes import _req_to_dict
 
 
 # ---------------------------------------------------------------------------
@@ -162,7 +160,7 @@ async def test_async_route_returns_degraded_status_when_temporal_missing(monkeyp
     """When Temporal is missing the route must return an explicit degraded detail dict."""
     monkeypatch.setattr(temporal_client, "store_memory_workflow", AsyncMock(return_value=None))
 
-    from memu.temporal_routes import create_memory_async, verify_api_key
+    from memu.temporal_routes import create_memory_async
 
     req = _make_req()
     with pytest.raises(HTTPException) as exc_info:
@@ -410,7 +408,6 @@ def test_core_readiness_does_not_include_temporal():
 
     # If TEMPORAL_HOST is absent, _verify_single with check_async=False must still pass.
     # This is the Core API Readiness contract: Temporal is optional.
-    import os
     # Verify the _verify_single function signature accepts check_async kwarg
     import inspect
     sig = inspect.signature(vd._verify_single)

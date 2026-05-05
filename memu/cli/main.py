@@ -28,7 +28,6 @@ from typing import Optional
 from ..rlm import Orchestrator, RLMContext
 from ..storage import StorageBackend, get_backend
 from ..storage.base import WikiNode
-from ..storage.markdown_backend import slugify
 from ..wiki import parse_wikilinks
 from ..wiki.vault import VaultLayout
 
@@ -177,11 +176,11 @@ async def _cmd_links(args: argparse.Namespace, backend: StorageBackend) -> int:
     out = await backend.list_links(args.slug, direction="out")
     inbound = await backend.list_links(args.slug, direction="in")
     print(f"outbound ({len(out)}):")
-    for l in out:
-        print(f"  -> [[{l.dst_slug}]]  ({l.type}, s={l.strength})")
+    for link in out:
+        print(f"  -> [[{link.dst_slug}]]  ({link.type}, s={link.strength})")
     print(f"inbound ({len(inbound)}):")
-    for l in inbound:
-        print(f"  <- [[{l.src_slug}]]  ({l.type}, s={l.strength})")
+    for link in inbound:
+        print(f"  <- [[{link.src_slug}]]  ({link.type}, s={link.strength})")
     return 0
 
 

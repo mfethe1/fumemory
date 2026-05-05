@@ -14,12 +14,12 @@ Coverage:
 
 from __future__ import annotations
 
-import importlib
 import logging
 import os
+import re
 import sys
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -229,6 +229,29 @@ def test_migration_022_does_not_drop_embedding_column():
     sql_path = REPO_ROOT / "memu" / "migrations" / "022_embedding_version.sql"
     content = sql_path.read_text()
     # There should be no DROP COLUMN targeting 'embedding' (the vector column)
-    import re
     drop_embedding = re.search(r"DROP\s+COLUMN\s+(IF\s+EXISTS\s+)?embedding\b", content, re.IGNORECASE)
     assert drop_embedding is None, "Migration 022 must not drop the embedding column"
+
+
+def test_active_migrations_do_not_destructively_rewrite_embedding_columns():
+    """ADR-0003 rejects destructive embedding dimension migrations."""
+    migrations_dir = REPO_ROOT / "memu" / "migrations"
+    destructive_patterns = [
+        re.compile(r"\bDROP\s+COLUMN\s+(?:IF\s+EXISTS\s+)?embedding\b", re.IGNORECASE),
+        re.compile(r"\bALTER\s+COLUMN\s+embedding\s+TYPE\b", re.IGNORECASE),
+        re.compile(r"\bDROP\s+COLUMN\b[^;]*\bembedding\b[^;]*\bCASCADE\b", re.IGNORECASE | re.DOTALL),
+    ]
+
+    violations: list[str] = []
+    for sql_path in sorted(migrations_dir.glob("*.sql")):
+        content = sql_path.read_text()
+        for pattern in destructive_patterns:
+            if match := pattern.search(content):
+                statement = " ".join(match.group(0).split())
+                violations.append(f"{sql_path.name}: {statement}")
+                break
+
+    assert not violations, (
+        "Active migrations must preserve stored vectors by using additive, "
+        "versioned embedding changes. Violations: " + "; ".join(violations)
+    )

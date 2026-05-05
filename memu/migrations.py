@@ -1,5 +1,4 @@
 import logging
-import os
 from pathlib import Path
 import asyncpg
 
@@ -78,5 +77,8 @@ async def run_migrations(pool: asyncpg.Pool):
                         "ON CONFLICT (version) DO UPDATE SET success = FALSE",
                         version,
                     )
-                except Exception:
-                    pass
+                except Exception as record_error:
+                    logger.error(
+                        f"Failed to record migration failure for {version}: {record_error}"
+                    )
+                raise

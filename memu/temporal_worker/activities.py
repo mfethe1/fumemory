@@ -455,7 +455,7 @@ async def mark_episodes_consolidated(episode_ids: list[str]) -> int:
         valid_ids = [eid for eid in episode_ids if eid]
         if not valid_ids:
             return 0
-        result = await conn.execute(
+        await conn.execute(
             """
             UPDATE memories SET searchable = FALSE, updated_at = NOW()
             WHERE id = ANY($1::uuid[])

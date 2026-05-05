@@ -16,13 +16,11 @@ import asyncio
 import logging
 import os
 import time
-from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
 
-import nats
 from pydantic import ValidationError
 
 from memu.cluster import NATSClusterManager

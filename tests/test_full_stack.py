@@ -5,7 +5,6 @@ audit trail, and temporal endpoints.
 """
 
 import asyncio
-import json
 import os
 import time
 
@@ -126,7 +125,9 @@ async def run_tests():
             capture_output=True, text=True, timeout=10
         )
         has_events = "swarm.memory" in logs.stdout or "swarm.search" in logs.stdout or "swarm.memory" in logs.stderr or "swarm.search" in logs.stderr
-        total_line = [l for l in (logs.stdout + logs.stderr).split("\n") if "total=" in l]
+        total_line = [
+            line for line in (logs.stdout + logs.stderr).split("\n") if "total=" in line
+        ]
         event_count = 0
         if total_line:
             import re

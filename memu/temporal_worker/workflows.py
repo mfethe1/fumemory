@@ -164,7 +164,7 @@ class ProspectiveMemoryWorkflow:
         await workflow.sleep(timedelta(seconds=sleep_seconds))
 
         # Inject intent into agent's Working_Context
-        result = await workflow.execute_activity(
+        await workflow.execute_activity(
             "inject_prospective_memory",
             args=[agent_id, intent],
             start_to_close_timeout=timedelta(seconds=30),
