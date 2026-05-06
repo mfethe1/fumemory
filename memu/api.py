@@ -51,6 +51,7 @@ logger = logging.getLogger(__name__)
 pool: asyncpg.Pool | None = None
 agent_events_consumer: AgentEventsConsumer | None = None
 state_projector_consumer: StateProjectorConsumer | None = None
+_embedding_status: dict = {"reachable": None, "last_checked": None}
 ENABLE_AGENT_EVENTS_CONSUMER = os.environ.get("ENABLE_AGENT_EVENTS_CONSUMER", "true").lower() == "true"
 ENABLE_STATE_PROJECTOR = os.environ.get("ENABLE_STATE_PROJECTOR", "true").lower() == "true"
 
@@ -149,8 +150,8 @@ async def verify_api_key(
 
 # --- Embedding ---
 
-async def get_embedding(text: str) -> list[float]:
-    """Get embedding vector from any OpenAI-compatible API (Ollama, OpenAI, etc.)."""
+async def get_embedding(text: str) -> list[float] | None:
+    """Get embedding vector. Returns None if embedding API is unreachable."""
     import httpx
 
     url = f"{EMBEDDING_BASE_URL.rstrip('/')}/v1/embeddings"
@@ -158,14 +159,23 @@ async def get_embedding(text: str) -> list[float]:
     if OPENAI_API_KEY:
         headers["Authorization"] = f"Bearer {OPENAI_API_KEY}"
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        r = await client.post(
-            url,
-            headers=headers,
-            json={"input": text, "model": EMBEDDING_MODEL},
-        )
-        r.raise_for_status()
-        return r.json()["data"][0]["embedding"]
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            r = await client.post(
+                url,
+                headers=headers,
+                json={"input": text, "model": EMBEDDING_MODEL},
+            )
+            r.raise_for_status()
+            result = r.json()["data"][0]["embedding"]
+        _embedding_status["reachable"] = True
+        _embedding_status["last_checked"] = datetime.now(timezone.utc).isoformat()
+        return result
+    except Exception as exc:
+        logger.warning("embedding API unreachable (%s): %s — storing without vector", EMBEDDING_BASE_URL, exc)
+        _embedding_status["reachable"] = False
+        _embedding_status["last_checked"] = datetime.now(timezone.utc).isoformat()
+        return None
 
 
 def content_hash(text: str) -> str:
@@ -207,6 +217,11 @@ async def health():
         report["agent_events"] = await _agent_events_report()
     if state_projector_consumer:
         report["state_projector"] = await _state_projector_report()
+    report["embedding_api"] = {
+        "base_url": EMBEDDING_BASE_URL,
+        "reachable": _embedding_status.get("reachable"),
+        "last_checked": _embedding_status.get("last_checked"),
+    }
     return report
 
 
@@ -336,19 +351,25 @@ async def create_memory(req: MemoryCreate, _key: str = Depends(verify_api_key)):
     c_hash = content_hash(req.content)
 
     async with pool.acquire() as conn:
-        # Check for duplicates
-        existing = await conn.fetchrow(
-            """
-            SELECT id, 1 - (embedding <=> $1::vector) AS similarity
-            FROM memories
-            WHERE content_hash = $2 OR (1 - (embedding <=> $1::vector)) > $3
-            ORDER BY similarity DESC
-            LIMIT 1
-            """,
-            str(embedding),
-            c_hash,
-            DEDUP_THRESHOLD,
-        )
+        # Check for duplicates — skip vector similarity if embedding unavailable
+        if embedding is not None:
+            existing = await conn.fetchrow(
+                """
+                SELECT id, 1 - (embedding <=> $1::vector) AS similarity
+                FROM memories
+                WHERE content_hash = $2 OR (1 - (embedding <=> $1::vector)) > $3
+                ORDER BY similarity DESC
+                LIMIT 1
+                """,
+                str(embedding),
+                c_hash,
+                DEDUP_THRESHOLD,
+            )
+        else:
+            existing = await conn.fetchrow(
+                "SELECT id, 1.0::float AS similarity FROM memories WHERE content_hash = $1",
+                c_hash,
+            )
 
         if existing and should_deduplicate(existing["similarity"], DEDUP_THRESHOLD):
             # Update existing memory instead of duplicating
@@ -374,7 +395,7 @@ async def create_memory(req: MemoryCreate, _key: str = Depends(verify_api_key)):
                 RETURNING *
                 """,
                 req.content,
-                str(embedding),
+                str(embedding) if embedding is not None else None,
                 req.memory_type.value,
                 req.agent_id,
                 json.dumps(normalized_metadata),
@@ -532,6 +553,11 @@ def _apply_retrieval_safety_policy(rows: Iterable[Any], *, now: datetime | None 
 @app.post("/search", response_model=list[SearchResult])
 async def search_memories(req: SearchRequest, _key: str = Depends(verify_api_key)):
     embedding = await get_embedding(req.query)
+
+    if embedding is None:
+        # Embedding API down — fall back to text search, wrap in SearchResult
+        text_mems = await search_text(query=req.query, limit=req.limit, agent_id=req.agent_id, _key=_key)
+        return [SearchResult(memory=m, similarity=0.0, final_score=0.0) for m in text_mems]
 
     filters = []
     params: list[Any] = [str(embedding)]
