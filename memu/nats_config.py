@@ -29,6 +29,19 @@ def primary_nats_url(default: str = "nats://localhost:4222") -> str:
     return local or railway or default
 
 
+def resolve_local_nkey_seed() -> str | None:
+    """Return the local NATS NKey seed from the environment, if set.
+
+    NATS_LOCAL_NKEY_SEED is the Ed25519 user seed (starts with 'SU') for the
+    local NATS instance only.  It is intentionally separate from NATS_NKEY_SEED
+    (used for Synadia Cloud / NGS / Railway) so that local and Railway nodes
+    can carry different credentials.
+
+    Generate with: infra/local-nats/gen-nkeys.sh
+    """
+    return _clean_endpoint(os.environ.get("NATS_LOCAL_NKEY_SEED"))
+
+
 def _clean_endpoint(value: str | None) -> str | None:
     if value is None:
         return None
