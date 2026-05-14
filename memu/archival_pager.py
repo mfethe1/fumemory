@@ -14,13 +14,11 @@ from __future__ import annotations
 
 import logging
 from typing import Any
-from uuid import UUID
 
 import asyncpg
 
 from memu.core_memory import (
     Block,
-    BlockEntry,
     CoreMemoryManager,
     count_tokens,
     DEFAULT_TOKEN_LIMITS,

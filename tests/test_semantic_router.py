@@ -4,13 +4,11 @@ from __future__ import annotations
 
 import pytest
 import numpy as np
-from unittest.mock import AsyncMock
 
 from memu.semantic_router import (
     SemanticRouter,
     SearchTarget,
     INTENT_ANCHORS,
-    ROUTING_CONFIDENCE_THRESHOLD,
 )
 
 

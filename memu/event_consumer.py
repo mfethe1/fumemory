@@ -19,7 +19,7 @@ import json
 import logging
 import os
 import socket
-from collections import Counter, defaultdict
+from collections import Counter
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 

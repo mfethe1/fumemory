@@ -1,10 +1,10 @@
 <div align="center">
 
-# memU
+# fumemory (memU)
 
-### Free, open-source shared memory for AI agents.
+### Free, open-source Memory Evidence Plane for OpenClaw agents.
 
-**Stop paying for memory. Your agents deserve better.**
+**Durable evidence writes. Learning recall. Federation proof. Your Postgres.**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://python.org)
@@ -16,27 +16,34 @@
 
 ---
 
-## Why pay for memory?
+## What is fumemory?
+
+fumemory is the **Memory Evidence Plane** for OpenClaw-driven agent work. It records durable Evidence Memory, distills Learning Memory, proves Federation Readiness, and delivers Forensic Recall — while **OpenClaw remains the top-level coordinator** for task routing and gateway selection.
 
 SuperMemory charges you monthly. Mem0 wants your data on their servers. Zep locks you into their cloud.
 
-**memU is free. Forever. Run it on your own Postgres.**
-
-Your agents' memories belong to you — not a SaaS vendor.
+**fumemory is free. Forever. Run it on your own Postgres.**
 
 ---
 
 ## Features
 
+- **Evidence Memory** — immutable, task-bound execution proof written synchronously by OpenClaw gateways
+- **Learning Memory** — distilled reusable insights derived from evidence after reflection and review
+- **Canonical Write** — synchronous `/api/v1/memu/add` path; evidence is searchable before OpenClaw proceeds
+- **Forensic Recall** — explicit recall mode returning Evidence Memory with task/session/gateway provenance for proof and audit
+- **Default Learning Recall** — concise agent context from accepted Learning Memory only; raw evidence never leaks
+- **Reflection Review** — six-hour Telegram review window for proposed Learning Memory before automatic integration
+- **Compact Telegram Notices** — proposed learning delivered as summary + actions; no raw evidence in chat
+- **Idempotency** — canonical evidence writes deduplicate by `(tenant_id, idempotency_key)`
+- **Versioned Embedding Contract** — `EMBEDDING_API_BASE` / `EMBEDDING_MODEL` / `EMBEDDING_DIMS`; dimension changes are additive
+- **Core API Readiness** — API + Postgres + auth + canonical write + recall; no NATS or Temporal required
+- **Federation Readiness** — Core API + Railway NATS/JetStream + searchable gateway proof
 - **Semantic vector search** — pgvector-powered similarity search over all memories
 - **Multi-agent namespacing** — agents share one memory pool, search across all or filter by agent
 - **Temporal awareness** — recency-weighted search, not just cosine similarity
 - **Memory decay & reinforcement** — frequently accessed memories get boosted, stale ones fade
-- **Typed memories** — fact, decision, lesson, pattern, failure — structured taxonomy
 - **Memory chains** — link related memories (decision → outcome → lesson learned)
-- **Deduplication** — detects near-duplicates on upsert, merges instead of duplicating
-- **Bulk import** — ingest markdown files, knowledge bases, existing memory stores
-- **RAG chat** — conversational queries over your entire knowledge base
 - **NATS mesh** — multi-machine clustering with local + Railway failover
 - **Warden** — container orchestration with heartbeat watchdog and Dead Man's Switch
 - **Glass Box UI** — real-time WebSocket dashboard for swarm observability
@@ -116,57 +123,74 @@ uvicorn memu.api:app --host 0.0.0.0 --port 8000
 
 ## Architecture
 
+fumemory is the **Memory Evidence Plane**. OpenClaw remains the top-level coordinator; fumemory stores proof and surfaces learning.
+
 ```text
-Your Agents (Winnie, Rosie, Lenny, Macklemore, ...)
-     |            |            |            |
-     +----------- + -----------+------------+
-                   |
-                   v
-            memU Python Client
-                   |
-                   v
-     +-----------------------------+
-     |        memU API Server      |
-     |     (FastAPI + asyncpg)     |
-     |                             |
-     |  /memories   POST - store   |
-     |  /search     POST - query   |
-     |  /chat       POST - RAG     |
-     |  /health     GET  - status  |
-     +-----------------------------+
-         |                   |
-         v                   v
-   +-----------+     +--------------+
-   | PostgreSQL|     |     NATS     |
-   | + pgvector|     |   Cluster    |
-   |           |     |              |
-   | embeddings|     | local + rail |
-   | metadata  |     | failover     |
-   | chains    |     +--------------+
-   | decay     |            |
-   +-----------+            v
-                    +--------------+
-                    |   Warden     |
-                    | (container   |
-                    |  lifecycle)  |
-                    +--------------+
-                            |
-                            v
-                    +--------------+
-                    |  WS Bridge   |
-                    | (Glass Box   |
-                    |  real-time   |
-                    |  dashboard)  |
-                    +--------------+
+OpenClaw Coordinator
+        |
+        | assigns work, owns routing, owns task state
+        v
+OpenClaw Gateway / Agent Runtime
+        |
+        | canonical sync evidence write (POST /api/v1/memu/add)
+        v
++------------------------------+
+| fumemory Memory Evidence API |
+| - schema validation          |
+| - idempotency                |
+| - auth and tenant scope      |
+| - immediate searchability    |
++---------------+--------------+
+                |
+                v
++------------------------------+
+| Memory Store                 |
+| - Evidence Memory (immutable)|
+| - Learning Memory (derived)  |
+| - source evidence links      |
+| - temporal validity          |
+| - vector, lexical, graph idx |
++-----+------------------+-----+
+      |                  |
+      |                  | background reflection
+      |                  v
+      |          Reflection Worker
+      |          - clusters evidence
+      |          - distills learning
+      |          - sends Compact Telegram Notice
+      |          - 6h review window before integration
+      |
+      v
+Recall Service
+- default learning recall (accepted Learning Memory only)
+- explicit forensic recall (Evidence Memory + provenance)
+      |
+      v
+OpenClaw prompt/context injection
+
+Railway services:
+  api (required) + postgres-pgvector (required)
+  + nats-jetstream (federation) + temporal-worker (async) + embedding-service (optional)
 ```
+
+### Readiness gates
+
+| Gate | Requires | How to verify |
+|------|----------|---------------|
+| **Core API Readiness** | `api` + `postgres-pgvector` | `python scripts/verify_deployment.py --api-url <url>` |
+| **Federation Readiness** | Core API + `nats-jetstream` + searchable proof | `python scripts/verify_deployment.py --api-url <url> --check-federation` |
+| **Async Readiness** | Core API + `temporal-worker` | `python scripts/verify_deployment.py --api-url <url> --check-async` |
+
+Core API Readiness does **not** require NATS or Temporal. Federation and async gates are additive.
 
 ### Components
 
 | Component | What it does |
 |-----------|-------------|
-| **memU API** (`memu/api.py`) | FastAPI server — memory CRUD, semantic search, RAG chat |
-| **PostgreSQL + pgvector** | Storage layer — embeddings, metadata, memory chains, decay scores |
-| **NATS Cluster** (`memu/cluster.py`) | Multi-machine mesh — local primary + Railway fallback |
+| **fumemory API** (`memu/api.py`) | FastAPI server — canonical write, learning recall, forensic recall, reflection queue |
+| **PostgreSQL + pgvector** | Storage — Evidence Memory, Learning Memory, embeddings, chains, decay scores |
+| **NATS Cluster** (`memu/cluster.py`) | Multi-machine mesh — local primary + Railway fallback; required for Federation Readiness |
+| **Reflection Worker** (`memu/reflection.py`) | Background worker — distills evidence into Learning Memory proposals, Telegram notices |
 | **Warden** (`memu/warden.py`) | Container lifecycle — heartbeat watchdog, respawn, warm pool, Dead Man's Switch |
 | **WS Bridge** (`memu/ws_bridge.py`) | WebSocket event stream — real-time swarm observability |
 | **Glass Box UI** (`ui/`) | React dashboard — live view of agent activity, DAG visualization |
@@ -249,7 +273,22 @@ Legacy `X-API-Key` remains supported for backward compatibility, but `X-MemU-Key
 
 ---
 
-## Memory Types
+## Memory Kinds and Types
+
+fumemory uses two orthogonal fields to classify memories:
+
+### `memory_kind` — the primary discriminator
+
+| Kind | Description | Recall |
+|------|-------------|--------|
+| `evidence` | Immutable, task-bound execution proof written by OpenClaw gateways | Forensic Recall only |
+| `learning` | Distilled reusable insight derived from evidence after review | Default recall |
+
+Evidence Memory is **append-only** and cannot be content-deduped across distinct task/session/gateway events. Corrections are new records with explicit links to the original.
+
+Learning Memory must carry source evidence IDs and a `review_status`. Reflection-generated learning starts as `proposed` and enters a six-hour Telegram review window before automatic integration.
+
+### `memory_type` — semantic taxonomy
 
 | Type | Use case |
 |------|----------|
@@ -258,6 +297,11 @@ Legacy `X-API-Key` remains supported for backward compatibility, but `X-MemU-Key
 | `lesson` | Things learned — "Always check migrations before deploy" |
 | `pattern` | Recurring observations — "Users churn when onboarding takes >5 min" |
 | `failure` | What went wrong — "Forgot to rotate API keys, caused 2h outage" |
+| `user_action` | OpenClaw gateway or agent action record |
+| `external` | External tool output or reference |
+| `procedural` | Step-by-step procedure or runbook |
+
+See `docs/MIGRATION_GUIDE.md` for how legacy rows are backfilled into `evidence` or `learning`.
 
 ---
 
@@ -341,26 +385,29 @@ MEMU_API_URL=http://127.0.0.1:8000  # scripts/hooks target this base URL
 # Legacy alias still accepted by some older helpers: MEMU_BASE_URL
 
 # Embeddings (any OpenAI-compatible endpoint)
-OPENAI_API_KEY=          # optional, for OpenAI
-EMBEDDING_BASE_URL=http://localhost:11434  # Ollama default
-EMBEDDING_MODEL=qwen3-embedding
-EMBEDDING_DIMS=4096
+# Canonical variable: EMBEDDING_API_BASE (EMBEDDING_BASE_URL is a deprecated alias)
+OPENAI_API_KEY=          # required when EMBEDDING_API_BASE points to OpenAI
+
+# Default (OpenAI-compatible):
+EMBEDDING_API_BASE=https://api.openai.com
+EMBEDDING_MODEL=text-embedding-3-small
+EMBEDDING_DIMS=1536
 
 # Decay
 DECAY_RATE=0.01
 DEDUP_THRESHOLD=0.95
 
 # Embedding provider for production (do NOT point to local laptop from Railway)
-# Option A: OpenAI-compatible API
+# Option A: OpenAI-compatible API (default)
 # OPENAI_API_KEY=sk-...
-# EMBEDDING_BASE_URL=https://api.openai.com/v1  # or compatible endpoint
+# EMBEDDING_API_BASE=https://api.openai.com
 # EMBEDDING_MODEL=text-embedding-3-small
 # EMBEDDING_DIMS=1536
 
-# Option B: hosted Ollama service on Railway (recommended for self-hosted path)
-EMBEDDING_BASE_URL=http://<railway-ollama-service>.railway.internal:11434
-EMBEDDING_MODEL=qwen3-embedding
-EMBEDDING_DIMS=4096
+# Option B: hosted Ollama service on Railway (self-hosted path — set all three)
+# EMBEDDING_API_BASE=http://<railway-ollama-service>.railway.internal:11434
+# EMBEDDING_MODEL=nomic-embed-text
+# EMBEDDING_DIMS=768
 
 # NATS clustering
 NATS_LOCAL_URL=nats://localhost:4222
@@ -378,13 +425,31 @@ TEMPORAL_TLS=false
 - Railway injects `PORT` for HTTP services; `memu.api` already honors it.
 - Do **not** hardcode `*.proxy.rlwy.net` hosts into committed config. Use env vars per deploy.
 - Core API boot requires `DATABASE_URL` and `MEMU_API_KEY`.
-- `NATS_RAILWAY_URL` is optional for API boot, but required for mesh features.
-- `TEMPORAL_HOST`/`TEMPORAL_TLS` are only required if you want `/memories/async` and `/search/async`.
-- Use `python scripts/verify_deployment.py --api-url <url>` for core API checks.
-- Add `--check-async` only when the Temporal service and worker are deployed and healthy.
-- For local/CI evidence on NATS lane locking, run `./scripts/verify_nats_lane_lock.sh` (JetStream-backed) or `./scripts/verify_baseline.sh`.
+- `NATS_RAILWAY_URL` is optional for API boot, but **required for Federation Readiness**.
+- `TEMPORAL_HOST`/`TEMPORAL_TLS` are only required for `/memories/async` and `/search/async`.
 
-See `docs/railway-readiness.md` for the full pre-deploy checklist.
+### Verification commands
+
+```bash
+# Core API Readiness (API + Postgres + auth + write + recall — no NATS or Temporal needed)
+python scripts/verify_deployment.py --api-url <url>
+
+# Federation Readiness (Core API + NATS + idempotency replay + searchable proof)
+python scripts/verify_deployment.py --api-url <url> --check-federation
+
+# Async Readiness (Core API + Temporal async endpoints)
+python scripts/verify_deployment.py --api-url <url> --check-async
+
+# Emit a machine-readable proof artifact (secrets redacted)
+python scripts/verify_deployment.py --api-url <url> --proof-out proof-core.json
+python scripts/verify_deployment.py --api-url <url> --check-federation --proof-out proof-federation.json
+```
+
+- Add `--check-federation` only when `nats-jetstream` is deployed and `NATS_RAILWAY_URL` is set.
+- Add `--check-async` only when `temporal-worker` is deployed and healthy.
+- For local/CI NATS lane-lock evidence, run `./scripts/verify_nats_lane_lock.sh` or `./scripts/verify_baseline.sh`.
+
+See `docs/railway-readiness.md` for the full pre-deploy checklist and `docs/OPENCLAW_INTEGRATION.md` for OpenClaw hook wiring.
 
 ---
 
@@ -431,8 +496,18 @@ fumemory/
 - [x] WebSocket bridge + Glass Box UI
 - [x] Bridge ledger (DAG, events, trajectories)
 - [x] Security hardening (10 failure modes mitigated)
+- [x] Evidence Memory / Learning Memory separation (`memory_kind`)
+- [x] Canonical synchronous evidence write path (`/api/v1/memu/add`)
+- [x] Idempotency by `(tenant_id, idempotency_key)` with 409 replay detection
+- [x] Default learning recall (accepted Learning Memory only)
+- [x] Forensic Recall with task/session/gateway provenance
+- [x] Reflection Worker + Reflection Review Queue (six-hour window)
+- [x] Compact Telegram reflection notices
+- [x] Core API Readiness / Federation Readiness / Async Readiness verification gates
+- [x] Versioned embedding contract (`EMBEDDING_API_BASE` / `EMBEDDING_MODEL` / `EMBEDDING_DIMS`)
+- [x] Async Memory Workflow parity tests (Temporal optional)
+- [x] Memory Action Eval (multi-session behavioral proof)
 - [ ] LangChain / LlamaIndex integration
-- [ ] Memory compression (summarize old memories)
 - [ ] Multi-tenant mode
 - [ ] Kubernetes Helm chart
 - [ ] PyPI package release
@@ -440,6 +515,10 @@ fumemory/
 See also:
 - `CONTRIBUTING.md`
 - `SECURITY.md`
+- `CONTEXT.md` — canonical domain language (Memory Evidence Plane, Evidence Memory, Learning Memory, etc.)
+- `docs/OPENCLAW_INTEGRATION.md` — OpenClaw hook wiring, Telegram reflection review, Forensic Recall
+- `docs/MIGRATION_GUIDE.md` — legacy memory classification and embedding versioning
+- `docs/railway-readiness.md` — Railway pre-deploy checklist and readiness gates
 - `docs/CROSS_GATEWAY_NATS_FEDERATION.md`
 - `docs/GATEWAY_FEDERATION_ROLLOUT_CHECKLIST.md`
 - `docs/MULTI_MACHINE.md`

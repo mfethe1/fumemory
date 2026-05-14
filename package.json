@@ -1,0 +1,9 @@
+{
+  "scripts": {
+    "sandcastle:issue": "node .sandcastle/run-issue.mjs",
+    "sandcastle:review": "node .sandcastle/run-review.mjs"
+  },
+  "devDependencies": {
+    "@ai-hero/sandcastle": "^0.5.7"
+  }
+}

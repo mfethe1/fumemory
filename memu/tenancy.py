@@ -80,7 +80,7 @@ async def resolve_tenant_id(pool: asyncpg.Pool, api_key: str) -> UUID:
             return tenant_id
 
     # If no tenant found, use default (backward compat)
-    logger.debug(f"No tenant found for API key, using default tenant")
+    logger.debug("No tenant found for API key, using default tenant")
     return DEFAULT_TENANT_ID
 
 

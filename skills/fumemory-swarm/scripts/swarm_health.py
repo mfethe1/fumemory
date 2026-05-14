@@ -1,6 +1,7 @@
 """fumemory swarm health check — run from any agent to verify full stack."""
 import asyncio
 import json
+import os
 import sys
 import socket
 
@@ -10,11 +11,17 @@ except ImportError:
     print("[!!] nats-py not installed. Run: pip install nats-py")
     sys.exit(1)
 
-NATS_LOCAL = "nats://100.76.63.58:4222"
-NATS_RAILWAY = "nats://gondola.proxy.rlwy.net:22393"
-BRIDGE_URL = "http://127.0.0.1:8001"
-GLASSBOX_URL = "http://localhost:3001"
-MEMU_URL = "https://api-production-86f5.up.railway.app/api/v1/memu/health"
+NATS_LOCAL = os.environ.get("NATS_LOCAL_URL", "nats://127.0.0.1:4222")
+NATS_RAILWAY = os.environ.get("NATS_RAILWAY_URL", "").strip()
+BRIDGE_URL = os.environ.get("BRIDGE_URL", "http://127.0.0.1:8001").rstrip("/")
+GLASSBOX_URL = os.environ.get("GLASSBOX_URL", "http://localhost:3001").rstrip("/")
+MEMU_BASE_URL = (
+    os.environ.get("MEMU_VERIFY_BASE_URL")
+    or os.environ.get("MEMU_API_URL")
+    or os.environ.get("MEMU_BASE_URL")
+    or "http://127.0.0.1:8000"
+).rstrip("/")
+MEMU_HEALTH_URL = MEMU_BASE_URL if MEMU_BASE_URL.endswith("/health") else f"{MEMU_BASE_URL}/health"
 
 
 def tcp_check(host: str, port: int, timeout: float = 3.0) -> bool:
@@ -74,13 +81,16 @@ async def main():
 
     # NATS checks
     results.append(await nats_check(NATS_LOCAL, "local"))
-    results.append(await nats_check(NATS_RAILWAY, "railway"))
+    if NATS_RAILWAY:
+        results.append(await nats_check(NATS_RAILWAY, "railway"))
+    else:
+        print("[SKIP] NATS (railway) | NATS_RAILWAY_URL not set")
 
     # HTTP checks
     results.append(http_check(f"{BRIDGE_URL}/api/stats", "Bridge (stats)"))
     results.append(http_check(f"{BRIDGE_URL}/api/cluster/status", "Bridge (cluster)"))
     results.append(http_check(GLASSBOX_URL, "Glass Box UI"))
-    results.append(http_check(MEMU_URL, "memU API"))
+    results.append(http_check(MEMU_HEALTH_URL, "memU API"))
 
     print()
     passed = sum(results)

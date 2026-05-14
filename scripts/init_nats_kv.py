@@ -4,7 +4,6 @@
 import asyncio
 import os
 import nats
-from nats.js.kv import KeyValue
 
 NATS_URL = os.environ.get("NATS_URL", "nats://localhost:4222")
 
@@ -21,7 +20,7 @@ async def main():
 
     for bucket, description in buckets:
         try:
-            kv = await js.key_value(bucket)
+            await js.key_value(bucket)
             print(f"Bucket {bucket} already exists.")
         except Exception:
             await js.create_key_value(bucket=bucket, description=description)

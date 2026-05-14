@@ -24,15 +24,23 @@ async def get_client() -> Any:
     return await Client.connect(host, tls=use_tls)
 
 
-async def store_memory_workflow(content: str, agent_id: str, metadata: dict | None) -> str | None:
+async def store_memory_workflow(req_dict: dict) -> str | None:
+    """Start a durable MemoryIngestionWorkflow preserving all canonical fields.
+
+    req_dict must contain all MemoryCreate-equivalent fields so the async path
+    never silently drops memory_type, memory_kind, idempotency_key, or metadata.
+    Returns the Temporal workflow ID on success, None when Temporal is unavailable.
+    """
     try:
         from memu.temporal_worker.workflows import MemoryIngestionWorkflow
 
+        content = req_dict.get("content", "")
+        agent_id = req_dict.get("agent_id", "system")
         client = await get_client()
         wf_id = f"memory-ingest-{agent_id}-{_workflow_suffix(agent_id, content)}"
         handle = await client.start_workflow(
             MemoryIngestionWorkflow.run,
-            args=[content, agent_id, metadata or {}],
+            args=[req_dict],
             id=wf_id,
             task_queue="memu-queue",
         )

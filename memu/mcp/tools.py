@@ -209,12 +209,12 @@ async def dispatch(
         }
         if args.get("include_links", True):
             out["outbound"] = [
-                {"dst_slug": l.dst_slug, "type": l.type, "strength": l.strength}
-                for l in await backend.list_links(node.slug, direction="out")
+                {"dst_slug": link.dst_slug, "type": link.type, "strength": link.strength}
+                for link in await backend.list_links(node.slug, direction="out")
             ]
             out["inbound"] = [
-                {"src_slug": l.src_slug, "type": l.type, "strength": l.strength}
-                for l in await backend.list_links(node.slug, direction="in")
+                {"src_slug": link.src_slug, "type": link.type, "strength": link.strength}
+                for link in await backend.list_links(node.slug, direction="in")
             ]
         return out
     if name == "wiki_write":
@@ -252,12 +252,12 @@ async def dispatch(
         inbound = await backend.list_links(args["ref"], direction="in")
         return {
             "outbound": [
-                {"dst_slug": l.dst_slug, "type": l.type, "strength": l.strength}
-                for l in outbound
+                {"dst_slug": link.dst_slug, "type": link.type, "strength": link.strength}
+                for link in outbound
             ],
             "inbound": [
-                {"src_slug": l.src_slug, "type": l.type, "strength": l.strength}
-                for l in inbound
+                {"src_slug": link.src_slug, "type": link.type, "strength": link.strength}
+                for link in inbound
             ],
         }
     if name == "rlm_solve":

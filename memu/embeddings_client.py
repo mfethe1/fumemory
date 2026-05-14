@@ -15,8 +15,11 @@ import logging
 import os
 import random
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
+
+from memu.embedding_contract import resolve_embedding_api_base
 
 logger = logging.getLogger(__name__)
 
@@ -24,15 +27,19 @@ logger = logging.getLogger(__name__)
 _KV_BUCKET = "memu_embedding_cache"
 _KV_TTL_S = 86400
 
-# Configuration via environment variables
-_API_KEY = os.environ.get("OPENAI_API_KEY", "")
-_MODEL = os.environ.get("EMBEDDING_MODEL", "text-embedding-3-small")
-_BASE_URL = os.environ.get("EMBEDDING_API_BASE", "https://api.openai.com")
+# Configuration defaults
+_DEFAULT_MODEL = "text-embedding-3-small"
 
 # Retry configuration for HTTP 429 (Rate Limit)
 _MAX_RETRIES = 3
 _BASE_DELAY_S = 1.0
 _MAX_JITTER_S = 0.5
+
+
+def _is_ollama_base(base_url: str) -> bool:
+    parsed = urlparse(base_url)
+    host = (parsed.hostname or "").lower()
+    return "ollama" in host or parsed.port == 11434
 
 
 async def _kv_get(nc: Any, cache_key: str) -> list[float] | None:
@@ -81,17 +88,22 @@ async def get_embedding(text: str, nc: Any = None) -> list[float] | None:
         except Exception:
             pass  # Cache unavailable — fall through to API
 
-    if not _API_KEY:
+    api_key = os.environ.get("OPENAI_API_KEY", "")
+    model = os.environ.get("EMBEDDING_MODEL", _DEFAULT_MODEL)
+    base_url = resolve_embedding_api_base()
+
+    if not api_key and not _is_ollama_base(base_url):
         logger.warning("OPENAI_API_KEY not set — embedding requests will fail")
         return None
 
-    url = f"{_BASE_URL.rstrip('/')}/v1/embeddings"
+    url = f"{base_url.rstrip('/')}/v1/embeddings"
     headers = {
-        "Authorization": f"Bearer {_API_KEY}",
         "Content-Type": "application/json",
     }
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
     payload = {
-        "model": _MODEL,
+        "model": model,
         "input": text,
     }
 

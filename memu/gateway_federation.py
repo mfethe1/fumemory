@@ -331,12 +331,7 @@ async def run_memu_smoke(cfg: FederationConfig, *, marker: str) -> list[SmokeRes
             )
         )
 
-        write_payload = {
-            "content": f"{marker} gateway federation smoke write",
-            "agent_id": cfg.gateway_id,
-            "memory_type": "observation",
-            "metadata": {"marker": marker, "source": "gateway-federation-smoke"},
-        }
+        write_payload = build_memu_smoke_write_payload(cfg, marker=marker)
         write = await client.post(f"{base}/api/v1/memu/add", headers=headers, json=write_payload)
         results.append(
             SmokeResult(
@@ -347,21 +342,78 @@ async def run_memu_smoke(cfg: FederationConfig, *, marker: str) -> list[SmokeRes
             )
         )
 
+        # Idempotency replay: exact replay returns the same memory id.
+        # Older compat paths may return 409, so keep that as an accepted proof.
+        replay = await client.post(f"{base}/api/v1/memu/add", headers=headers, json=write_payload)
+        replay_data = safe_json(replay)
+        original_id = (safe_json(write) or {}).get("id")
+        replay_ok, replay_detail = verify_memu_replay_response(
+            replay.status_code,
+            replay_data,
+            original_id=original_id,
+        )
+        results.append(
+            SmokeResult(
+                name="memu-idempotency-replay",
+                ok=replay_ok,
+                detail=replay_detail,
+                data=replay_data,
+            )
+        )
+
+        # Searchable memory proof: verify the marker appears in search results
         search = await client.post(
             f"{base}/api/v1/memu/search-text",
             headers=headers,
             json={"query": marker, "k": 5},
         )
+        search_data = safe_json(search)
+        found_in_results = False
+        if search.status_code == 200 and search_data:
+            items = search_data.get("results") or search_data.get("memories") or []
+            if not items and isinstance(search_data.get("value"), list):
+                items = search_data["value"]
+            found_in_results = any(
+                marker in (r.get("content", "") if isinstance(r, dict) else "")
+                for r in items
+            )
         results.append(
             SmokeResult(
                 name="memu-search-text",
-                ok=search.status_code == 200,
-                detail=f"search-text status={search.status_code}",
-                data=safe_json(search),
+                ok=found_in_results,
+                detail="marker found in search results" if found_in_results else f"marker not found in results (status={search.status_code})",
+                data=search_data,
             )
         )
 
         return results
+
+
+def build_memu_smoke_write_payload(cfg: FederationConfig, *, marker: str) -> dict[str, Any]:
+    return {
+        "content": f"{marker} gateway federation smoke write",
+        "agent_id": cfg.gateway_id,
+        "memory_type": "observation",
+        "memory_kind": "evidence",
+        "idempotency_key": f"gateway-smoke-{cfg.gateway_id}-{marker}",
+        "metadata": {"marker": marker, "source": "gateway-federation-smoke"},
+    }
+
+
+def verify_memu_replay_response(
+    status_code: int,
+    replay_data: dict[str, Any] | None,
+    *,
+    original_id: str | None,
+) -> tuple[bool, str]:
+    if status_code == 409:
+        return True, "409 conflict/dedup confirmed"
+    if status_code != 200:
+        return False, f"expected same-id 200 or 409, got {status_code}"
+    replay_id = str((replay_data or {}).get("id") or "")
+    if original_id and replay_id == str(original_id):
+        return True, "200 exact replay returned same id"
+    return False, f"expected replay id {original_id or '<missing>'}, got {replay_id or '<missing>'}"
 
 
 def safe_json(response: httpx.Response) -> dict[str, Any] | None:
@@ -374,8 +426,31 @@ def safe_json(response: httpx.Response) -> dict[str, Any] | None:
         return None
 
 
-def results_to_json(results: list[SmokeResult]) -> dict[str, Any]:
+def _redact_nats_url(url: str) -> str:
+    """Keep scheme+host, redact auth credentials embedded in the URL."""
+    if "@" in url:
+        scheme_end = url.find("//") + 2
+        at_pos = url.rfind("@")
+        return url[:scheme_end] + "[REDACTED]@" + url[at_pos + 1:]
+    return url
+
+
+def results_to_json(
+    results: list[SmokeResult],
+    *,
+    gateway_id: str = "",
+    nats_railway_url: str = "",
+) -> dict[str, Any]:
+    evidence_memory_ids: list[str] = []
+    for r in results:
+        if r.name == "memu-write" and r.ok and r.data:
+            mem_id = r.data.get("id")
+            if mem_id:
+                evidence_memory_ids.append(str(mem_id))
     return {
         "ok": all(item.ok for item in results),
+        "gateway_id": gateway_id,
+        "nats_railway_url": _redact_nats_url(nats_railway_url),
+        "evidence_memory_ids": evidence_memory_ids,
         "results": [asdict(item) for item in results],
     }

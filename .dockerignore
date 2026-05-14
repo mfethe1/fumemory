@@ -2,6 +2,12 @@
 .venv
 venv
 env
+node_modules
+ui/node_modules
+.sandcastle/logs
+.sandcastle/worktrees
+.sandcastle/patches
+.pytest_cache
 __pycache__
 *.pyc
 .idea

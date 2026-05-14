@@ -13,11 +13,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import signal
 import sys
-import time
-from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID
 
@@ -232,8 +231,6 @@ def check_fencing_token_health(current_token: int) -> bool:
 # Blast radius: Privilege escalation within the mesh.
 # Fix: Strict subject sanitization. Only alphanumeric + dots + hyphens.
 # ============================================================================
-
-import re
 
 SAFE_SUBJECT_PATTERN = re.compile(r'^[a-zA-Z0-9._-]+$')
 MAX_SUBJECT_LENGTH = 256

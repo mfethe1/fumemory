@@ -6,7 +6,6 @@ Checks all components without requiring external dependencies.
 
 import sys
 import os
-import ast
 
 def check_models():
     """Validate models.py structure."""

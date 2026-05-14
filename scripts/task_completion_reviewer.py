@@ -85,7 +85,7 @@ async def review_completion(db_url: str, task_id: str, payload: dict, reviewer_i
         notes = "\n".join([n for n in [existing_notes, new_entry] if n])
 
         if ok:
-            updated = await conn.fetchrow(
+            await conn.fetchrow(
                 """
                 UPDATE backlog
                 SET
@@ -122,7 +122,7 @@ async def review_completion(db_url: str, task_id: str, payload: dict, reviewer_i
 
             status = "approved"
         else:
-            updated = await conn.fetchrow(
+            await conn.fetchrow(
                 """
                 UPDATE backlog
                 SET

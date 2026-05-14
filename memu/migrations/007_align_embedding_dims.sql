@@ -1,31 +1,18 @@
--- Migration: Align all embedding columns to 4096 dims
--- qwen3-embedding on Railway produces 4096-dim vectors.
--- The original schema created memories.embedding as vector(1536).
--- This migration aligns everything to the actual model output.
+-- Migration: add 4096-dim memories embedding storage.
+-- ADR-0003 requires dimension changes to be additive and versioned.
 
--- Step 1: Drop any indexes that depend on the embedding column type
-DROP INDEX IF EXISTS idx_memories_embedding;
-DROP INDEX IF EXISTS idx_search_history_embedding;
+ALTER TABLE memories
+    ADD COLUMN IF NOT EXISTS embedding_version INTEGER NOT NULL DEFAULT 1;
 
--- Step 2: Alter memories embedding to 4096 dims
--- Note: existing 1536-dim vectors will be dropped (NULL'd) since they're
--- incompatible. This is acceptable — they'll be re-embedded on next access.
-DO $$
-BEGIN
-  -- Null out any old 1536-dim embeddings (can't cast between vector sizes)
-  UPDATE memories SET embedding = NULL WHERE embedding IS NOT NULL;
-  
-  -- Alter column type
-  ALTER TABLE memories ALTER COLUMN embedding TYPE vector(4096);
-  
-  RAISE NOTICE 'memories.embedding upgraded to vector(4096)';
-EXCEPTION WHEN OTHERS THEN
-  RAISE NOTICE 'memories embedding migration skipped: %', SQLERRM;
-END
-$$;
+ALTER TABLE memories
+    ADD COLUMN IF NOT EXISTS embedding_v4096 vector(4096);
 
--- Step 3: Recreate indexes (without HNSW for now — 4096 dims may exceed
--- pgvector HNSW limits on some versions; use IVFFlat instead)
--- IVFFlat supports higher dimensions more reliably
--- Skip index creation for now — let queries use sequential scan until
--- we have enough vectors for IVFFlat training (needs ~1000+ rows)
+COMMENT ON COLUMN memories.embedding_version IS
+    'Tracks which embedding contract generated the stored vector.';
+
+COMMENT ON COLUMN memories.embedding_v4096 IS
+    'Additive 4096-dim embedding column. Existing memories.embedding values are preserved.';
+
+CREATE INDEX IF NOT EXISTS idx_memories_embedding_version
+    ON memories(embedding_version)
+    WHERE embedding IS NOT NULL OR embedding_v4096 IS NOT NULL;

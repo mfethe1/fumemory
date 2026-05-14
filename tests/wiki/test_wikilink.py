@@ -25,7 +25,7 @@ def test_anchor_link():
 
 def test_namespaced_slug():
     links = parse_wikilinks("cites [[paper/2312.12345]] and [[code/foo.py:FooParser]]")
-    slugs = [l.slug for l in links]
+    slugs = [link.slug for link in links]
     assert slugs == ["paper/2312.12345", "code/foo.py:FooParser"]
     assert links[0].namespace == "paper"
 

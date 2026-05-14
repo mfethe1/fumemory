@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import uuid
 
-import pytest
 
 from memu.storage import get_backend
 from memu.storage.base import LinkRecord, WikiNode
@@ -67,9 +66,9 @@ def test_markdown_links_in_and_out(tmp_path):
         await backend.put_node(src)
 
         out = await backend.list_links("src", direction="out")
-        assert [l.dst_slug for l in out] == ["dst"]
+        assert [link.dst_slug for link in out] == ["dst"]
         inbound = await backend.list_links("dst", direction="in")
-        assert [l.src_slug for l in inbound] == ["src"]
+        assert [link.src_slug for link in inbound] == ["src"]
         await backend.close()
 
     _run(go())

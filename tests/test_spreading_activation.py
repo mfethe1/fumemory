@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 from memu.spreading_activation import (
     fetch_graph_neighbors,
@@ -11,7 +11,7 @@ from memu.spreading_activation import (
     activate_spreading,
     MAX_PRIMED_NEIGHBORS,
 )
-from memu.core_memory import Block, BlockEntry, CoreMemoryManager
+from memu.core_memory import Block, CoreMemoryManager
 
 
 # ---------------------------------------------------------------------------

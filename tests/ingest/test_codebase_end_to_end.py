@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import shutil
 from pathlib import Path
 
@@ -66,7 +65,7 @@ async def test_methods_link_back_to_their_class(tmp_path):
         await ingest_codebase(backend, src)
         greet = await backend.get_node("code/tiny_pkg/core/Greeter.greet")
         assert greet is not None
-        dst_slugs = {l.dst_slug for l in greet.links}
+        dst_slugs = {link.dst_slug for link in greet.links}
         assert "code/tiny_pkg/core/Greeter" in dst_slugs
         # self._render() is linked.
         assert "code/tiny_pkg/core/Greeter._render" in dst_slugs
@@ -83,13 +82,13 @@ async def test_cross_module_imports_become_wikilinks(tmp_path):
         await ingest_codebase(backend, src)
         render = await backend.get_node("code/tiny_pkg/core/Greeter._render")
         assert render is not None
-        dst = {l.dst_slug for l in render.links}
+        dst = {link.dst_slug for link in render.links}
         # u.format_hello resolves to utils.format_hello via the aliased import.
         assert "code/tiny_pkg/utils/format_hello" in dst
 
         factory = await backend.get_node("code/tiny_pkg/core/make_greeter")
         assert factory is not None
-        dst2 = {l.dst_slug for l in factory.links}
+        dst2 = {link.dst_slug for link in factory.links}
         # hidden_helper comes from ``from ._private import hidden_helper``.
         assert "code/tiny_pkg/_private/hidden_helper" in dst2
         # Greeter() call links to the class in the same module.

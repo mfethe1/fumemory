@@ -15,7 +15,8 @@ from memu.cognitive_workers import (
 from memu.core_memory import Block, CoreMemoryManager
 
 # Reuse MockJetStream from Phase 1 tests
-import sys, os
+import sys
+import os
 sys.path.insert(0, os.path.dirname(__file__))
 from test_core_memory import MockJetStream
 
@@ -169,7 +170,7 @@ class TestSubconsciousStream:
 
         # Set agent vector to be orthogonal to broadcast
         stream.update_agent_vector("lenny", make_embedding(1))
-        result = await stream.check_and_inject(make_embedding(999), "unrelated topic")
+        await stream.check_and_inject(make_embedding(999), "unrelated topic")
         # Likely low similarity — should not inject
         # (depends on random vectors, but orthogonal seeds should be < 0.85)
 
@@ -184,7 +185,7 @@ class TestSubconsciousStream:
         await stream.check_and_inject(emb, "test insight")
 
         # Primed_Cache should have content
-        primed = await core_mem.get_block("lenny", Block.PRIMED_CACHE)
+        await core_mem.get_block("lenny", Block.PRIMED_CACHE)
         # Working_Context should be unchanged (empty from bootstrap)
         working = await core_mem.get_block("lenny", Block.WORKING_CONTEXT)
         assert working.content == ""

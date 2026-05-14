@@ -36,7 +36,6 @@ from memu.swarm_models import (
     CheckpointSaved,
     DLQEntry,
     EventType,
-    HydrationHandoff,
     LaneLock,
     RPCRequest,
     RPCResponse,
@@ -44,7 +43,6 @@ from memu.swarm_models import (
     SwarmEvent,
     TaskNode,
     TaskOrphaned,
-    TaskStatus,
 )
 from memu.hardening import sanitize_nats_subject
 
@@ -306,7 +304,7 @@ class LaneLockedExecution:
                     "task_id": str(self.task.task_id),
                     "progress_pct": 0.0,
                     "status_note": "lane-lock-heartbeat",
-                    "lanes_held": [l.lane_id for l in self.acquired_locks],
+                    "lanes_held": [lock.lane_id for lock in self.acquired_locks],
                 })
 
             except asyncio.CancelledError:

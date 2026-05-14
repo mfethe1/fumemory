@@ -412,7 +412,7 @@ Example:
 GATEWAY_ID=mac-mini-main \
 NATS_RAILWAY_URL='nats://...' \
 NATS_AUTH_TOKEN='...' \
-MEMU_BASE_URL='https://api-production-86f5.up.railway.app' \
+MEMU_BASE_URL='https://<fumemory-api>.up.railway.app' \
 X_MEMU_KEY='...' \
 python scripts/gateway_federation_smoke.py --json
 ```

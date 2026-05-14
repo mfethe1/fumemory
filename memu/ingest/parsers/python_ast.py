@@ -23,7 +23,6 @@ from __future__ import annotations
 import ast
 import builtins
 import hashlib
-import re
 from pathlib import Path
 from typing import Iterable, Optional
 

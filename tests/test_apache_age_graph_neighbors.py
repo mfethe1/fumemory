@@ -9,7 +9,6 @@ from uuid import UUID
 
 import pytest
 from fastapi import HTTPException
-from fastapi.testclient import TestClient
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 

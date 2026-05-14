@@ -17,7 +17,6 @@ from .base import (
     LinkRecord,
     NodeKind,
     SearchHit,
-    StorageBackend,
     WikiNode,
 )
 

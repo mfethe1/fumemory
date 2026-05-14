@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 
 from memu.ingest.filters import build_walker
 

@@ -1,7 +1,5 @@
 # memu/web_search_ingest.py
-from memu.models import MemoryCreate, MemoryType
 from memu.temporal_client import store_memory_workflow
-import json
 import logging
 
 logger = logging.getLogger(__name__)
