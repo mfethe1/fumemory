@@ -13,7 +13,6 @@ Context isolation: writes ONLY to Primed_Cache (worker-writable block).
 
 from __future__ import annotations
 
-import json
 import logging
 from typing import Any
 

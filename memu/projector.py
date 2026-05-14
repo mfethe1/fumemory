@@ -10,11 +10,9 @@ import asyncio
 import json
 import logging
 import os
-from uuid import UUID
 
 import nats
 import httpx
-from nats.js import JetStreamContext
 
 from memu.nats_config import primary_nats_url
 from memu.swarm_models import SwarmEvent, EventType

@@ -18,17 +18,14 @@ import asyncio
 import logging
 from datetime import datetime, timezone
 from typing import Any, Callable
-from uuid import UUID, uuid4
+from uuid import UUID
 
-from nats.aio.client import Client as NATS
 from pydantic import BaseModel
 
 from memu.cluster import NATSClusterManager
-from memu.swarm_models import EventType, SwarmEvent
 from memu.worker_payloads import (
     SpawnParallelBatchPayload,
     SpawnSubtaskPayload,
-    WorkerClaimPayload,
     WorkerErrorPayload,
     WorkerHeartbeatPayload,
     WorkerMessage,
@@ -365,9 +362,8 @@ class ParallelWorkerRouter:
         )
 
         # Check if batch should be considered successful
-        success = True
         if batch.require_all_success and errors:
-            success = False
+            pass
 
         # Aggregate results based on strategy
         aggregated_result = self._aggregate_results(batch, results, errors)

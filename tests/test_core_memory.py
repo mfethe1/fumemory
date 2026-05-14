@@ -6,23 +6,16 @@ These tests use a mock NATS KV store to verify logic without a running NATS serv
 from __future__ import annotations
 
 import pytest
-import asyncio
-from dataclasses import dataclass, field
-from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
 
 from memu.core_memory import (
     Block,
     BlockEntry,
     AgentCoreMemory,
     CoreMemoryManager,
-    CASConflictError,
     count_tokens,
     AGENT_WRITABLE_BLOCKS,
     WORKER_WRITABLE_BLOCKS,
-    DEFAULT_TOKEN_LIMITS,
     TOTAL_TOKEN_BUDGET,
-    MAX_CAS_RETRIES,
 )
 
 

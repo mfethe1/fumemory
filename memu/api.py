@@ -4,11 +4,11 @@ from __future__ import annotations
 from datetime import datetime, timezone, timedelta
 
 import hashlib
+import asyncio
 import json
-from memu.web_search_ingest import ingest_web_search
 import os
 import logging
-import signal
+import time
 from contextlib import asynccontextmanager
 from typing import Any, Optional
 from uuid import UUID
@@ -17,32 +17,32 @@ import re
 import asyncpg
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request, Security
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel
 
+from memu.concept_search import (
+    concept_lookup,
+    concept_search_memories,
+    hybrid_search as _hybrid_search_core,
+)
 from memu.decay import compute_final_score, should_deduplicate
-
-# --- Logging Config ---
-LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
-# Reduce noise from verbose libraries
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("httpcore").setLevel(logging.WARNING)
-logging.getLogger("fastembed").setLevel(logging.WARNING)
 from memu.cluster import NATSClusterManager
 from memu.core_memory import (
     Block,
     CoreMemoryManager,
     CASConflictError,
 )
-from memu.semantic_router import SemanticRouter, SearchTarget
+from memu.semantic_router import SemanticRouter
 from memu.nats_publisher import NATSEventPublisher
 from memu.models import (
     BulkImportRequest,
     BulkImportResponse,
     ChatRequest,
     ChatResponse,
+    ForensicRecallItem,
+    ForensicRecallRequest,
+    ForensicRecallResponse,
     GatewayLease,
     GatewayLeaseAcquireRequest,
     GatewayLeaseAcquireResponse,
@@ -50,7 +50,13 @@ from memu.models import (
     GatewayLeaseRenewRequest,
     Memory,
     MemoryCreate,
+    MemoryKind,
     MemoryType,
+    ReflectionAction,
+    ReflectionActionRequest,
+    ReflectionActionResponse,
+    ReflectionProposal,
+    ReflectionProposalCreate,
     SearchRequest,
     SearchResult,
     Task,
@@ -59,6 +65,8 @@ from memu.models import (
     TaskUpdate,
     TaskReviewRequest,
 )
+from memu.schema_contract import compute_canonical_payload_hash
+from memu.reflection import compute_proposal_expiry
 
 from memu.notion_bridge import create_bridge_from_env, NotionBridge
 from memu.migrations import run_migrations
@@ -66,19 +74,25 @@ from memu.temporal_routes import router as temporal_router
 from memu.tenancy import (
     resolve_tenant_id,
     tenant_connection,
-    tenant_transaction,
     DEFAULT_TENANT_ID,
-    SINGLE_TENANT_MODE,
 )
+
+# --- Logging Config ---
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
+# Reduce noise from verbose libraries
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("fastembed").setLevel(logging.WARNING)
 
 # --- Config ---
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://memu:memu@localhost:5432/memu")
 MEMU_API_KEY = os.environ.get("MEMU_API_KEY", "memu-dev-key")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
-EMBEDDING_BASE_URL = os.environ.get("EMBEDDING_BASE_URL", "")
-EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
-EMBEDDING_DIMS = int(os.environ.get("EMBEDDING_DIMS", "4096"))
+EMBEDDING_API_BASE = os.environ.get("EMBEDDING_API_BASE", "https://api.openai.com")
+EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "text-embedding-3-small")
+EMBEDDING_DIMS = int(os.environ.get("EMBEDDING_DIMS", "1536"))
 DEDUP_THRESHOLD = float(os.environ.get("DEDUP_THRESHOLD", "0.95"))
 DECAY_RATE = float(os.environ.get("DECAY_RATE", "0.01"))
 HNSW_ITERATIVE_SCAN = os.environ.get("HNSW_ITERATIVE_SCAN", "strict_order")
@@ -93,13 +107,104 @@ _nats_publisher: NATSEventPublisher | None = None
 _core_memory_mgr: CoreMemoryManager | None = None
 _implicit_profiler: Any = None  # ImplicitProfiler (lazy import)
 _semantic_router: SemanticRouter | None = None
+_embedding_schema_ok: bool = True  # Set False when configured dims ≠ schema dims
+_migrations_ok: bool = False
+_migration_startup_error: str | None = None
 is_shutting_down: bool = False  # Set True on SIGTERM; triggers 503 for new requests
 logger = logging.getLogger(__name__)
 
 
+def _new_metrics() -> dict[str, Any]:
+    return {
+        "http_requests_total": 0,
+        "http_requests_by_status_class": {},
+        "http_request_errors_total": 0,
+        "http_request_latency_seconds_sum": 0.0,
+        "http_request_latency_seconds_count": 0,
+        "readiness_failures_total": 0,
+    }
+
+
+_metrics: dict[str, Any] = _new_metrics()
+
+
+def _record_http_request(status_code: int, elapsed_seconds: float) -> None:
+    status_class = f"{status_code // 100}xx"
+    _metrics["http_requests_total"] += 1
+    by_status = _metrics["http_requests_by_status_class"]
+    by_status[status_class] = by_status.get(status_class, 0) + 1
+    if status_code >= 500:
+        _metrics["http_request_errors_total"] += 1
+    _metrics["http_request_latency_seconds_sum"] += elapsed_seconds
+    _metrics["http_request_latency_seconds_count"] += 1
+
+
+def _render_metrics() -> str:
+    lines = [
+        "# TYPE memu_http_requests_total counter",
+        f"memu_http_requests_total {_metrics['http_requests_total']}",
+        "# TYPE memu_http_requests_by_status_class_total counter",
+    ]
+    for status_class in sorted(_metrics["http_requests_by_status_class"]):
+        value = _metrics["http_requests_by_status_class"][status_class]
+        lines.append(
+            f'memu_http_requests_by_status_class_total{{status_class="{status_class}"}} {value}'
+        )
+    lines.extend(
+        [
+            "# TYPE memu_http_request_errors_total counter",
+            f"memu_http_request_errors_total {_metrics['http_request_errors_total']}",
+            "# TYPE memu_http_request_latency_seconds_sum counter",
+            (
+                "memu_http_request_latency_seconds_sum "
+                f"{_metrics['http_request_latency_seconds_sum']:.6f}"
+            ),
+            "# TYPE memu_http_request_latency_seconds_count counter",
+            (
+                "memu_http_request_latency_seconds_count "
+                f"{_metrics['http_request_latency_seconds_count']}"
+            ),
+            "# TYPE memu_readiness_failures_total counter",
+            f"memu_readiness_failures_total {_metrics['readiness_failures_total']}",
+        ]
+    )
+    return "\n".join(lines) + "\n"
+
+
+def _make_startup_nats_cluster() -> NATSClusterManager:
+    """Create the API startup NATS client.
+
+    API boot must prove NATS availability quickly and then degrade to Core API
+    mode if NATS is down. Long-lived mesh processes can keep infinite reconnects,
+    but FastAPI lifespan cannot wait on them or Railway healthchecks fail.
+    """
+    return NATSClusterManager(
+        connect_timeout_s=float(os.environ.get("MEMU_NATS_STARTUP_CONNECT_TIMEOUT_S", "2")),
+        max_reconnect_attempts=int(os.environ.get("MEMU_NATS_STARTUP_RECONNECT_ATTEMPTS", "0")),
+        allow_reconnect=False,
+    )
+
+
+def _env_flag(name: str, default: str = "0") -> bool:
+    return os.environ.get(name, default).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _startup_nats_enabled() -> bool:
+    """Whether the API should connect to NATS during FastAPI startup."""
+    return _env_flag("MEMU_ENABLE_STARTUP_NATS")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global pool, _fastembed_model, _nats_cluster, _nats_publisher, _core_memory_mgr, _implicit_profiler
+    global \
+        pool, \
+        _fastembed_model, \
+        _nats_cluster, \
+        _nats_publisher, \
+        _core_memory_mgr, \
+        _implicit_profiler, \
+        _migrations_ok, \
+        _migration_startup_error
     # Conservative pool size: allows 4 pods × 5 = 20 total connections during
     # rolling deploys. statement_cache_size=0 for PgBouncer compatibility.
     pool = await asyncpg.create_pool(
@@ -110,58 +215,93 @@ async def lifespan(app: FastAPI):
         max_inactive_connection_lifetime=30,
         statement_cache_size=0,
     )
-    
-    # Run DB migrations
+
+    # Run DB migrations. Startup must fail if migrations fail; otherwise the
+    # process can present healthy while serving an unsafe schema.
+    _migrations_ok = False
+    _migration_startup_error = None
     try:
         await run_migrations(pool)
+        _migrations_ok = True
     except Exception as e:
-        logger.error(f"Migration startup failed: {e}")
-    
+        _migration_startup_error = str(e)
+        logger.exception("Migration startup failed")
+        await pool.close()
+        pool = None
+        raise
+
+    # Verify embedding contract: configured dims must match schema
+    global _embedding_schema_ok
+    try:
+        from memu.embedding_contract import verify_embedding_schema, resolve_embedding_api_base
+
+        resolve_embedding_api_base()  # logs alias warning if EMBEDDING_BASE_URL is used
+        _embedding_schema_ok = await verify_embedding_schema(pool, EMBEDDING_DIMS)
+    except Exception as e:
+        logger.error("Embedding contract check failed: %s. Semantic recall may be degraded.", e)
+        _embedding_schema_ok = False
+
     # Pre-warm fastembed model
     try:
         from fastembed import TextEmbedding
+
         _fastembed_model = TextEmbedding()
     except Exception as e:
         logger.warning("FastEmbed pre-warm failed: %s", e)
 
-    # Connect NATS cluster (non-blocking â€” API works without NATS)
-    try:
-        _nats_cluster = NATSClusterManager()
-        await _nats_cluster.connect()
-        _nats_publisher = NATSEventPublisher(_nats_cluster, gateway_id="memu-api")
-        logger.info("NATS event publisher connected")
-
-        # Start OTel Exporter
+    # Connect NATS cluster only when explicitly enabled. Core API Readiness
+    # must not wait on NATS, because Railway healthchecks depend on lifespan
+    # completing before /health is served.
+    if _startup_nats_enabled():
         try:
-            from memu.otel_exporter import OTelExporterTask
-            import asyncio
-            otel_task = OTelExporterTask(_nats_cluster)
-            asyncio.create_task(otel_task.start())
-            logger.info("OTel Exporter started")
-        except Exception as e:
-            logger.error(f"Failed to start OTel Exporter: {e}")
+            _nats_cluster = _make_startup_nats_cluster()
+            connect_budget_s = float(os.environ.get("MEMU_NATS_STARTUP_BUDGET_S", "5"))
+            await asyncio.wait_for(_nats_cluster.connect(), timeout=connect_budget_s)
+            _nats_publisher = NATSEventPublisher(_nats_cluster, gateway_id="memu-api")
+            logger.info("NATS event publisher connected")
 
-        # Initialize Core Memory Manager (NATS KV)
-        try:
-            _core_memory_mgr = CoreMemoryManager(_nats_cluster.jetstream)
-            await _core_memory_mgr.ensure_bucket()
-            logger.info("Core Memory Manager initialized (NATS KV)")
+            # Start OTel Exporter
+            try:
+                from memu.otel_exporter import OTelExporterTask
+
+                otel_task = OTelExporterTask(_nats_cluster)
+                asyncio.create_task(otel_task.start())
+                logger.info("OTel Exporter started")
+            except Exception as e:
+                logger.error(f"Failed to start OTel Exporter: {e}")
+
+            # Initialize Core Memory Manager (NATS KV)
+            try:
+                _core_memory_mgr = CoreMemoryManager(_nats_cluster.jetstream)
+                await _core_memory_mgr.ensure_bucket()
+                logger.info("Core Memory Manager initialized (NATS KV)")
+            except Exception as e:
+                logger.warning("Core Memory Manager init failed: %s", e)
+                _core_memory_mgr = None
+
+            # Start Implicit Profiling Daemon
+            try:
+                from memu.implicit_profiler import ImplicitProfiler
+
+                if _core_memory_mgr:
+                    _implicit_profiler = ImplicitProfiler(_nats_cluster, _core_memory_mgr)
+                    asyncio.create_task(_implicit_profiler.start())
+                    logger.info("Implicit Profiler daemon started")
+            except Exception as e:
+                logger.warning("Implicit Profiler startup failed: %s", e)
+
         except Exception as e:
-            logger.warning("Core Memory Manager init failed: %s", e)
+            logger.warning("NATS connection failed (API will work without events): %s", e)
+            if _nats_cluster:
+                try:
+                    await _nats_cluster.close()
+                except Exception:
+                    pass
+            _nats_cluster = None
+            _nats_publisher = None
             _core_memory_mgr = None
-
-        # Start Implicit Profiling Daemon
-        try:
-            from memu.implicit_profiler import ImplicitProfiler
-            if _core_memory_mgr:
-                _implicit_profiler = ImplicitProfiler(_nats_cluster, _core_memory_mgr)
-                asyncio.create_task(_implicit_profiler.start())
-                logger.info("Implicit Profiler daemon started")
-        except Exception as e:
-            logger.warning("Implicit Profiler startup failed: %s", e)
-
-    except Exception as e:
-        logger.warning("NATS connection failed (API will work without events): %s", e)
+    else:
+        logger.info("NATS startup disabled; Core API will run without event publishing.")
         _nats_cluster = None
         _nats_publisher = None
         _core_memory_mgr = None
@@ -191,6 +331,7 @@ async def lifespan(app: FastAPI):
     if pool:
         try:
             from memu.lane_lock import release_all_my_leases
+
             await release_all_my_leases(pool)
         except Exception as exc:
             logger.warning("Lease release during shutdown failed: %s", exc)
@@ -222,6 +363,18 @@ app.include_router(temporal_router, tags=["Async Workflows"])
 
 
 @app.middleware("http")
+async def metrics_middleware(request: Request, call_next):
+    start = time.perf_counter()
+    try:
+        response = await call_next(request)
+    except Exception:
+        _record_http_request(500, time.perf_counter() - start)
+        raise
+    _record_http_request(response.status_code, time.perf_counter() - start)
+    return response
+
+
+@app.middleware("http")
 async def shutdown_guard(request: Request, call_next):
     """Return 503 for new requests when the pod is draining (SIGTERM received).
 
@@ -247,10 +400,11 @@ api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 class AuthContext(str):
     """Authenticated request context with tenant information.
-    
+
     Extends str for backward compatibility â€” existing endpoints that
     type-hint `_key: str` will still work. Access tenant_id via .tenant_id.
     """
+
     tenant_id: UUID
 
     def __new__(cls, api_key: str, tenant_id: UUID | None = None):
@@ -277,7 +431,7 @@ async def verify_api_key(
 @asynccontextmanager
 async def _tenant_conn(auth: AuthContext):
     """Helper: acquire a tenant-scoped connection (sets RLS context).
-    
+
     Usage in endpoints:
         auth = Depends(verify_api_key)
         async with _tenant_conn(auth) as conn:
@@ -285,6 +439,7 @@ async def _tenant_conn(auth: AuthContext):
     """
     async with tenant_connection(pool, auth.tenant_id) as conn:
         yield conn
+
 
 # TODO: MCP_MOUNT â€” Rosie to mount MCP server here
 # TODO: OTEL_STARTUP â€” Macklemore to wire OTel exporter into lifespan
@@ -324,6 +479,7 @@ def _cypher_string_literal(value: str) -> str:
 
 # --- Embedding ---
 
+
 async def get_embedding(text: str) -> list[float] | None:
     """Get embedding vector via NATS KV cache or external Serverless API.
 
@@ -331,7 +487,13 @@ async def get_embedding(text: str) -> list[float] | None:
     No ML models are loaded in the Gateway pod. NATS KV provides L1 semantic caching.
     """
     from memu.embeddings_client import get_embedding as _get_embedding
-    nc = _nats_cluster.active_connection if _nats_cluster else None
+
+    nc = None
+    if _nats_cluster:
+        try:
+            nc = _nats_cluster.active_connection
+        except Exception as e:
+            logger.warning("NATS embedding cache unavailable; continuing without cache: %s", e)
     return await _get_embedding(text, nc=nc)
 
 
@@ -340,6 +502,7 @@ def content_hash(text: str) -> str:
 
 
 # --- Helpers ---
+
 
 def _row_to_memory(row) -> Memory:
     metadata = row["metadata"]
@@ -350,17 +513,20 @@ def _row_to_memory(row) -> Memory:
         id=row["id"],
         content=row["content"],
         memory_type=row["memory_type"],
+        memory_kind=_record_value(row, "memory_kind", "learning"),
         agent_id=row["agent_id"],
         metadata=metadata,
         parent_id=row["parent_id"],
         confidence=row["confidence"],
         access_count=row["access_count"],
         decay_score=row["decay_score"],
-        salience_score=float(row.get("salience_score", 0.5) or 0.5),
-        searchable=bool(row.get("searchable", True)),
+        salience_score=float(_record_value(row, "salience_score", 0.5) or 0.5),
+        searchable=bool(_record_value(row, "searchable", True)),
+        review_status=_record_value(row, "review_status", None),
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )
+
 
 def _row_to_task(row) -> Task:
     metadata = row["metadata"]
@@ -504,7 +670,9 @@ def _extract_superseding_targets(
     return _coerce_uuid_list(targets)
 
 
-def _apply_superseding_metadata(metadata: dict[str, Any], superseded_ids: list[UUID]) -> dict[str, Any]:
+def _apply_superseding_metadata(
+    metadata: dict[str, Any], superseded_ids: list[UUID]
+) -> dict[str, Any]:
     payload = dict(metadata)
     if not superseded_ids:
         return payload
@@ -570,7 +738,9 @@ def _filter_current_search_rows(rows: list[Any], now: datetime | None = None) ->
     return filtered_rows
 
 
-async def _apply_superseding_operations(conn: Any, new_memory_id: UUID, superseded_ids: list[UUID]) -> None:
+async def _apply_superseding_operations(
+    conn: Any, new_memory_id: UUID, superseded_ids: list[UUID]
+) -> None:
     if not superseded_ids:
         return
 
@@ -637,15 +807,15 @@ def _rerank_lost_in_middle(results: list) -> list:
     if n <= 2:
         return results  # nothing to re-arrange
 
-    top_count = max(1, n // 5)       # 20%
-    bottom_count = max(1, n // 5)    # 20%
+    top_count = max(1, n // 5)  # 20%
+    bottom_count = max(1, n // 5)  # 20%
     # Ensure we don't over-allocate for very small lists
     if top_count + bottom_count >= n:
         return results
 
     top = results[:top_count]
-    bottom = results[top_count:top_count + bottom_count]
-    middle = results[top_count + bottom_count:]
+    bottom = results[top_count : top_count + bottom_count]
+    middle = results[top_count + bottom_count :]
 
     return top + middle + bottom
 
@@ -661,19 +831,134 @@ def _parse_optional_iso(value: str | None) -> datetime | None:
 
 # --- Routes ---
 
+
 @app.get("/health")
 async def health():
     try:
         async with pool.acquire() as conn:
             await conn.fetchval("SELECT 1")
-        return {"status": "healthy", "version": "0.1.0"}
     except Exception as e:
         raise HTTPException(status_code=503, detail=str(e))
+
+    from memu.embedding_contract import resolve_embedding_api_base
+
+    return {
+        "status": "healthy",
+        "version": "0.1.0",
+        "embedding_api": {"base_url": resolve_embedding_api_base()},
+    }
 
 
 @app.get("/api/v1/memu/health")
 async def memu_health_compat():
     return await health()
+
+
+async def _database_readiness() -> dict[str, Any]:
+    if pool is None:
+        return {"ok": False, "detail": "database pool is not initialized"}
+    try:
+        async with pool.acquire() as conn:
+            await conn.fetchval("SELECT 1")
+        return {"ok": True}
+    except Exception as exc:
+        return {"ok": False, "detail": str(exc)}
+
+
+async def _migration_readiness() -> dict[str, Any]:
+    if _migration_startup_error:
+        return {"ok": False, "detail": _migration_startup_error}
+    if not _migrations_ok:
+        return {"ok": False, "detail": "migrations have not completed successfully"}
+    if pool is None:
+        return {"ok": False, "detail": "database pool is not initialized"}
+
+    try:
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT
+                    count(*) FILTER (WHERE success IS FALSE) AS failed_count,
+                    count(*) AS applied_count
+                FROM schema_migrations
+                """
+            )
+    except Exception as exc:
+        return {"ok": False, "detail": str(exc)}
+
+    failed_count = int(row["failed_count"] or 0) if row else 0
+    applied_count = int(row["applied_count"] or 0) if row else 0
+    check: dict[str, Any] = {
+        "ok": failed_count == 0,
+        "failed_count": failed_count,
+        "applied_count": applied_count,
+    }
+    if failed_count:
+        check["detail"] = f"{failed_count} migration(s) are marked failed"
+    return check
+
+
+def _embedding_readiness() -> dict[str, Any]:
+    if _embedding_schema_ok:
+        return {"ok": True, "configured_dims": EMBEDDING_DIMS}
+    return {
+        "ok": False,
+        "configured_dims": EMBEDDING_DIMS,
+        "detail": "embedding schema does not match configured embedding contract",
+    }
+
+
+def _nats_startup_readiness() -> dict[str, Any]:
+    if not _startup_nats_enabled():
+        return {"ok": True, "required": False}
+    if _nats_cluster is None:
+        return {
+            "ok": False,
+            "required": True,
+            "detail": "startup NATS is enabled but not connected",
+        }
+    try:
+        _nats_cluster.active_connection
+    except Exception as exc:
+        return {"ok": False, "required": True, "detail": str(exc)}
+    return {"ok": True, "required": True}
+
+
+async def readiness_payload() -> tuple[int, dict[str, Any]]:
+    checks: dict[str, Any] = {
+        "database": await _database_readiness(),
+        "migrations": await _migration_readiness(),
+        "embedding_schema": _embedding_readiness(),
+    }
+
+    if _startup_nats_enabled():
+        checks["nats_startup"] = _nats_startup_readiness()
+
+    ready = all(check.get("ok") is True for check in checks.values())
+    if not ready:
+        _metrics["readiness_failures_total"] += 1
+    payload = {
+        "status": "ready" if ready else "not_ready",
+        "version": "0.1.0",
+        "checks": checks,
+    }
+    return (200 if ready else 503), payload
+
+
+@app.get("/ready")
+async def ready():
+    status_code, payload = await readiness_payload()
+    return JSONResponse(status_code=status_code, content=payload)
+
+
+@app.get("/api/v1/memu/ready")
+async def memu_ready_compat():
+    return await ready()
+
+
+@app.get("/metrics")
+async def metrics():
+    return PlainTextResponse(_render_metrics(), media_type="text/plain; version=0.0.4")
 
 
 @app.post("/memories", response_model=Memory)
@@ -687,65 +972,128 @@ async def create_memory(req: MemoryCreate, _key: str = Depends(verify_api_key)):
         invalidates=req.invalidates,
     )
     normalized_metadata = _apply_superseding_metadata(normalized_metadata, superseded_ids)
+
+    memory_kind = req.memory_kind.value
+    is_evidence = memory_kind == MemoryKind.evidence.value
+    idempotency_key = req.idempotency_key or None
+
+    # Canonical payload hash — only computed for evidence writes with an idempotency key.
+    # Excludes transport-only fields so retries with the same payload produce the same hash.
+    canonical_hash: str | None = None
+    if is_evidence and idempotency_key:
+        canonical_hash = compute_canonical_payload_hash(
+            content=req.content,
+            memory_type=req.memory_type.value,
+            agent_id=req.agent_id,
+            metadata=normalized_metadata,
+        )
+
     embedding = await get_embedding(req.content)
     c_hash = content_hash(req.content)
+    tenant_id = getattr(_key, "tenant_id", DEFAULT_TENANT_ID)
 
     async with _tenant_conn(_key) as conn:
-        # Check for duplicates (content hash always works; vector similarity only when embedding available)
-        if embedding is not None:
-            vec = f"vector({EMBEDDING_DIMS})"
-            existing = await conn.fetchrow(
-                f"""
-                SELECT id, 1 - (embedding <=> $1::{vec}) AS similarity
+        # --- Evidence Memory: idempotency check ---
+        # Evidence rows are never content-deduped across distinct events.
+        # Dedup is handled exclusively via (tenant_id, idempotency_key).
+        if is_evidence and idempotency_key:
+            existing_idem = await conn.fetchrow(
+                """
+                SELECT id, canonical_payload_hash
                 FROM memories
-                WHERE content_hash = $2 OR (1 - (embedding <=> $1::{vec})) > $3
-                ORDER BY similarity DESC
+                WHERE tenant_id = $1 AND idempotency_key = $2
                 LIMIT 1
                 """,
-                str(embedding),
-                c_hash,
-                DEDUP_THRESHOLD,
+                tenant_id,
+                idempotency_key,
             )
-        else:
-            existing = await conn.fetchrow(
-                "SELECT id, 1.0::float AS similarity FROM memories WHERE content_hash = $1 LIMIT 1",
-                c_hash,
-            )
+            if existing_idem:
+                stored_hash = existing_idem["canonical_payload_hash"]
+                if stored_hash == canonical_hash:
+                    # Exact replay — return the original memory unchanged
+                    row = await conn.fetchrow(
+                        "SELECT * FROM memories WHERE id = $1",
+                        existing_idem["id"],
+                    )
+                    return _row_to_memory(row)
+                else:
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "error": "idempotency_conflict",
+                            "message": (
+                                "An Evidence Memory with this idempotency_key already exists "
+                                "but its canonical payload hash differs from this request."
+                            ),
+                            "existing_id": str(existing_idem["id"]),
+                        },
+                    )
 
-        if existing and should_deduplicate(existing["similarity"], DEDUP_THRESHOLD):
-            # Update existing memory instead of duplicating
+        # --- Learning Memory: content-hash / vector dedup ---
+        # Evidence Memory skips this block — distinct task/session/gateway events
+        # must remain separate records even when their content is identical.
+        row = None
+        if not is_evidence:
+            if embedding is not None:
+                vec = f"vector({EMBEDDING_DIMS})"
+                existing = await conn.fetchrow(
+                    f"""
+                    SELECT id, 1 - (embedding <=> $1::{vec}) AS similarity
+                    FROM memories
+                    WHERE content_hash = $2 OR (1 - (embedding <=> $1::{vec})) > $3
+                    ORDER BY similarity DESC
+                    LIMIT 1
+                    """,
+                    str(embedding),
+                    c_hash,
+                    DEDUP_THRESHOLD,
+                )
+            else:
+                existing = await conn.fetchrow(
+                    "SELECT id, 1.0::float AS similarity FROM memories WHERE content_hash = $1 LIMIT 1",
+                    c_hash,
+                )
+
+            if existing and should_deduplicate(existing["similarity"], DEDUP_THRESHOLD):
+                row = await conn.fetchrow(
+                    """
+                    UPDATE memories SET
+                        access_count = access_count + 1,
+                        confidence = GREATEST(confidence, $2),
+                        metadata = metadata || $3::jsonb,
+                        updated_at = NOW()
+                    WHERE id = $1
+                    RETURNING *
+                    """,
+                    existing["id"],
+                    req.confidence,
+                    json.dumps(normalized_metadata),
+                )
+
+        # --- Insert new memory (evidence always reaches here; learning only when no dedup hit) ---
+        if row is None:
             row = await conn.fetchrow(
                 """
-                UPDATE memories SET
-                    access_count = access_count + 1,
-                    confidence = GREATEST(confidence, $2),
-                    metadata = metadata || $3::jsonb,
-                    updated_at = NOW()
-                WHERE id = $1
-                RETURNING *
-                """,
-                existing["id"],
-                req.confidence,
-                json.dumps(normalized_metadata),
-            )
-        else:
-            # Include tenant_id for RLS multi-tenancy
-            tenant_id = getattr(_key, 'tenant_id', DEFAULT_TENANT_ID)
-            row = await conn.fetchrow(
-                """
-                INSERT INTO memories (content, embedding, memory_type, agent_id, metadata, parent_id, confidence, content_hash, tenant_id)
-                VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9)
+                INSERT INTO memories (
+                    content, embedding, memory_type, memory_kind,
+                    agent_id, metadata, parent_id, confidence,
+                    content_hash, tenant_id, idempotency_key, canonical_payload_hash
+                )
+                VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $10, $11, $12)
                 RETURNING *
                 """,
                 req.content,
                 str(embedding) if embedding is not None else None,
                 req.memory_type.value,
+                memory_kind,
                 req.agent_id,
                 json.dumps(normalized_metadata),
                 req.parent_id,
                 req.confidence,
                 c_hash,
                 tenant_id,
+                idempotency_key,
+                canonical_hash,
             )
 
         superseded_ids = [value for value in superseded_ids if value != row["id"]]
@@ -783,15 +1131,17 @@ async def create_memory(req: MemoryCreate, _key: str = Depends(verify_api_key)):
                             WHERE id = $1
                             """,
                             memory.id,
-                            json.dumps({
-                                "entities": [
-                                    {
-                                        "name": rel.entity,
-                                        "relationship_type": rel.relationship_type,
-                                        "strength": rel.strength
-                                    }
-                                ]
-                            }),
+                            json.dumps(
+                                {
+                                    "entities": [
+                                        {
+                                            "name": rel.entity,
+                                            "relationship_type": rel.relationship_type,
+                                            "strength": rel.strength,
+                                        }
+                                    ]
+                                }
+                            ),
                         )
                 except Exception as e:
                     logger.warning(f"Failed to create relationship link: {e}")
@@ -817,8 +1167,10 @@ class MemUAddCompatRequest(BaseModel):
     text: str | None = None
     agent_id: str = "unknown"
     memory_type: MemoryType = MemoryType.observation
+    memory_kind: MemoryKind = MemoryKind.learning
     metadata: dict[str, Any] | None = None
     confidence: float = 1.0
+    idempotency_key: str | None = None
 
 
 class MemUAddCompatResponse(BaseModel):
@@ -844,16 +1196,29 @@ async def memu_add_compat(req: MemUAddCompatRequest, _key: str = Depends(verify_
             message="Missing required field: content",
         )
 
-    memory = await create_memory(
-        MemoryCreate(
-            content=req.content,
-            agent_id=req.agent_id,
-            memory_type=req.memory_type,
-            metadata=req.metadata,
-            confidence=req.confidence,
-        ),
-        _key=_key,
-    )
+    try:
+        memory = await create_memory(
+            MemoryCreate(
+                content=req.content,
+                agent_id=req.agent_id,
+                memory_type=req.memory_type,
+                memory_kind=req.memory_kind,
+                metadata=req.metadata,
+                confidence=req.confidence,
+                idempotency_key=req.idempotency_key,
+            ),
+            _key=_key,
+        )
+    except HTTPException as exc:
+        if exc.status_code == 409:
+            detail = exc.detail if isinstance(exc.detail, dict) else {}
+            return MemUAddCompatResponse(
+                ok=False,
+                id=detail.get("existing_id"),
+                error_code="IDEMPOTENCY_CONFLICT",
+                message=detail.get("message", "Idempotency conflict"),
+            )
+        raise
     return MemUAddCompatResponse(ok=True, id=str(memory.id), message="Memory stored")
 
 
@@ -880,34 +1245,33 @@ async def memories_search_compat(
     return await search_memories(req, _key=_key)
 
 
-
 @app.get("/memories/recent", response_model=list[Memory])
 async def get_recent_memories(
     limit: int = 10,
     agent_id: str | None = None,
     memory_type: str | None = None,
-    _key: str = Depends(verify_api_key)
+    _key: str = Depends(verify_api_key),
 ):
     query = "SELECT * FROM memories "
     conditions = []
     args = []
-    
+
     if agent_id:
         args.append(agent_id)
         conditions.append(f"agent_id = ${len(args)}")
     if memory_type:
         args.append(memory_type)
         conditions.append(f"memory_type = ${len(args)}")
-        
+
     if conditions:
         query += "WHERE " + " AND ".join(conditions)
-        
+
     args.append(limit)
     query += f" ORDER BY created_at DESC LIMIT ${len(args)}"
-    
+
     async with pool.acquire() as conn:
         rows = await conn.fetch(query, *args)
-        
+
     return [_row_to_memory(row) for row in rows]
 
 
@@ -915,14 +1279,19 @@ async def get_recent_memories(
 async def get_stats(_key: str = Depends(verify_api_key)):
     async with pool.acquire() as conn:
         total = await conn.fetchval("SELECT COUNT(*) FROM memories")
-        by_type_rows = await conn.fetch("SELECT memory_type, COUNT(*) FROM memories GROUP BY memory_type")
-        by_agent_rows = await conn.fetch("SELECT agent_id, COUNT(*) FROM memories GROUP BY agent_id")
-    
+        by_type_rows = await conn.fetch(
+            "SELECT memory_type, COUNT(*) FROM memories GROUP BY memory_type"
+        )
+        by_agent_rows = await conn.fetch(
+            "SELECT agent_id, COUNT(*) FROM memories GROUP BY agent_id"
+        )
+
     return {
         "total": total,
         "by_type": {row["memory_type"]: row["count"] for row in by_type_rows},
-        "by_agent": {row["agent_id"]: row["count"] for row in by_agent_rows}
+        "by_agent": {row["agent_id"]: row["count"] for row in by_agent_rows},
     }
+
 
 @app.get("/memories/{memory_id}", response_model=Memory)
 async def get_memory(memory_id: UUID, _key: str = Depends(verify_api_key)):
@@ -1001,7 +1370,7 @@ async def search_memories(req: SearchRequest, _key: str = Depends(verify_api_key
             )
         results.sort(key=lambda r: r.final_score, reverse=True)
         return results[: req.limit]
-    
+
     filters = ["valid_to IS NULL"]
     params: list[Any] = [str(embedding)]
     idx = 2
@@ -1087,7 +1456,7 @@ async def search_memories(req: SearchRequest, _key: str = Depends(verify_api_key
                 f"""
                 SELECT *, 0.45::float8 AS similarity
                 FROM memories
-                WHERE {' AND '.join(lexical_filters)}
+                WHERE {" AND ".join(lexical_filters)}
                 ORDER BY updated_at DESC
                 LIMIT {req.limit}
                 """,
@@ -1150,7 +1519,7 @@ async def search_memories(req: SearchRequest, _key: str = Depends(verify_api_key
                 len(final),
                 "vector",
                 json.dumps({"temporal_weight": req.temporal_weight, "limit": req.limit}),
-                emb_str
+                emb_str,
             )
     except Exception as e:
         # Log at debug level â€” search_history logging failure is non-critical
@@ -1200,7 +1569,9 @@ class MemUSearchCompatRequest(BaseModel):
 
 
 @app.post("/api/v1/memu/search")
-async def memu_search_post_compat(req: MemUSearchCompatRequest, _key: str = Depends(verify_api_key)):
+async def memu_search_post_compat(
+    req: MemUSearchCompatRequest, _key: str = Depends(verify_api_key)
+):
     search_req = SearchRequest(
         query=req.query,
         limit=req.limit,
@@ -1211,6 +1582,830 @@ async def memu_search_post_compat(req: MemUSearchCompatRequest, _key: str = Depe
         entity_weight=req.entity_weight,
     )
     return await search_memories(search_req, _key=_key)
+
+
+# ---------------------------------------------------------------------------
+# Recall contract helpers
+# ---------------------------------------------------------------------------
+
+# review_status values that are eligible for default Learning recall.
+_LEARNING_RECALL_REVIEW_STATUSES: tuple[str, ...] = (
+    "accepted",
+    "legacy",
+    "accepted_by_timeout",
+)
+
+
+def _has_role_access(allowed_roles: list[str], agent_roles: list[str] | None) -> bool:
+    """Return True if the caller's roles grant access to the memory.
+
+    A memory with ['*'] in allowed_roles is accessible to everyone.
+    When agent_roles is None, no role filtering is applied (trusted caller).
+    """
+    if agent_roles is None:
+        return True
+    if "*" in allowed_roles:
+        return True
+    return bool(set(allowed_roles) & set(agent_roles))
+
+
+def _build_forensic_item(
+    row: Any,
+    include_content: bool,
+    agent_roles: list[str] | None,
+) -> ForensicRecallItem:
+    """Construct a ForensicRecallItem from a DB row, applying redaction rules."""
+    metadata: dict[str, Any] = row.get("metadata") or {}
+    if isinstance(metadata, str):
+        metadata = json.loads(metadata)
+
+    allowed_roles: list[str] = metadata.get("allowed_roles") or ["*"]
+
+    # Determine redaction
+    redacted = False
+    redaction_reason: str | None = None
+    content: str | None = row.get("content")
+
+    if not include_content:
+        redacted = True
+        redaction_reason = "content_excluded_by_request"
+        content = None
+    elif not _has_role_access(allowed_roles, agent_roles):
+        redacted = True
+        redaction_reason = "role_access_denied"
+        content = None
+
+    # Extract provenance links from metadata (source evidence IDs, correction chains)
+    provenance_links: list[str] = []
+    for key in ("source_evidence_ids", "superseded_ids", "correction_of"):
+        val = metadata.get(key)
+        if isinstance(val, list):
+            provenance_links.extend(str(v) for v in val)
+        elif isinstance(val, str) and val:
+            provenance_links.append(val)
+
+    # artifact_refs may be a list or a comma-separated string in metadata
+    artifact_refs: list[str] = []
+    raw_refs = metadata.get("artifact_refs")
+    if isinstance(raw_refs, list):
+        artifact_refs = [str(r) for r in raw_refs]
+    elif isinstance(raw_refs, str) and raw_refs:
+        artifact_refs = [raw_refs]
+
+    event_at_raw = metadata.get("event_at")
+    event_at: datetime | None = None
+    if event_at_raw:
+        try:
+            event_at = datetime.fromisoformat(str(event_at_raw).replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            pass
+
+    return ForensicRecallItem(
+        evidence_id=row["id"],
+        memory_kind=row.get("memory_kind") or "evidence",
+        memory_type=row.get("memory_type") or "unknown",
+        content=content,
+        redacted=redacted,
+        redaction_reason=redaction_reason,
+        event_type=metadata.get("event_type"),
+        event_at=event_at,
+        task_id=metadata.get("task_id"),
+        session_id=metadata.get("session_id"),
+        gateway_id=metadata.get("gateway_id"),
+        agent_id=row.get("agent_id") or "",
+        source=metadata.get("source"),
+        source_ref=metadata.get("source_ref"),
+        artifact_refs=artifact_refs,
+        allowed_roles=allowed_roles,
+        provenance_links=provenance_links,
+        created_at=row["created_at"],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Learning Recall endpoint — default recall mode, Learning Memory only
+# ---------------------------------------------------------------------------
+
+
+@app.post("/api/v1/recall", response_model=list[SearchResult])
+async def learning_recall(req: SearchRequest, _key: str = Depends(verify_api_key)):
+    """Default recall: returns Learning Memory only (accepted, legacy, accepted_by_timeout).
+
+    Evidence Memory is never included.  Supports vector, lexical, and temporal fusion.
+    This is the correct endpoint for injecting reusable guidance into OpenClaw context.
+    """
+    embedding = await get_embedding(req.query)
+
+    # Learnnig-only hard filters appended to every query in this endpoint.
+    learning_kind_sql = "memory_kind = 'learning'"
+    review_statuses_sql = "review_status IN ('accepted', 'legacy', 'accepted_by_timeout')"
+
+    async with _tenant_conn(_key) as conn:
+        if embedding is None:
+            logger.warning(
+                "Embedding unavailable for /api/v1/recall; falling back to lexical search"
+            )
+            filters = [
+                "content ILIKE $1",
+                "valid_to IS NULL",
+                learning_kind_sql,
+                review_statuses_sql,
+            ]
+            params: list[Any] = [f"%{req.query}%"]
+            idx = 2
+            if req.agent_id:
+                filters.append(f"agent_id = ${idx}")
+                params.append(req.agent_id)
+                idx += 1
+            if req.memory_type:
+                filters.append(f"memory_type = ${idx}")
+                params.append(req.memory_type.value)
+                idx += 1
+            where = " AND ".join(filters)
+            rows = await conn.fetch(
+                f"""
+                SELECT *, 0.0::float8 AS similarity
+                FROM memories
+                WHERE {where}
+                ORDER BY updated_at DESC
+                LIMIT {req.limit}
+                """,
+                *params,
+            )
+            results = []
+            for row in rows:
+                score = compute_final_score(
+                    similarity=0.5,
+                    created_at=row["created_at"],
+                    access_count=row["access_count"],
+                    decay_rate=DECAY_RATE,
+                    temporal_weight=req.temporal_weight,
+                    salience_score=float(row.get("salience_score", 0.5) or 0.5),
+                )
+                results.append(
+                    SearchResult(memory=_row_to_memory(row), similarity=0.0, final_score=score)
+                )
+            results.sort(key=lambda r: r.final_score, reverse=True)
+            return results[: req.limit]
+
+        # Vector search path
+        filters = [
+            "valid_to IS NULL",
+            learning_kind_sql,
+            review_statuses_sql,
+        ]
+        params = [str(embedding)]
+        idx = 2
+        if req.agent_id:
+            filters.append(f"agent_id = ${idx}")
+            params.append(req.agent_id)
+            idx += 1
+        if req.memory_type:
+            filters.append(f"memory_type = ${idx}")
+            params.append(req.memory_type.value)
+            idx += 1
+        if req.min_confidence > 0:
+            filters.append(f"confidence >= ${idx}")
+            params.append(req.min_confidence)
+            idx += 1
+        if req.time_window_start:
+            filters.append(f"created_at >= ${idx}")
+            params.append(req.time_window_start)
+            idx += 1
+        if req.time_window_end:
+            filters.append(f"created_at <= ${idx}")
+            params.append(req.time_window_end)
+            idx += 1
+        if req.agent_roles:
+            filters.append(
+                f"(metadata->'allowed_roles' @> '\"*\"'::jsonb "
+                f"OR metadata->'allowed_roles' && ${idx}::jsonb)"
+            )
+            params.append(json.dumps(req.agent_roles))
+            idx += 1
+
+        where = " AND ".join(filters)
+        vec = f"vector({EMBEDDING_DIMS})"
+        rows = []
+        min_results = max(1, min(req.limit, req.min_results))
+        for current_limit in _expansion_schedule(req.limit * 2, req.max_expansion_steps):
+            rows = await conn.fetch(
+                f"""
+                SELECT *, 1 - (embedding <=> $1::{vec}) AS similarity
+                FROM memories
+                WHERE embedding IS NOT NULL AND {where}
+                ORDER BY embedding <=> $1::{vec}
+                LIMIT {current_limit}
+                """,
+                *params,
+            )
+            if len(rows) >= min_results:
+                break
+
+        # Lexical fallback when vector results are sparse
+        if req.lexical_fallback and len(rows) < min_results:
+            lex_filters = [
+                "content ILIKE $1",
+                "valid_to IS NULL",
+                learning_kind_sql,
+                review_statuses_sql,
+            ]
+            lex_params: list[Any] = [f"%{req.query}%"]
+            lidx = 2
+            if req.agent_id:
+                lex_filters.append(f"agent_id = ${lidx}")
+                lex_params.append(req.agent_id)
+                lidx += 1
+            if req.memory_type:
+                lex_filters.append(f"memory_type = ${lidx}")
+                lex_params.append(req.memory_type.value)
+                lidx += 1
+            lex_rows = await conn.fetch(
+                f"""
+                SELECT *, 0.45::float8 AS similarity
+                FROM memories
+                WHERE {" AND ".join(lex_filters)}
+                ORDER BY updated_at DESC
+                LIMIT {req.limit}
+                """,
+                *lex_params,
+            )
+            existing_ids = {r["id"] for r in rows}
+            for r in lex_rows:
+                if r["id"] not in existing_ids:
+                    rows.append(r)
+
+    results = []
+    for row in rows:
+        score = compute_final_score(
+            similarity=row["similarity"],
+            created_at=row["created_at"],
+            access_count=row["access_count"],
+            decay_rate=DECAY_RATE,
+            temporal_weight=req.temporal_weight,
+            salience_score=float(row.get("salience_score", 0.5) or 0.5),
+        )
+        entity_overlap = _entity_overlap_score(req.query, row["content"])
+        score = (1 - req.entity_weight) * score + (req.entity_weight * entity_overlap)
+        results.append(
+            SearchResult(
+                memory=_row_to_memory(row), similarity=row["similarity"], final_score=score
+            )
+        )
+    results.sort(key=lambda r: r.final_score, reverse=True)
+    return results[: req.limit]
+
+
+# ---------------------------------------------------------------------------
+# Forensic Recall endpoint — explicit mode, Evidence Memory with provenance
+# ---------------------------------------------------------------------------
+
+
+@app.post("/api/v1/recall/forensic", response_model=ForensicRecallResponse)
+async def forensic_recall(req: ForensicRecallRequest, _key: str = Depends(verify_api_key)):
+    """Forensic Recall: returns Evidence Memory with replay-grade provenance.
+
+    Supports task/session/gateway/agent/event-type/artifact filters, cursor-based
+    pagination, ABAC role filtering, and per-record redaction when the caller lacks
+    the required role or explicitly excludes content.
+    """
+    filters: list[str] = [
+        "memory_kind = 'evidence'",
+        "valid_to IS NULL",
+    ]
+    params: list[Any] = []
+    idx = 1
+
+    if req.task_id:
+        filters.append(f"metadata->>'task_id' = ${idx}")
+        params.append(req.task_id)
+        idx += 1
+    if req.session_id:
+        filters.append(f"metadata->>'session_id' = ${idx}")
+        params.append(req.session_id)
+        idx += 1
+    if req.gateway_id:
+        filters.append(f"metadata->>'gateway_id' = ${idx}")
+        params.append(req.gateway_id)
+        idx += 1
+    if req.agent_id:
+        filters.append(f"agent_id = ${idx}")
+        params.append(req.agent_id)
+        idx += 1
+    if req.event_type:
+        filters.append(f"metadata->>'event_type' = ${idx}")
+        params.append(req.event_type)
+        idx += 1
+    if req.time_window_start:
+        filters.append(f"created_at >= ${idx}")
+        params.append(req.time_window_start)
+        idx += 1
+    if req.time_window_end:
+        filters.append(f"created_at <= ${idx}")
+        params.append(req.time_window_end)
+        idx += 1
+    if req.artifact_ref:
+        filters.append(f"metadata->'artifact_refs' @> ${idx}::jsonb")
+        params.append(json.dumps([req.artifact_ref]))
+        idx += 1
+
+    # Cursor-based pagination: cursor encodes "created_at__id" boundary
+    if req.cursor:
+        try:
+            cursor_ts_str, cursor_id = req.cursor.rsplit("__", 1)
+            filters.append(
+                f"(created_at > ${idx}::timestamptz OR "
+                f"(created_at = ${idx}::timestamptz AND id::text > ${idx + 1}))"
+            )
+            params.append(cursor_ts_str)
+            params.append(cursor_id)
+            idx += 2
+        except (ValueError, AttributeError):
+            raise HTTPException(status_code=400, detail="Invalid pagination cursor.")
+
+    where = " AND ".join(filters)
+
+    # Fetch limit+1 to detect whether another page exists
+    fetch_limit = req.limit + 1
+    async with _tenant_conn(_key) as conn:
+        rows = await conn.fetch(
+            f"""
+            SELECT id, content, memory_type, memory_kind, agent_id,
+                   metadata, created_at, valid_to
+            FROM memories
+            WHERE {where}
+            ORDER BY created_at ASC, id ASC
+            LIMIT {fetch_limit}
+            """,
+            *params,
+        )
+
+    has_next = len(rows) > req.limit
+    page_rows = list(rows[: req.limit])
+
+    items = [_build_forensic_item(row, req.include_content, req.agent_roles) for row in page_rows]
+
+    next_cursor: str | None = None
+    if has_next and page_rows:
+        last = page_rows[-1]
+        next_cursor = f"{last['created_at'].isoformat()}__{last['id']}"
+
+    return ForensicRecallResponse(items=items, next_cursor=next_cursor)
+
+
+# ---------------------------------------------------------------------------
+# Reflection Review Queue endpoints (Issue #28)
+# ---------------------------------------------------------------------------
+
+
+def _row_to_proposal(row: Any) -> ReflectionProposal:
+    """Convert a reflection_proposals DB row to a ReflectionProposal model."""
+    risk_flags = row.get("risk_flags") or []
+    if isinstance(risk_flags, str):
+        risk_flags = json.loads(risk_flags)
+
+    source_evidence_ids = row.get("source_evidence_ids") or []
+    if isinstance(source_evidence_ids, str):
+        source_evidence_ids = json.loads(source_evidence_ids)
+
+    return ReflectionProposal(
+        proposal_id=row["proposal_id"],
+        tenant_id=str(row["tenant_id"]),
+        status=row["status"],
+        source=row["source"],
+        summary=row["summary"],
+        content=row["content"],
+        confidence=float(row["confidence"]),
+        risk_flags=list(risk_flags),
+        source_task_id=row.get("source_task_id"),
+        source_session_id=row.get("source_session_id"),
+        source_evidence_ids=list(source_evidence_ids),
+        expires_at=row["expires_at"],
+        telegram_message_id=row.get("telegram_message_id"),
+        memory_id=row.get("memory_id"),
+        superseded_by=row.get("superseded_by"),
+        agent_id=row.get("agent_id") or "unknown",
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
+
+
+async def _write_accepted_learning_memory(
+    conn: Any,
+    proposal: Any,
+    content: str,
+    review_status: str,
+    tenant_id: str,
+    supersedes_id: Optional[UUID] = None,
+) -> UUID:
+    """Write a Learning Memory to the memories table for an accepted proposal.
+
+    Returns the new memory's UUID. Sets review_status explicitly so the memory
+    is immediately eligible for default (learning) recall.
+    """
+    meta: dict[str, Any] = {
+        "source": "reflection",
+        "proposal_id": str(proposal["proposal_id"]),
+        "source_task_id": proposal.get("source_task_id"),
+        "source_session_id": proposal.get("source_session_id"),
+        "source_evidence_ids": list(proposal.get("source_evidence_ids") or []),
+        "allowed_roles": ["*"],
+    }
+    if supersedes_id:
+        meta["supersedes"] = str(supersedes_id)
+
+    c_hash = content_hash(content)
+    row = await conn.fetchrow(
+        """
+        INSERT INTO memories (
+            content, memory_type, memory_kind, agent_id, metadata,
+            confidence, content_hash, tenant_id, review_status
+        )
+        VALUES ($1, 'lesson', 'learning', $2, $3::jsonb, $4, $5, $6, $7)
+        RETURNING id
+        """,
+        content,
+        proposal.get("agent_id") or "reflection-worker",
+        json.dumps(meta),
+        float(proposal["confidence"]),
+        c_hash,
+        tenant_id,
+        review_status,
+    )
+    new_id = row["id"]
+
+    # If this supersedes an earlier memory, mark that memory invalid
+    if supersedes_id:
+        now = datetime.now(timezone.utc)
+        await conn.execute(
+            """
+            UPDATE memories
+            SET valid_to = COALESCE(valid_to, $2),
+                metadata = COALESCE(metadata, '{}'::jsonb)
+                    || jsonb_build_object('invalidated_by', $1::text, 'invalidated_at', $2::text),
+                updated_at = NOW()
+            WHERE id = $3
+              AND (valid_to IS NULL OR valid_to > $2)
+            """,
+            str(new_id),
+            now,
+            supersedes_id,
+        )
+
+    return new_id
+
+
+@app.post("/api/v1/reflections/proposals", response_model=ReflectionProposal)
+async def create_reflection_proposal(
+    req: ReflectionProposalCreate,
+    _key: str = Depends(verify_api_key),
+):
+    """Create a reflection proposal entering the 6-hour review window.
+
+    The proposal is stored as 'pending' until approved, denied, edited,
+    or automatically integrated after the review window expires.
+    """
+    tenant_id = str(getattr(_key, "tenant_id", DEFAULT_TENANT_ID))
+    now = datetime.now(timezone.utc)
+    expires_at = compute_proposal_expiry(now)
+
+    async with _tenant_conn(_key) as conn:
+        row = await conn.fetchrow(
+            """
+            INSERT INTO reflection_proposals (
+                tenant_id, status, source, summary, content, confidence,
+                risk_flags, source_task_id, source_session_id,
+                source_evidence_ids, expires_at, agent_id
+            )
+            VALUES ($1, 'pending', $2, $3, $4, $5, $6::jsonb, $7, $8, $9::jsonb, $10, $11)
+            RETURNING *
+            """,
+            tenant_id,
+            req.source.value,
+            req.summary,
+            req.content,
+            req.confidence,
+            json.dumps(req.risk_flags),
+            req.source_task_id,
+            req.source_session_id,
+            json.dumps(req.source_evidence_ids),
+            expires_at,
+            req.agent_id,
+        )
+
+    return _row_to_proposal(row)
+
+
+@app.get("/api/v1/reflections/proposals", response_model=list[ReflectionProposal])
+async def list_reflection_proposals(
+    status: Optional[str] = None,
+    source: Optional[str] = None,
+    limit: int = 20,
+    _key: str = Depends(verify_api_key),
+):
+    """List reflection proposals for the current tenant.
+
+    Defaults to pending proposals. Supports status and source filters.
+    """
+    tenant_id = str(getattr(_key, "tenant_id", DEFAULT_TENANT_ID))
+    filters = ["tenant_id = $1"]
+    params: list[Any] = [tenant_id]
+    idx = 2
+
+    if status:
+        filters.append(f"status = ${idx}")
+        params.append(status)
+        idx += 1
+    else:
+        filters.append("status = 'pending'")
+
+    if source:
+        filters.append(f"source = ${idx}")
+        params.append(source)
+        idx += 1
+
+    where = " AND ".join(filters)
+    async with _tenant_conn(_key) as conn:
+        rows = await conn.fetch(
+            f"""
+            SELECT * FROM reflection_proposals
+            WHERE {where}
+            ORDER BY expires_at ASC
+            LIMIT {limit}
+            """,
+            *params,
+        )
+
+    return [_row_to_proposal(row) for row in rows]
+
+
+@app.get("/api/v1/reflections/proposals/{proposal_id}", response_model=ReflectionProposal)
+async def get_reflection_proposal(
+    proposal_id: UUID,
+    _key: str = Depends(verify_api_key),
+):
+    """Fetch a single reflection proposal by ID."""
+    tenant_id = str(getattr(_key, "tenant_id", DEFAULT_TENANT_ID))
+    async with _tenant_conn(_key) as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM reflection_proposals WHERE proposal_id = $1 AND tenant_id = $2",
+            proposal_id,
+            tenant_id,
+        )
+    if not row:
+        raise HTTPException(status_code=404, detail="Proposal not found")
+    return _row_to_proposal(row)
+
+
+@app.post(
+    "/api/v1/reflections/proposals/{proposal_id}/action",
+    response_model=ReflectionActionResponse,
+)
+async def take_reflection_action(
+    proposal_id: UUID,
+    req: ReflectionActionRequest,
+    _key: str = Depends(verify_api_key),
+):
+    """Take action on a reflection proposal: approve, deny, edit, or inspect.
+
+    approve  — accepts the proposal and writes the Learning Memory.
+    deny     — rejects the proposal; no memory is written.
+    edit     — accepts with modified content and writes the Learning Memory.
+               If the proposal is already accepted/accepted_by_timeout,
+               creates a superseding Learning Memory (late feedback) without
+               mutating the original accepted record.
+    inspect  — logs the review action; proposal status is unchanged.
+               Returns the proposal with source evidence IDs for forensic recall.
+    """
+    tenant_id = str(getattr(_key, "tenant_id", DEFAULT_TENANT_ID))
+    decision = req.decision
+
+    async with _tenant_conn(_key) as conn:
+        proposal_row = await conn.fetchrow(
+            "SELECT * FROM reflection_proposals WHERE proposal_id = $1 AND tenant_id = $2",
+            proposal_id,
+            tenant_id,
+        )
+        if not proposal_row:
+            raise HTTPException(status_code=404, detail="Proposal not found")
+
+        current_status = proposal_row["status"]
+        memory_id: Optional[UUID] = None
+        supersedes_id: Optional[UUID] = None
+        new_status = current_status
+
+        if decision == ReflectionAction.inspect:
+            # inspect: record the action, leave status unchanged
+            await conn.execute(
+                """
+                INSERT INTO reflection_actions (proposal_id, actor, decision, notes)
+                VALUES ($1, $2, 'inspect', $3)
+                """,
+                proposal_id,
+                req.actor,
+                req.notes,
+            )
+            return ReflectionActionResponse(
+                proposal_id=proposal_id,
+                decision="inspect",
+                status=current_status,
+                memory_id=proposal_row.get("memory_id"),
+            )
+
+        if decision == ReflectionAction.deny:
+            if current_status not in ("pending",):
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Cannot deny a proposal with status '{current_status}'.",
+                )
+            new_status = "rejected"
+            await conn.execute(
+                "UPDATE reflection_proposals SET status = 'rejected', updated_at = NOW() "
+                "WHERE proposal_id = $1",
+                proposal_id,
+            )
+            await conn.execute(
+                """
+                INSERT INTO reflection_actions (proposal_id, actor, decision, notes)
+                VALUES ($1, $2, 'deny', $3)
+                """,
+                proposal_id,
+                req.actor,
+                req.notes,
+            )
+            return ReflectionActionResponse(
+                proposal_id=proposal_id,
+                decision="deny",
+                status=new_status,
+            )
+
+        if decision == ReflectionAction.approve:
+            if current_status != "pending":
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Cannot approve a proposal with status '{current_status}'.",
+                )
+            new_status = "accepted"
+            memory_id = await _write_accepted_learning_memory(
+                conn=conn,
+                proposal=proposal_row,
+                content=proposal_row["content"],
+                review_status="accepted",
+                tenant_id=tenant_id,
+            )
+            await conn.execute(
+                "UPDATE reflection_proposals SET status = 'accepted', memory_id = $2, "
+                "updated_at = NOW() WHERE proposal_id = $1",
+                proposal_id,
+                memory_id,
+            )
+            await conn.execute(
+                """
+                INSERT INTO reflection_actions (proposal_id, actor, decision, notes)
+                VALUES ($1, $2, 'approve', $3)
+                """,
+                proposal_id,
+                req.actor,
+                req.notes,
+            )
+            return ReflectionActionResponse(
+                proposal_id=proposal_id,
+                decision="approve",
+                status=new_status,
+                memory_id=memory_id,
+            )
+
+        if decision == ReflectionAction.edit:
+            edited = req.edited_content
+            if not edited:
+                raise HTTPException(
+                    status_code=422,
+                    detail="edited_content is required for the 'edit' action.",
+                )
+
+            if current_status == "pending":
+                # Normal edit-and-accept path
+                new_status = "accepted"
+                memory_id = await _write_accepted_learning_memory(
+                    conn=conn,
+                    proposal=proposal_row,
+                    content=edited,
+                    review_status="accepted",
+                    tenant_id=tenant_id,
+                )
+                await conn.execute(
+                    "UPDATE reflection_proposals SET status = 'accepted', memory_id = $2, "
+                    "updated_at = NOW() WHERE proposal_id = $1",
+                    proposal_id,
+                    memory_id,
+                )
+            elif current_status in ("accepted", "accepted_by_timeout"):
+                # Late feedback: create superseding memory without mutating history
+                original_memory_id: Optional[UUID] = proposal_row.get("memory_id")
+                supersedes_id = original_memory_id
+                new_status = "superseded"
+                memory_id = await _write_accepted_learning_memory(
+                    conn=conn,
+                    proposal=proposal_row,
+                    content=edited,
+                    review_status="accepted",
+                    tenant_id=tenant_id,
+                    supersedes_id=original_memory_id,
+                )
+                await conn.execute(
+                    "UPDATE reflection_proposals SET status = 'superseded', superseded_by = $2, "
+                    "updated_at = NOW() WHERE proposal_id = $1",
+                    proposal_id,
+                    proposal_id,
+                )
+            else:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Cannot edit a proposal with status '{current_status}'.",
+                )
+
+            await conn.execute(
+                """
+                INSERT INTO reflection_actions
+                    (proposal_id, actor, decision, notes, edited_content)
+                VALUES ($1, $2, 'edit', $3, $4)
+                """,
+                proposal_id,
+                req.actor,
+                req.notes,
+                edited,
+            )
+            return ReflectionActionResponse(
+                proposal_id=proposal_id,
+                decision="edit",
+                status=new_status,
+                memory_id=memory_id,
+                supersedes_id=supersedes_id,
+            )
+
+    # Should not reach here
+    raise HTTPException(status_code=422, detail="Unrecognised action.")  # pragma: no cover
+
+
+@app.post("/api/v1/reflections/process-timeouts")
+async def process_reflection_timeouts(_key: str = Depends(verify_api_key)):
+    """Process expired pending proposals and integrate them as accepted_by_timeout.
+
+    For each proposal whose review window has closed and is still pending:
+      1. Writes the Learning Memory with review_status='accepted_by_timeout'.
+      2. Updates the proposal status to 'accepted_by_timeout'.
+      3. Records a 'timeout_accept' action in the audit trail.
+
+    Returns the count of proposals processed.
+    """
+    tenant_id = str(getattr(_key, "tenant_id", DEFAULT_TENANT_ID))
+    now = datetime.now(timezone.utc)
+    processed = 0
+
+    async with _tenant_conn(_key) as conn:
+        expired_rows = await conn.fetch(
+            """
+            SELECT * FROM reflection_proposals
+            WHERE tenant_id = $1
+              AND status = 'pending'
+              AND expires_at <= $2
+            ORDER BY expires_at ASC
+            """,
+            tenant_id,
+            now,
+        )
+
+        for row in expired_rows:
+            pid = row["proposal_id"]
+            try:
+                memory_id = await _write_accepted_learning_memory(
+                    conn=conn,
+                    proposal=row,
+                    content=row["content"],
+                    review_status="accepted_by_timeout",
+                    tenant_id=tenant_id,
+                )
+                await conn.execute(
+                    "UPDATE reflection_proposals "
+                    "SET status = 'accepted_by_timeout', memory_id = $2, updated_at = NOW() "
+                    "WHERE proposal_id = $1",
+                    pid,
+                    memory_id,
+                )
+                await conn.execute(
+                    """
+                    INSERT INTO reflection_actions
+                        (proposal_id, actor, decision, notes)
+                    VALUES ($1, 'system', 'timeout_accept', $2)
+                    """,
+                    pid,
+                    f"Review window expired at {now.isoformat()}",
+                )
+                processed += 1
+            except Exception as exc:
+                logger.error("Failed to process timeout for proposal %s: %s", pid, exc)
+
+    return {"processed": processed, "timestamp": now.isoformat()}
 
 
 @app.get("/search-text")
@@ -1274,7 +2469,9 @@ class MemUSearchTextCompatRequest(BaseModel):
 
 
 @app.post("/api/v1/memu/search-text")
-async def memu_search_text_post_compat(req: MemUSearchTextCompatRequest, _key: str = Depends(verify_api_key)):
+async def memu_search_text_post_compat(
+    req: MemUSearchTextCompatRequest, _key: str = Depends(verify_api_key)
+):
     return await search_text(
         query=req.query,
         agent_id=req.agent_id,
@@ -1541,7 +2738,7 @@ async def update_task(task_id: UUID, req: TaskUpdate, _key: str = Depends(verify
     if not updates:
         raise HTTPException(status_code=400, detail="No update fields provided")
 
-    updates.append(f"updated_at = NOW()")
+    updates.append("updated_at = NOW()")
     values.append(task_id)
 
     query = "UPDATE backlog SET " + ", ".join(updates) + f" WHERE id = ${idx} RETURNING *"
@@ -1634,6 +2831,8 @@ async def review_task(task_id: UUID, req: TaskReviewRequest, _key: str = Depends
             logger.warning("Failed to emit task review event: %s", exc)
 
     return task
+
+
 @app.get("/api/v1/gateway-leases/{lease_key:path}", response_model=GatewayLease)
 async def get_gateway_lease(lease_key: str, _key: str = Depends(verify_api_key)):
     async with _tenant_conn(_key) as conn:
@@ -1647,7 +2846,9 @@ async def get_gateway_lease(lease_key: str, _key: str = Depends(verify_api_key))
 
 
 @app.post("/api/v1/gateway-leases/acquire", response_model=GatewayLeaseAcquireResponse)
-async def acquire_gateway_lease(req: GatewayLeaseAcquireRequest, _key: str = Depends(verify_api_key)):
+async def acquire_gateway_lease(
+    req: GatewayLeaseAcquireRequest, _key: str = Depends(verify_api_key)
+):
     now = datetime.now(timezone.utc)
     expires_at = now.replace(microsecond=0) + timedelta(seconds=req.ttl_seconds)
     status = "claimed"
@@ -1751,14 +2952,18 @@ async def renew_gateway_lease(req: GatewayLeaseRenewRequest, _key: str = Depends
             json.dumps(req.metadata or {}),
         )
     if not row:
-        raise HTTPException(status_code=409, detail="Lease renew rejected: caller is not current owner")
+        raise HTTPException(
+            status_code=409, detail="Lease renew rejected: caller is not current owner"
+        )
     lease = _row_to_gateway_lease(row)
     await _publish_gateway_lease_event("renewed", lease)
     return GatewayLeaseAcquireResponse(status="renewed", lease=lease)
 
 
 @app.post("/api/v1/gateway-leases/release")
-async def release_gateway_lease(req: GatewayLeaseReleaseRequest, _key: str = Depends(verify_api_key)):
+async def release_gateway_lease(
+    req: GatewayLeaseReleaseRequest, _key: str = Depends(verify_api_key)
+):
     async with _tenant_conn(_key) as conn:
         row = await conn.fetchrow(
             "DELETE FROM gateway_topic_leases WHERE lease_key = $1 AND owner_gateway = $2 RETURNING *",
@@ -1766,7 +2971,9 @@ async def release_gateway_lease(req: GatewayLeaseReleaseRequest, _key: str = Dep
             req.gateway_id,
         )
     if not row:
-        raise HTTPException(status_code=409, detail="Lease release rejected: caller is not current owner")
+        raise HTTPException(
+            status_code=409, detail="Lease release rejected: caller is not current owner"
+        )
     lease = _row_to_gateway_lease(row)
     await _publish_gateway_lease_event("released", lease)
     return {"ok": True, "status": "released", "lease": lease.model_dump(mode="json")}
@@ -1774,9 +2981,11 @@ async def release_gateway_lease(req: GatewayLeaseReleaseRequest, _key: str = Dep
 
 # --- Graph / Cypher Queries ---
 
+
 class CypherRequest(BaseModel):
     query: str
     graph_name: str = "memu_graph"
+
 
 @app.post("/api/v1/memu/cypher")
 async def execute_cypher(req: CypherRequest, _key: str = Depends(verify_api_key)):
@@ -1784,13 +2993,16 @@ async def execute_cypher(req: CypherRequest, _key: str = Depends(verify_api_key)
     graph_name = _validate_graph_identifier(req.graph_name)
     async with pool.acquire() as conn:
         try:
-            await conn.execute("SET search_path = ag_catalog, \"$user\", public")
+            await conn.execute('SET search_path = ag_catalog, "$user", public')
             # Example query: MATCH (v:Memory) RETURN v
-            cypher_sql = f"SELECT * FROM cypher('{graph_name}', $$ {req.query} $$) AS (result agtype);"
+            cypher_sql = (
+                f"SELECT * FROM cypher('{graph_name}', $$ {req.query} $$) AS (result agtype);"
+            )
             rows = await conn.fetch(cypher_sql)
             return {"ok": True, "results": [dict(r) for r in rows]}
         except Exception as e:
             raise HTTPException(status_code=400, detail=str(e))
+
 
 @app.get("/api/v1/memu/graph/neighbors/{memory_id}")
 async def get_graph_neighbors(
@@ -1808,7 +3020,7 @@ async def get_graph_neighbors(
     id_literal = _cypher_string_literal(str(memory_id))
     async with pool.acquire() as conn:
         try:
-            await conn.execute("SET search_path = ag_catalog, \"$user\", public")
+            await conn.execute('SET search_path = ag_catalog, "$user", public')
             cypher_sql = f"""
             SELECT * FROM cypher('{graph_name}', $$ 
                 MATCH (m:Memory {{id: {id_literal}}})-[r]-(neighbor:Memory)
@@ -1834,7 +3046,7 @@ async def get_graph_stats(
     graph_name = _validate_graph_identifier(graph_name)
     async with pool.acquire() as conn:
         try:
-            await conn.execute("SET search_path = ag_catalog, \"$user\", public")
+            await conn.execute('SET search_path = ag_catalog, "$user", public')
 
             # vertex count
             v_rows = await conn.fetch(
@@ -1859,8 +3071,7 @@ async def get_graph_stats(
                 """
             )
             rel_types = [
-                {"rel_type": str(r["rel_type"]).strip('"'), "count": int(r["cnt"])}
-                for r in rt_rows
+                {"rel_type": str(r["rel_type"]).strip('"'), "count": int(r["cnt"])} for r in rt_rows
             ]
 
             return {
@@ -1897,7 +3108,7 @@ async def get_graph_path(
     to_literal = _cypher_string_literal(str(to_id))
     async with pool.acquire() as conn:
         try:
-            await conn.execute("SET search_path = ag_catalog, \"$user\", public")
+            await conn.execute('SET search_path = ag_catalog, "$user", public')
             cypher_sql = f"""
             SELECT * FROM cypher('{graph_name}', $$ 
                 MATCH p = shortestPath(
@@ -1926,6 +3137,7 @@ async def get_graph_path(
 
 # --- A-MEM Link Layer ---
 
+
 class LinkCreate(BaseModel):
     source_id: UUID
     target_id: UUID
@@ -1945,7 +3157,10 @@ async def create_link(req: LinkCreate, _key: str = Depends(verify_api_key)):
                 DO UPDATE SET strength = LEAST(1.0, memory_links.strength + 0.1), last_accessed = NOW()
                 RETURNING id, source_id, target_id, relationship, strength
                 """,
-                req.source_id, req.target_id, req.relationship, req.strength,
+                req.source_id,
+                req.target_id,
+                req.relationship,
+                req.strength,
             )
             return {"ok": True, "link": dict(row)}
         except Exception as e:
@@ -1968,35 +3183,39 @@ async def get_links(memory_id: UUID, _key: str = Depends(verify_api_key)):
         return {"ok": True, "links": [dict(r) for r in rows], "count": len(rows)}
 
 
-
 # --- Entity Invalidation (Superseding) ---
 # Matches Zep's entity supersession capability for temporal knowledge graphs
 
+
 class SupersedeRequest(BaseModel):
     """Request to supersede an entity (mark as invalidated by a newer version)."""
+
     superseded_memory_id: UUID  # The old memory being superseded
     superseding_memory_id: UUID  # The new memory that supersedes it
     relationship: str = "supersedes"  # Default relationship type
     strength: float = 1.0  # Superseding relationships are strong by default
     metadata: Optional[dict[str, Any]] = None
 
+
 class SupersedeResponse(BaseModel):
     """Response from a supersession operation."""
+
     ok: bool
     superseded_memory_id: UUID
     superseding_memory_id: UUID
     link_id: UUID
     message: str
 
+
 @app.post("/api/v1/memu/supersede", response_model=SupersedeResponse)
 async def supersede_entity(req: SupersedeRequest, _key: str = Depends(verify_api_key)):
     """
     Supersede an entity (like Zep's entity invalidation).
-    
+
     This does two things:
     1. Sets valid_to on the superseded memory to NOW() (marks it as historical)
     2. Creates a 'supersedes' link between the new and old memory
-    
+
     The superseded memory remains in the database but is excluded from
     temporal queries that filter for valid_to IS NULL.
     """
@@ -2015,7 +3234,7 @@ async def supersede_entity(req: SupersedeRequest, _key: str = Depends(verify_api
             if not old_memory:
                 raise HTTPException(
                     status_code=404,
-                    detail=f"Memory {req.superseded_memory_id} not found or already superseded"
+                    detail=f"Memory {req.superseded_memory_id} not found or already superseded",
                 )
 
             # Step 2: Verify the superseding memory exists and is current
@@ -2029,7 +3248,7 @@ async def supersede_entity(req: SupersedeRequest, _key: str = Depends(verify_api
             if not new_memory:
                 raise HTTPException(
                     status_code=404,
-                    detail=f"Superseding memory {req.superseding_memory_id} not found or already superseded"
+                    detail=f"Superseding memory {req.superseding_memory_id} not found or already superseded",
                 )
 
             # Step 3: Create the supersedes link
@@ -2041,7 +3260,7 @@ async def supersede_entity(req: SupersedeRequest, _key: str = Depends(verify_api
                 RETURNING id
                 """,
                 req.superseding_memory_id,  # source (the new one)
-                req.superseded_memory_id,    # target (the old one)
+                req.superseded_memory_id,  # target (the old one)
                 req.relationship,
                 req.strength,
                 req.metadata or {},
@@ -2051,7 +3270,8 @@ async def supersede_entity(req: SupersedeRequest, _key: str = Depends(verify_api
             if not link:
                 link = await conn.fetchrow(
                     "SELECT id FROM memory_links WHERE source_id = $1 AND target_id = $2",
-                    req.superseding_memory_id, req.superseded_memory_id
+                    req.superseding_memory_id,
+                    req.superseded_memory_id,
                 )
 
     return SupersedeResponse(
@@ -2059,8 +3279,9 @@ async def supersede_entity(req: SupersedeRequest, _key: str = Depends(verify_api
         superseded_memory_id=req.superseded_memory_id,
         superseding_memory_id=req.superseding_memory_id,
         link_id=link["id"],
-        message=f"Memory {req.superseded_memory_id} superseded by {req.superseding_memory_id}"
+        message=f"Memory {req.superseded_memory_id} superseded by {req.superseding_memory_id}",
     )
+
 
 @app.get("/api/v1/memu/superseded/{memory_id}")
 async def get_superseded_history(memory_id: UUID, _key: str = Depends(verify_api_key)):
@@ -2103,6 +3324,7 @@ async def get_superseded_history(memory_id: UUID, _key: str = Depends(verify_api
         "supersedes": [dict(s) for s in supersedes],
         "supersedes_count": len(supersedes),
     }
+
 
 @app.get("/api/v1/memu/entities/current")
 async def get_current_entities(
@@ -2149,7 +3371,9 @@ async def get_current_entities(
         "count": len(rows),
     }
 
+
 # --- Temporal Queries ---
+
 
 @app.get("/api/v1/memu/temporal")
 async def temporal_search_endpoint(
@@ -2192,28 +3416,32 @@ async def temporal_search_endpoint(
 
     # Apply time decay reranking (7-day half-life)
     import math
+
     results = []
     for row in rows:
         age_days = float(row["age_days"])
         base_sim = float(row["similarity"])
         decay = math.exp(-0.693 * age_days / 7.0)
         temporal_score = base_sim * decay
-        results.append({
-            "id": str(row["id"]),
-            "content": row["content"],
-            "agent_id": row["agent_id"],
-            "memory_type": row["memory_type"],
-            "similarity": base_sim,
-            "temporal_score": temporal_score,
-            "age_days": round(age_days, 1),
-            "created_at": str(row["created_at"]),
-        })
+        results.append(
+            {
+                "id": str(row["id"]),
+                "content": row["content"],
+                "agent_id": row["agent_id"],
+                "memory_type": row["memory_type"],
+                "similarity": base_sim,
+                "temporal_score": temporal_score,
+                "age_days": round(age_days, 1),
+                "created_at": str(row["created_at"]),
+            }
+        )
 
     results.sort(key=lambda r: r["temporal_score"], reverse=True)
     return {"ok": True, "results": results[:limit]}
 
 
 # --- Point-in-Time Query ---
+
 
 @app.get("/api/v1/memu/at")
 async def point_in_time_query(
@@ -2253,9 +3481,12 @@ async def point_in_time_query(
             *params,
         )
 
-    return {"ok": True, "point_in_time": timestamp, "memories": [dict(r) for r in rows], "count": len(rows)}
-
-
+    return {
+        "ok": True,
+        "point_in_time": timestamp,
+        "memories": [dict(r) for r in rows],
+        "count": len(rows),
+    }
 
 
 # --- Notion Integration ---
@@ -2335,17 +3566,16 @@ async def notion_health(_key: str = Depends(verify_api_key)):
         await bridge.close()
 
 
-
 # --- Forensics Endpoints (Compliance Engine) ---
 
 
 @app.get("/api/forensics/{task_id}")
 async def forensics_task_bundle(task_id: str, _key: str = Depends(verify_api_key)):
     """Aggregate the DAG, events, and bi-temporal memory context for a task.
-    
+
     This is the core forensic playback endpoint â€” given a task_id, reconstruct
     exactly what happened, what the agent knew, and what it decided.
-    
+
     Returns a downloadable JSON "Incident Bundle" suitable for compliance
     officers, insurance adjusters, and legal review.
     """
@@ -2381,7 +3611,11 @@ async def forensics_task_bundle(task_id: str, _key: str = Depends(verify_api_key
                     "timestamp": row["timestamp"].isoformat() if row["timestamp"] else None,
                     "gateway_id": row["gateway_id"],
                     "event_type": row["event_type"],
-                    "payload": row["payload"] if isinstance(row["payload"], dict) else json.loads(row["payload"]) if row["payload"] else {},
+                    "payload": row["payload"]
+                    if isinstance(row["payload"], dict)
+                    else json.loads(row["payload"])
+                    if row["payload"]
+                    else {},
                     "signature": row["signature"],
                     "compute_cost": row["compute_cost"],
                     "signature_present": bool(row["signature"]),
@@ -2404,7 +3638,13 @@ async def forensics_task_bundle(task_id: str, _key: str = Depends(verify_api_key
             )
             if task_row:
                 bundle["task_state"] = {
-                    k: (str(v) if isinstance(v, UUID) else v.isoformat() if hasattr(v, 'isoformat') else v)
+                    k: (
+                        str(v)
+                        if isinstance(v, UUID)
+                        else v.isoformat()
+                        if hasattr(v, "isoformat")
+                        else v
+                    )
                     for k, v in dict(task_row).items()
                 }
 
@@ -2418,7 +3658,9 @@ async def forensics_task_bundle(task_id: str, _key: str = Depends(verify_api_key
                         bundle["root_prompt"] = {
                             "content": root["content"],
                             "user_id": root["user_id"],
-                            "created_at": root["created_at"].isoformat() if root["created_at"] else None,
+                            "created_at": root["created_at"].isoformat()
+                            if root["created_at"]
+                            else None,
                         }
         except Exception as e:
             bundle["task_state_error"] = str(e)
@@ -2447,7 +3689,9 @@ async def forensics_task_bundle(task_id: str, _key: str = Depends(verify_api_key
                             "memory_type": row["memory_type"],
                             "agent_id": row["agent_id"],
                             "confidence": row["confidence"],
-                            "valid_from": row["valid_from"].isoformat() if row["valid_from"] else None,
+                            "valid_from": row["valid_from"].isoformat()
+                            if row["valid_from"]
+                            else None,
                             "valid_to": row["valid_to"].isoformat() if row["valid_to"] else None,
                         }
                         for row in context_memories
@@ -2467,20 +3711,34 @@ async def forensics_task_bundle(task_id: str, _key: str = Depends(verify_api_key
                         "SELECT capabilities, status, metadata FROM gateway_registry WHERE gateway_id = $1",
                         gw,
                     )
-                    bundle["gateway_signatures"].append({
-                        "gateway_id": gw,
-                        "public_key": gw_row["metadata"].get("public_key") if gw_row and gw_row["metadata"] else None,
-                        "status": gw_row["status"] if gw_row else "unknown",
-                        "events_signed": sum(1 for e in bundle["events"] if e["gateway_id"] == gw and e["signature_present"]),
-                        "events_unsigned": sum(1 for e in bundle["events"] if e["gateway_id"] == gw and not e["signature_present"]),
-                    })
+                    bundle["gateway_signatures"].append(
+                        {
+                            "gateway_id": gw,
+                            "public_key": gw_row["metadata"].get("public_key")
+                            if gw_row and gw_row["metadata"]
+                            else None,
+                            "status": gw_row["status"] if gw_row else "unknown",
+                            "events_signed": sum(
+                                1
+                                for e in bundle["events"]
+                                if e["gateway_id"] == gw and e["signature_present"]
+                            ),
+                            "events_unsigned": sum(
+                                1
+                                for e in bundle["events"]
+                                if e["gateway_id"] == gw and not e["signature_present"]
+                            ),
+                        }
+                    )
                 except Exception:
-                    bundle["gateway_signatures"].append({
-                        "gateway_id": gw,
-                        "public_key": None,
-                        "events_signed": 0,
-                        "events_unsigned": 0,
-                    })
+                    bundle["gateway_signatures"].append(
+                        {
+                            "gateway_id": gw,
+                            "public_key": None,
+                            "events_signed": 0,
+                            "events_unsigned": 0,
+                        }
+                    )
 
         # 5. Check DLQ for this task
         try:
@@ -2495,7 +3753,13 @@ async def forensics_task_bundle(task_id: str, _key: str = Depends(verify_api_key
             )
             if dlq_row:
                 bundle["dead_letter_queue"] = {
-                    k: (str(v) if isinstance(v, UUID) else v.isoformat() if hasattr(v, 'isoformat') else v)
+                    k: (
+                        str(v)
+                        if isinstance(v, UUID)
+                        else v.isoformat()
+                        if hasattr(v, "isoformat")
+                        else v
+                    )
                     for k, v in dict(dlq_row).items()
                 }
         except Exception as e:
@@ -2565,9 +3829,9 @@ async def forensics_task_bundle(task_id: str, _key: str = Depends(verify_api_key
 
 @app.get("/api/forensics/playback/{task_id}")
 async def forensics_playback(task_id: str, _key: str = Depends(verify_api_key)):
-    """Time Machine: reconstruct the agent's exact brain state at the moment 
+    """Time Machine: reconstruct the agent's exact brain state at the moment
     it made each decision on this task.
-    
+
     Returns a timeline of decisions with their bi-temporal memory context,
     allowing perfect reconstruction of what the agent knew vs what it did.
     """
@@ -2615,26 +3879,28 @@ async def forensics_playback(task_id: str, _key: str = Depends(verify_api_key)):
                 ts,
             )
 
-            timeline.append({
-                "event_id": str(event["event_id"]),
-                "timestamp": ts.isoformat(),
-                "event_type": event["event_type"],
-                "gateway_id": event["gateway_id"],
-                "payload": event["payload"],
-                "signed": bool(event["signature"]),
-                "agent_brain_state": {
-                    "memories_in_scope": len(memories),
-                    "memories": [
-                        {
-                            "id": str(m["id"]),
-                            "content_preview": m["content"][:200],
-                            "type": m["memory_type"],
-                            "confidence": m["confidence"],
-                        }
-                        for m in memories
-                    ],
-                },
-            })
+            timeline.append(
+                {
+                    "event_id": str(event["event_id"]),
+                    "timestamp": ts.isoformat(),
+                    "event_type": event["event_type"],
+                    "gateway_id": event["gateway_id"],
+                    "payload": event["payload"],
+                    "signed": bool(event["signature"]),
+                    "agent_brain_state": {
+                        "memories_in_scope": len(memories),
+                        "memories": [
+                            {
+                                "id": str(m["id"]),
+                                "content_preview": m["content"][:200],
+                                "type": m["memory_type"],
+                                "confidence": m["confidence"],
+                            }
+                            for m in memories
+                        ],
+                    },
+                }
+            )
 
     return {
         "task_id": task_id,
@@ -2644,8 +3910,8 @@ async def forensics_playback(task_id: str, _key: str = Depends(verify_api_key)):
     }
 
 
-
 # --- Lane Coordination (NATS bridge for external agents) ---
+
 
 class LaneMessage(BaseModel):
     task_id: str
@@ -2653,6 +3919,7 @@ class LaneMessage(BaseModel):
     lane: str
     fencing_token: str
     state: str  # claimed, in_progress, blocked, done
+
 
 @app.post("/api/v1/lanes/publish")
 async def publish_lane_message(msg: LaneMessage, api_key: str = Security(api_key_header)):
@@ -2686,12 +3953,21 @@ async def publish_lane_message(msg: LaneMessage, api_key: str = Security(api_key
 async def get_lane_status(api_key: str = Security(api_key_header)):
     """Check NATS connectivity for lane coordination."""
     verify_api_key(api_key)
-    connected = _nats_publisher is not None and _nats_publisher.cluster.active_connection is not None
+    connected = (
+        _nats_publisher is not None and _nats_publisher.cluster.active_connection is not None
+    )
     return {"ok": connected, "nats": "connected" if connected else "disconnected"}
 
 
-
 # --- Search Vault / Recall Endpoints ---
+
+
+class MemURecallCompatRequest(BaseModel):
+    query: str
+    limit: int = 5
+    agent: str | None = None
+    agent_id: str | None = None
+
 
 @app.get("/api/v1/memu/search/recall")
 async def recall_search_compat(
@@ -2704,13 +3980,29 @@ async def recall_search_compat(
     return await recall_search(query=q, limit=limit, agent_id=agent_id or agent, _key=_key)
 
 
+@app.post("/api/v1/memu/search/recall")
+async def recall_search_post_compat(
+    req: MemURecallCompatRequest, _key: str = Depends(verify_api_key)
+):
+    return await recall_search(
+        query=req.query, limit=req.limit, agent_id=req.agent_id or req.agent, _key=_key
+    )
+
+
+@app.post("/search/recall")
+async def recall_search_post(req: MemURecallCompatRequest, _key: str = Depends(verify_api_key)):
+    return await recall_search(
+        query=req.query, limit=req.limit, agent_id=req.agent_id or req.agent, _key=_key
+    )
+
+
 @app.get("/search/recall")
 async def recall_search(
     query: str | None = None,
     q: str | None = None,
     limit: int = 5,
     agent_id: str | None = None,
-    _key: str = Depends(verify_api_key)
+    _key: str = Depends(verify_api_key),
 ):
     """
     Search the Vault (search_history) for similar past searches.
@@ -2730,24 +4022,38 @@ async def recall_search(
         raise HTTPException(status_code=503, detail="Database not initialized")
 
     async with _tenant_conn(_key) as conn:
-        vec = f"vector({EMBEDDING_DIMS})"
-        rows = await conn.fetch(
-            f"""
-            SELECT query, agent_id, created_at, results_count, 
-                   1 - (embedding <=> $1::{vec}) as similarity
-            FROM search_history
-            WHERE embedding IS NOT NULL
-            ORDER BY embedding <=> $1::{vec}
-            LIMIT $2
-            """,
-            str(embedding),
-            limit,
-        )
-        
+        if embedding is None:
+            rows = await conn.fetch(
+                """
+                SELECT query, agent_id, created_at, results_count, 0.0::float8 as similarity
+                FROM search_history
+                WHERE query ILIKE $1
+                ORDER BY created_at DESC
+                LIMIT $2
+                """,
+                f"%{normalized_query}%",
+                limit,
+            )
+        else:
+            vec = f"vector({EMBEDDING_DIMS})"
+            rows = await conn.fetch(
+                f"""
+                SELECT query, agent_id, created_at, results_count, 
+                       1 - (embedding <=> $1::{vec}) as similarity
+                FROM search_history
+                WHERE embedding IS NOT NULL
+                ORDER BY embedding <=> $1::{vec}
+                LIMIT $2
+                """,
+                str(embedding),
+                limit,
+            )
+
     return [dict(r) for r in rows]
 
 
 # --- Tenant Management Endpoints ---
+
 
 class TenantCreate(BaseModel):
     name: str
@@ -2783,7 +4089,9 @@ async def create_tenant(req: TenantCreate, _key: str = Depends(verify_api_key)):
             return TenantResponse(**dict(row))
         except Exception as e:
             if "unique" in str(e).lower():
-                raise HTTPException(status_code=409, detail=f"Tenant slug '{req.slug}' already exists")
+                raise HTTPException(
+                    status_code=409, detail=f"Tenant slug '{req.slug}' already exists"
+                )
             raise HTTPException(status_code=400, detail=str(e))
 
 
@@ -2792,7 +4100,9 @@ async def list_tenants(_key: str = Depends(verify_api_key)):
     """List all tenants."""
     async with _tenant_conn(_key) as conn:
         try:
-            rows = await conn.fetch("SELECT id, name, slug, plan, created_at FROM tenants ORDER BY created_at")
+            rows = await conn.fetch(
+                "SELECT id, name, slug, plan, created_at FROM tenants ORDER BY created_at"
+            )
             return [dict(r) for r in rows]
         except Exception as e:
             # tenants table may not exist yet
@@ -2811,10 +4121,12 @@ async def get_tenant(tenant_slug: str, _key: str = Depends(verify_api_key)):
             raise HTTPException(status_code=404, detail="Tenant not found")
         return dict(row)
 
+
 class DedupeResponse(BaseModel):
     deleted_count: int
     merged_access_count: int
     dry_run: bool
+
 
 @app.post("/api/v1/memu/dedupe", response_model=DedupeResponse)
 async def dedupe_memories(
@@ -2823,39 +4135,53 @@ async def dedupe_memories(
 ):
     """Find and merge identical memories by content_hash to reduce context bloat."""
     async with _tenant_conn(_key) as conn:
-        rows = await conn.fetch('''
+        rows = await conn.fetch("""
             SELECT content_hash, array_agg(id ORDER BY created_at ASC) as ids, sum(access_count) as total_access
             FROM memories
             GROUP BY content_hash
             HAVING count(id) > 1
-        ''')
-        
+        """)
+
         deleted = 0
         merged = 0
-        
+
         for row in rows:
-            ids = row['ids']
+            ids = row["ids"]
             keep_id = ids[0]
             drop_ids = ids[1:]
-            total_access = row['total_access']
-            
+            total_access = row["total_access"]
+
             if not dry_run:
                 # Add access_count to the kept id
-                await conn.execute('UPDATE memories SET access_count = $1, updated_at = NOW() WHERE id = $2', total_access, keep_id)
+                await conn.execute(
+                    "UPDATE memories SET access_count = $1, updated_at = NOW() WHERE id = $2",
+                    total_access,
+                    keep_id,
+                )
                 # Relink any memory_links pointing to drop_ids to keep_id
-                await conn.execute('UPDATE memory_links SET source_id = $1 WHERE source_id = ANY($2) AND source_id != $1', keep_id, drop_ids)
-                await conn.execute('UPDATE memory_links SET target_id = $1 WHERE target_id = ANY($2) AND target_id != $1', keep_id, drop_ids)
+                await conn.execute(
+                    "UPDATE memory_links SET source_id = $1 WHERE source_id = ANY($2) AND source_id != $1",
+                    keep_id,
+                    drop_ids,
+                )
+                await conn.execute(
+                    "UPDATE memory_links SET target_id = $1 WHERE target_id = ANY($2) AND target_id != $1",
+                    keep_id,
+                    drop_ids,
+                )
                 # Delete the redundant ones
-                await conn.execute('DELETE FROM memories WHERE id = ANY($1)', drop_ids)
-                
+                await conn.execute("DELETE FROM memories WHERE id = ANY($1)", drop_ids)
+
             deleted += len(drop_ids)
             merged += total_access
-            
+
     return DedupeResponse(deleted_count=deleted, merged_access_count=merged, dry_run=dry_run)
+
 
 class HygieneCleanupResponse(BaseModel):
     deleted_history_count: int
     dry_run: bool
+
 
 @app.post("/api/v1/memu/hygiene/cleanup", response_model=HygieneCleanupResponse)
 async def history_cleanup(
@@ -2866,25 +4192,17 @@ async def history_cleanup(
     """Periodic cleanup of old search history and stale logs for operational hygiene."""
     async with _tenant_conn(_key) as conn:
         if dry_run:
-            val = await conn.fetchval("SELECT count(*) FROM search_history WHERE created_at < NOW() - INTERVAL '1 day' * $1", days_old)
+            val = await conn.fetchval(
+                "SELECT count(*) FROM search_history WHERE created_at < NOW() - INTERVAL '1 day' * $1",
+                days_old,
+            )
             return HygieneCleanupResponse(deleted_history_count=val or 0, dry_run=True)
-        
-        res = await conn.execute("DELETE FROM search_history WHERE created_at < NOW() - INTERVAL '1 day' * $1", days_old)
+
+        res = await conn.execute(
+            "DELETE FROM search_history WHERE created_at < NOW() - INTERVAL '1 day' * $1", days_old
+        )
         deleted = int(res.split()[1]) if res.startswith("DELETE") else 0
         return HygieneCleanupResponse(deleted_history_count=deleted, dry_run=False)
-
-# ===========================================================================
-# Memory Agent API endpoints (migration 014)
-# ===========================================================================
-
-from memu.concept_search import (
-    fts_search,
-    trgm_search,
-    concept_lookup,
-    concept_search_memories,
-    hybrid_search as _hybrid_search_core,
-    rrf_fuse,
-)
 
 
 class HybridSearchRequest(BaseModel):
@@ -2908,7 +4226,7 @@ class CompactionResult(BaseModel):
 
 
 class AgentRunRequest(BaseModel):
-    run_type: str = "full"    # 'compact', 'index', 'distill', 'full'
+    run_type: str = "full"  # 'compact', 'index', 'distill', 'full'
     model: str | None = None
 
 
@@ -3083,7 +4401,7 @@ async def hybrid_search_endpoint(req: HybridSearchRequest, _key: str = Depends(v
             "rrf_score": m.get("rrf_score", 0.0),
             "similarity": m.get("similarity", 0.0),
         }
-        for m in fused[:req.limit]
+        for m in fused[: req.limit]
     ]
 
 
@@ -3093,7 +4411,8 @@ async def trigger_agent_run(req: AgentRunRequest, _key: str = Depends(verify_api
     Trigger a memory agent run asynchronously.
     run_type: 'compact' | 'index' | 'distill' | 'full'
     """
-    import subprocess, sys
+    import subprocess
+    import sys
 
     cmd = [sys.executable, "-m", "memu.memory_agent", f"--{req.run_type}"]
     if req.model:
@@ -3184,23 +4503,33 @@ async def get_core_memory(agent_id: str, _key: str = Depends(verify_api_key)):
 
 
 @app.get("/api/v1/memu/core-memory/{agent_id}/{block_name}")
-async def get_core_memory_block(agent_id: str, block_name: str, _key: str = Depends(verify_api_key)):
+async def get_core_memory_block(
+    agent_id: str, block_name: str, _key: str = Depends(verify_api_key)
+):
     """Get a specific core memory block."""
     mgr = _require_core_memory()
     try:
         block = Block(block_name)
     except ValueError:
-        raise HTTPException(status_code=400, detail=f"Invalid block: {block_name}. Valid: {[b.value for b in Block]}")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid block: {block_name}. Valid: {[b.value for b in Block]}",
+        )
     entry = await mgr.get_block(agent_id, block)
     if entry is None:
-        raise HTTPException(status_code=404, detail=f"Block {block_name} not found for agent {agent_id}")
+        raise HTTPException(
+            status_code=404, detail=f"Block {block_name} not found for agent {agent_id}"
+        )
     return entry.to_dict()
 
 
 @app.put("/api/v1/memu/core-memory/{agent_id}/{block_name}")
 async def update_core_memory_block(
-    agent_id: str, block_name: str, req: CoreMemoryBlockUpdate,
-    revision: int = 0, _key: str = Depends(verify_api_key),
+    agent_id: str,
+    block_name: str,
+    req: CoreMemoryBlockUpdate,
+    revision: int = 0,
+    _key: str = Depends(verify_api_key),
 ):
     """Update a core memory block (CAS-protected). Agent can only write Working_Context."""
     mgr = _require_core_memory()
@@ -3221,7 +4550,9 @@ async def update_core_memory_block(
 
 @app.post("/api/v1/memu/core-memory/{agent_id}/{block_name}/append")
 async def append_core_memory_block(
-    agent_id: str, block_name: str, req: CoreMemoryAppendRequest,
+    agent_id: str,
+    block_name: str,
+    req: CoreMemoryAppendRequest,
     _key: str = Depends(verify_api_key),
 ):
     """Append text to a core memory block."""
@@ -3243,7 +4574,9 @@ async def append_core_memory_block(
 
 @app.post("/api/v1/memu/core-memory/{agent_id}/{block_name}/replace")
 async def replace_core_memory_block(
-    agent_id: str, block_name: str, req: CoreMemoryReplaceRequest,
+    agent_id: str,
+    block_name: str,
+    req: CoreMemoryReplaceRequest,
     _key: str = Depends(verify_api_key),
 ):
     """Replace text within a core memory block."""
@@ -3253,7 +4586,9 @@ async def replace_core_memory_block(
     except ValueError:
         raise HTTPException(status_code=400, detail=f"Invalid block: {block_name}")
     try:
-        entry = await mgr.replace_in_block(agent_id, block, req.old_text, req.new_text, caller="agent")
+        entry = await mgr.replace_in_block(
+            agent_id, block, req.old_text, req.new_text, caller="agent"
+        )
         return entry.to_dict()
     except PermissionError as e:
         raise HTTPException(status_code=403, detail=str(e))
@@ -3265,14 +4600,19 @@ async def replace_core_memory_block(
 
 @app.post("/api/v1/memu/core-memory/{agent_id}/page-archival")
 async def page_archival_endpoint(
-    agent_id: str, req: PageArchivalRequest,
+    agent_id: str,
+    req: PageArchivalRequest,
     _key: str = Depends(verify_api_key),
 ):
     """Search PostgreSQL archival memory and page results into Working_Context."""
     mgr = _require_core_memory()
     from memu.archival_pager import page_from_archival
+
     paged = await page_from_archival(
-        mgr, pool, agent_id, req.query,
+        mgr,
+        pool,
+        agent_id,
+        req.query,
         get_embedding=get_embedding,
         limit=req.limit,
     )
@@ -3297,8 +4637,11 @@ async def get_system_prompt_fragment(agent_id: str, _key: str = Depends(verify_a
     """Render core memory blocks into a system prompt fragment for LLM injection."""
     mgr = _require_core_memory()
     mem = await mgr.get_agent_memory(agent_id)
-    return {"agent_id": agent_id, "fragment": mem.as_system_prompt_fragment(), "total_tokens": mem.total_tokens}
-
+    return {
+        "agent_id": agent_id,
+        "fragment": mem.as_system_prompt_fragment(),
+        "total_tokens": mem.total_tokens,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -3308,7 +4651,9 @@ async def get_system_prompt_fragment(agent_id: str, _key: str = Depends(verify_a
 
 class ProspectiveMemoryRequest(BaseModel):
     intent: str
-    trigger_condition: dict  # {"type": "time", "delay_seconds": 3600} or {"type": "event", "pattern": "..."}
+    trigger_condition: (
+        dict  # {"type": "time", "delay_seconds": 3600} or {"type": "event", "pattern": "..."}
+    )
 
 
 @app.post("/api/v1/memu/memory/prospective")
@@ -3334,6 +4679,7 @@ async def create_prospective_memory(
     # Try to start Temporal workflow
     try:
         from temporalio.client import Client as TemporalClient
+
         temporal_url = os.environ.get("TEMPORAL_URL", "localhost:7233")
         client = await TemporalClient.connect(temporal_url)
         handle = await client.start_workflow(
@@ -3355,6 +4701,7 @@ async def create_prospective_memory(
         # Fallback: asyncio.create_task with sleep
         async def _fallback_reminder():
             import asyncio
+
             await asyncio.sleep(delay_seconds)
             if _core_memory_mgr:
                 try:
@@ -3363,14 +4710,18 @@ async def create_prospective_memory(
                     if entry:
                         new_content = f"{reminder}\n{entry.content}"
                         await _core_memory_mgr.update_block(
-                            agent_id, Block.WORKING_CONTEXT, new_content,
-                            entry.revision, caller="agent",
+                            agent_id,
+                            Block.WORKING_CONTEXT,
+                            new_content,
+                            entry.revision,
+                            caller="agent",
                         )
                     logger.info("Prospective memory triggered for %s: %s", agent_id, req.intent)
                 except Exception as exc:
                     logger.error("Prospective memory injection failed: %s", exc)
 
         import asyncio
+
         asyncio.create_task(_fallback_reminder())
         return {
             "status": "scheduled_fallback",
@@ -3382,5 +4733,6 @@ async def create_prospective_memory(
 
 if __name__ == "__main__":
     import uvicorn
+
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)

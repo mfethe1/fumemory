@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 from typing import Awaitable, Callable, Optional, Protocol
 
 from ..storage.base import SearchHit, StorageBackend, WikiNode
+from .retriever import Embedder, HybridRetriever
 
 
 DecomposerFn = Callable[[str, int], Awaitable[list[str]]]
@@ -54,16 +55,20 @@ class RLMResult:
 
 
 class DefaultRetriever:
-    """Minimal retriever that uses the StorageBackend's FTS path.
+    """Backward-compatible wrapper: delegates to :class:`HybridRetriever`.
 
-    Production swaps this for a wrapper around ``memu.semantic_router``.
+    Older code constructed :class:`Orchestrator` without an explicit
+    retriever and got FTS-only behavior. The orchestrator now wraps
+    :class:`HybridRetriever` instead, which stays FTS-only when no
+    embedder is wired but transparently adds vector + graph fusion once
+    one is provided.
     """
 
-    def __init__(self, backend: StorageBackend):
-        self.backend = backend
+    def __init__(self, backend: StorageBackend, *, embedder: Optional[Embedder] = None):
+        self._hybrid = HybridRetriever(backend, embedder=embedder)
 
     async def retrieve(self, query: str, k: int) -> list[SearchHit]:
-        return await self.backend.search_fts(query, k=k)
+        return await self._hybrid.retrieve(query, k=k)
 
 
 async def _noop_decompose(task: str, fanout: int) -> list[str]:
@@ -92,11 +97,15 @@ class Orchestrator:
         backend: StorageBackend,
         *,
         retriever: Optional[Retriever] = None,
+        embedder: Optional[Embedder] = None,
         decomposer: DecomposerFn = _noop_decompose,
         aggregator: AggregatorFn = _concat_aggregate,
     ) -> None:
         self.backend = backend
-        self.retriever = retriever or DefaultRetriever(backend)
+        if retriever is not None:
+            self.retriever = retriever
+        else:
+            self.retriever = HybridRetriever(backend, embedder=embedder)
         self.decomposer = decomposer
         self.aggregator = aggregator
 

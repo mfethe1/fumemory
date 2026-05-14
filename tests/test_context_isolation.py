@@ -9,7 +9,6 @@ from memu.context_isolation import (
     sanitize_agent_message,
     create_minimal_task_handoff,
     ContextIsolationError,
-    MAX_PAYLOAD_SIZE_BYTES,
     MAX_STRING_LENGTH,
 )
 

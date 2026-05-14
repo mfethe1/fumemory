@@ -19,19 +19,30 @@ def get_db_url():
 
 # --- Embedding helpers (OpenAI-compatible + local fallback) ---
 
-EMBEDDING_BASE_URL = os.environ.get("EMBEDDING_BASE_URL", "")
-EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
-EMBEDDING_DIMS = int(os.environ.get("EMBEDDING_DIMS", "4096"))
+# EMBEDDING_API_BASE is canonical; EMBEDDING_BASE_URL is a deprecated alias.
+_embedding_api_base_canonical = os.environ.get("EMBEDDING_API_BASE", "")
+_embedding_base_url_alias = os.environ.get("EMBEDDING_BASE_URL", "")
+if not _embedding_api_base_canonical and _embedding_base_url_alias:
+    import logging as _logging
+    _logging.getLogger(__name__).warning(
+        "EMBEDDING_BASE_URL is a deprecated alias for EMBEDDING_API_BASE. "
+        "Update your deployment configuration to use EMBEDDING_API_BASE instead."
+    )
+    _embedding_api_base_canonical = _embedding_base_url_alias
+
+EMBEDDING_API_BASE = _embedding_api_base_canonical or "https://api.openai.com"
+EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "text-embedding-3-small")
+EMBEDDING_DIMS = int(os.environ.get("EMBEDDING_DIMS", "1536"))
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 
 
 async def _embedding_from_http(text: str) -> list[float] | None:
     """Try OpenAI-compatible endpoint (/v1/embeddings), including Ollama compatibility."""
     # Only attempt remote embedding call for explicit providers.
-    if not OPENAI_API_KEY and "ollama" not in EMBEDDING_BASE_URL:
+    if not OPENAI_API_KEY and "ollama" not in EMBEDDING_API_BASE:
         return None
 
-    base = EMBEDDING_BASE_URL.rstrip("/")
+    base = EMBEDDING_API_BASE.rstrip("/")
     headers = {"Content-Type": "application/json"}
     if OPENAI_API_KEY:
         headers["Authorization"] = f"Bearer {OPENAI_API_KEY}"
@@ -120,23 +131,88 @@ async def generate_embedding(text: str) -> list[float] | None:
 
 
 @activity.defn
-async def store_memory(content: str, agent_id: str, metadata: dict, embedding: list[float] | None) -> str:
-    """Store memory and return ID."""
+async def store_memory(req_dict: dict, embedding: list[float] | None) -> dict:
+    """Store memory preserving all canonical evidence fields.
+
+    Accepts a req_dict with canonical fields so the async path never silently
+    hardcodes memory_type or drops provenance.  Returns a dict with:
+      memory_id         — UUID string of the persisted record
+      idempotency_status — "new" | "exact_replay"
+    """
+    from memu.schema_contract import compute_canonical_payload_hash
+
+    content = req_dict.get("content", "")
+    agent_id = req_dict.get("agent_id", "system")
+    memory_type = req_dict.get("memory_type", "observation")
+    memory_kind = req_dict.get("memory_kind", "learning")
+    idempotency_key = req_dict.get("idempotency_key") or None
+    salience_score = float(req_dict.get("salience_score", 0.5))
+    metadata: dict = dict(req_dict.get("metadata") or {})
+    tenant_id = req_dict.get("tenant_id", "00000000-0000-0000-0000-000000000001")
+    parent_id = req_dict.get("parent_id") or None
+
+    # Ensure allowed_roles is in metadata for ABAC
+    if "allowed_roles" not in metadata:
+        metadata["allowed_roles"] = req_dict.get("allowed_roles") or ["*"]
+
+    is_evidence = (memory_kind == "evidence")
+    canonical_hash: str | None = None
+
+    if is_evidence and idempotency_key:
+        canonical_hash = compute_canonical_payload_hash(
+            content=content,
+            memory_type=memory_type,
+            agent_id=agent_id,
+            metadata=metadata,
+        )
+
     # One-shot connection — acceptable for Temporal activity isolation
     conn = await asyncpg.connect(get_db_url())
     try:
+        # Idempotency check for evidence writes
+        if is_evidence and idempotency_key:
+            existing = await conn.fetchrow(
+                """
+                SELECT id, canonical_payload_hash FROM memories
+                WHERE tenant_id = $1::uuid AND idempotency_key = $2
+                LIMIT 1
+                """,
+                tenant_id,
+                idempotency_key,
+            )
+            if existing:
+                stored_hash = existing["canonical_payload_hash"]
+                if stored_hash == canonical_hash:
+                    return {"memory_id": str(existing["id"]), "idempotency_status": "exact_replay"}
+                # Conflict — let the caller decide; still return the existing ID
+                return {
+                    "memory_id": str(existing["id"]),
+                    "idempotency_status": "conflict",
+                }
+
         row = await conn.fetchrow(
             """
-            INSERT INTO memories (content, agent_id, metadata, memory_type, embedding)
-            VALUES ($1, $2, $3, 'user_action', $4::vector)
+            INSERT INTO memories (
+                content, agent_id, metadata, memory_type, memory_kind,
+                salience_score, tenant_id, idempotency_key, canonical_payload_hash,
+                parent_id, embedding
+            )
+            VALUES ($1, $2, $3::jsonb, $4, $5, $6, $7::uuid, $8, $9, $10, $11::vector)
             RETURNING id
             """,
             content,
             agent_id,
             json.dumps(metadata),
+            memory_type,
+            memory_kind,
+            salience_score,
+            tenant_id,
+            idempotency_key,
+            canonical_hash,
+            parent_id,
             str(embedding) if embedding else None,
         )
-        return str(row["id"])
+        return {"memory_id": str(row["id"]), "idempotency_status": "new"}
     finally:
         await conn.close()
 
@@ -379,7 +455,7 @@ async def mark_episodes_consolidated(episode_ids: list[str]) -> int:
         valid_ids = [eid for eid in episode_ids if eid]
         if not valid_ids:
             return 0
-        result = await conn.execute(
+        await conn.execute(
             """
             UPDATE memories SET searchable = FALSE, updated_at = NOW()
             WHERE id = ANY($1::uuid[])

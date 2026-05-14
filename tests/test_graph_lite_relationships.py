@@ -8,7 +8,6 @@ import asyncio
 import asyncpg
 import os
 import sys
-from uuid import uuid4, UUID
 import json
 import pytest
 
@@ -17,7 +16,6 @@ pytestmark = pytest.mark.skip(reason="manual integration script; requires live m
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-from memu.models import MemoryCreate, MemoryType, Relationship
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://memu:memu@localhost:5432/memu")
 

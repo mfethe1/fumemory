@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 """Deployment verification for memU.
 
-Default mode verifies the core API only:
-- GET /health
-- POST /memories
-- POST /search-text
+Three readiness gates, each a strict superset of the previous:
 
-Async/Temporal checks are optional and only run when --check-async is passed.
-This avoids false negatives on Railway when Temporal is not part of the current deploy.
+  Core API Readiness (default):
+    GET /health, POST /memories (canonical write), GET /search-text, POST /search
+
+  Federation Readiness (--check-federation):
+    Core API + idempotency-keyed evidence write + idempotency replay + searchable memory proof
+
+  Async Readiness (--check-async):
+    Core API + POST /memories/async + POST /search/async (Temporal required)
+
+Use --proof-out FILE to emit a machine-readable JSON proof artifact with secrets redacted.
 """
 
 from __future__ import annotations
@@ -20,6 +25,16 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime, timezone
+
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+
+COMPAT_BASE_SUFFIX = "/api/v1/memu"
 
 
 def _default_api_url() -> str:
@@ -29,6 +44,14 @@ def _default_api_url() -> str:
         or os.environ.get("MEMU_BASE_URL")
         or "http://127.0.0.1:8000"
     ).rstrip("/")
+
+
+def _api_candidates(api_url: str | None) -> list[str]:
+    requested = (api_url or "").rstrip("/")
+    if requested and requested.lower() != "auto":
+        return [requested]
+
+    return [_default_api_url()]
 
 
 def _resolve_api_key(explicit: str | None) -> str:
@@ -63,101 +86,433 @@ def _request(method: str, url: str, *, api_key: str | None = None, json_body: di
         return e.code, body
 
 
-def _check_health(api_url: str) -> bool:
-    print(f"🏥 Checking health at {api_url}/health...")
-    status, body = _request("GET", f"{api_url}/health")
+def _compat_mode(api_url: str) -> bool:
+    return api_url.rstrip("/").endswith(COMPAT_BASE_SUFFIX)
+
+
+def _endpoint(api_url: str, path: str, compat_path: str | None = None) -> str:
+    suffix = compat_path if (_compat_mode(api_url) and compat_path) else path
+    return f"{api_url}{suffix}"
+
+
+def _check_health(api_url: str) -> tuple[bool, str]:
+    health_url = _endpoint(api_url, "/health", "/health")
+    print(f"🏥 Checking health at {health_url}...")
+    status, body = _request("GET", health_url)
     if status == 200:
         print(f"✅ Healthy: {body}")
-        return True
+        return True, f"status={status}"
     print(f"❌ Unhealthy: {status} - {body}")
-    return False
+    return False, f"status={status} body={body[:120]}"
 
 
-def _write_sync_memory(api_url: str, api_key: str) -> str | None:
+def _write_sync_memory(api_url: str, api_key: str) -> tuple[str | None, str]:
     print("\n✍️ Testing sync memory write...")
     content = f"Deployment Verification Test {time.time()}"
     payload = {
         "content": content,
         "agent_id": "macklemore-qa",
-        "memory_type": "observation",
+        "memory_type": "fact",
         "metadata": {"source": "deployment_test", "verified": True},
     }
-    status, body = _request("POST", f"{api_url}/memories", api_key=api_key, json_body=payload)
+    status, body = _request(
+        "POST",
+        _endpoint(api_url, "/memories", "/add"),
+        api_key=api_key,
+        json_body=payload,
+    )
     if status == 200:
         print("✅ Sync write succeeded.")
-        return content
+        return content, "canonical write succeeded"
     print(f"❌ Sync write failed: {status} - {body}")
-    return None
+    return None, f"status={status} body={body[:120]}"
 
 
-def _verify_ingestion(api_url: str, api_key: str, content: str) -> bool:
+def _verify_search_text(api_url: str, api_key: str, content: str) -> tuple[bool, str]:
     print("\n🔍 Verifying ingestion via /search-text...")
-    params = urllib.parse.urlencode({"q": content, "limit": 1})
-    status, body = _request("GET", f"{api_url}/search-text?{params}", api_key=api_key)
+    if _compat_mode(api_url):
+        status, body = _request(
+            "POST",
+            _endpoint(api_url, "/search-text", "/search"),
+            api_key=api_key,
+            json_body={"query": content, "limit": 1},
+        )
+    else:
+        params = urllib.parse.urlencode({"q": content, "limit": 1})
+        status, body = _request("GET", _endpoint(api_url, f"/search-text?{params}", f"/search-text?{params}"), api_key=api_key)
     if status != 200:
-        print(f"❌ Verification query failed: {status} - {body}")
-        return False
+        print(f"❌ /search-text failed: {status} - {body}")
+        return False, f"status={status} body={body[:120]}"
 
     try:
-        results = json.loads(body)
+        payload = json.loads(body)
     except json.JSONDecodeError:
-        print(f"❌ Verification response was not JSON: {body}")
-        return False
+        print(f"❌ /search-text response was not JSON: {body}")
+        return False, "non-JSON response"
+
+    if isinstance(payload, dict):
+        results = payload.get("results") or payload.get("memories") or []
+    else:
+        results = payload
 
     if results and content in results[0].get("content", ""):
-        print(f"✅ Verified! Found memory: {results[0]['content'][:80]}...")
-        return True
+        print(f"✅ /search-text verified: {results[0]['content'][:80]}...")
+        return True, "memory found in results"
 
-    print("❌ Verification failed: newly written memory not found.")
-    return False
+    print("❌ /search-text verification failed: newly written memory not found.")
+    return False, "memory not found in results"
 
 
-def _check_async(api_url: str, api_key: str) -> bool:
+def _extract_memory_results(payload: object) -> list:
+    if isinstance(payload, dict):
+        results = payload.get("results") or payload.get("memories") or []
+    elif isinstance(payload, list):
+        results = payload
+    else:
+        return []
+    return results if isinstance(results, list) else []
+
+
+def _item_content(item: object) -> str:
+    if not isinstance(item, dict):
+        return ""
+    if isinstance(item.get("content"), str):
+        return item["content"]
+    memory = item.get("memory")
+    if isinstance(memory, dict) and isinstance(memory.get("content"), str):
+        return memory["content"]
+    return ""
+
+
+def _verify_memory_retrieval(api_url: str, api_key: str, content: str) -> tuple[bool, str]:
+    print("\n🧠 Verifying written-memory retrieval via /search...")
+    params = urllib.parse.urlencode({"query": content, "limit": 3})
+    attempts = [
+        (
+            "POST",
+            _endpoint(api_url, "/search", "/search"),
+            {"query": content, "limit": 3, "lexical_fallback": True, "min_results": 1},
+            "/search POST",
+        ),
+        ("GET", _endpoint(api_url, f"/search/recall?{params}", f"/search/recall?{params}"), None, "/search/recall legacy GET"),
+        ("POST", _endpoint(api_url, "/search/recall", "/search/recall"), {"query": content, "limit": 3}, "/search/recall legacy POST"),
+    ]
+    last_error = "no attempts made"
+    for method, url, body_json, label in attempts:
+        status, body = _request(method, url, api_key=api_key, json_body=body_json)
+        if status != 200:
+            last_error = f"{label}: {status} - {body}"
+            continue
+        try:
+            payload = json.loads(body)
+        except json.JSONDecodeError:
+            last_error = f"{label}: non-JSON response {body}"
+            continue
+
+        results = _extract_memory_results(payload)
+        if not results:
+            last_error = f"{label}: no memory results"
+            continue
+
+        for item in results:
+            if content in _item_content(item):
+                print(f"✅ Retrieval verified newly written memory via {label}.")
+                return True, "memory found in retrieval results"
+
+        last_error = f"{label}: memory not found in {len(results)} result(s)"
+
+    print("❌ retrieval verification failed: newly written memory not found.")
+    return False, f"memory not found in retrieval results ({last_error})"
+
+
+def _verify_search_recall(api_url: str, api_key: str, content: str) -> tuple[bool, str]:
+    """Backward-compatible alias for older tests/scripts."""
+    return _verify_memory_retrieval(api_url, api_key, content)
+
+
+def _redact_nats_url(url: str) -> str:
+    """Keep scheme+host, redact auth credentials embedded in the URL."""
+    if "@" in url:
+        scheme_end = url.find("//") + 2
+        at_pos = url.rfind("@")
+        return url[:scheme_end] + "[REDACTED]@" + url[at_pos + 1:]
+    return url
+
+
+def _check_federation(api_url: str, api_key: str) -> tuple[bool, list[dict]]:
+    """Federation Readiness gate.
+
+    Requires NATS_RAILWAY_URL to be present — federation readiness cannot pass
+    without NATS. Also proves idempotency-keyed evidence write and replay on
+    the memory plane.
+    NATS/JetStream publish/consume and directed response are proved by the
+    gateway smoke (gateway_federation_smoke.py) and test suite.
+    """
+    print("\n🔗 Testing Federation Readiness (NATS required + idempotency write + replay + searchable proof)...")
+    checks: list[dict] = []
+
+    nats_url = os.environ.get("NATS_RAILWAY_URL", "").strip()
+    nats_present = bool(nats_url)
+    checks.append({
+        "name": "nats_railway_url",
+        "passed": nats_present,
+        "detail": "NATS_RAILWAY_URL present" if nats_present else "NATS_RAILWAY_URL missing - federation readiness requires NATS",
+    })
+    if not nats_present:
+        print("  ❌ NATS_RAILWAY_URL not set — federation readiness requires NATS.")
+        return False, checks
+
+    idempotency_key = f"verify-federation-{int(time.time())}"
+    content = f"Federation Readiness Proof {idempotency_key}"
+    evidence_payload = {
+        "content": content,
+        "agent_id": "macklemore-qa",
+        "memory_type": "fact",
+        "memory_kind": "evidence",
+        "idempotency_key": idempotency_key,
+        "metadata": {"source": "federation_readiness_test", "gate": "federation"},
+    }
+
+    # 1. Idempotency-keyed evidence write
+    print("  ✍️  Writing idempotency-keyed evidence memory...")
+    status, body = _request(
+        "POST",
+        _endpoint(api_url, "/memories", "/add"),
+        api_key=api_key,
+        json_body=evidence_payload,
+    )
+    write_ok = status == 200
+    write_check: dict = {
+        "name": "idempotency_write",
+        "passed": write_ok,
+        "detail": f"status={status}" if not write_ok else "evidence memory written",
+    }
+    if write_ok:
+        try:
+            memory_id = json.loads(body).get("id")
+            if memory_id:
+                write_check["evidence_memory_id"] = str(memory_id)
+        except Exception:
+            pass
+        print("  ✅ Idempotency write succeeded.")
+    else:
+        print(f"  ❌ Idempotency write failed: {status} - {body}")
+    checks.append(write_check)
+    if not write_ok:
+        return False, checks
+
+    # 2. Idempotency replay — exact replay returns the same memory id.
+    # Older compat paths may return 409, so keep that as an accepted proof.
+    print("  🔁 Replaying same idempotency_key to prove deduplication...")
+    status2, body2 = _request(
+        "POST",
+        _endpoint(api_url, "/memories", "/add"),
+        api_key=api_key,
+        json_body=evidence_payload,
+    )
+    replay_ok, replay_detail = _verify_idempotency_replay(
+        status2,
+        body2,
+        expected_id=str(write_check.get("evidence_memory_id") or ""),
+    )
+    checks.append({
+        "name": "idempotency_replay",
+        "passed": replay_ok,
+        "detail": replay_detail,
+    })
+    if replay_ok:
+        print(f"  ✅ Idempotency replay confirmed ({replay_detail}).")
+    else:
+        print(f"  ❌ Idempotency replay failed: {replay_detail} - {body2}")
+
+    # 3. Searchable memory proof via /search
+    print("  🧠 Proving searchable memory via /search...")
+    search_ok, search_detail = _verify_memory_retrieval(api_url, api_key, content)
+    checks.append({
+        "name": "federation_searchable_proof",
+        "passed": search_ok,
+        "detail": search_detail,
+    })
+
+    overall = all(c["passed"] for c in checks)
+    if overall:
+        print("✅ Federation Readiness gate passed.")
+    else:
+        print("❌ Federation Readiness gate failed.")
+    return overall, checks
+
+
+def _verify_idempotency_replay(status: int, body: str, *, expected_id: str) -> tuple[bool, str]:
+    if status == 409:
+        return True, "409 conflict/dedup confirmed"
+    if status != 200:
+        return False, f"expected same-id 200 or 409, got {status}"
+
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError:
+        return False, "replay returned non-JSON 200"
+
+    replay_id = str(payload.get("id") or "")
+    if expected_id and replay_id == expected_id:
+        return True, "200 exact replay returned same id"
+    return False, f"expected replay id {expected_id or '<missing>'}, got {replay_id or '<missing>'}"
+
+
+def _check_async(api_url: str, api_key: str) -> tuple[bool, list[dict]]:
     print("\n🚀 Testing async endpoints (Temporal required)...")
+    checks: list[dict] = []
 
     ingest_payload = {
         "content": f"Async Deployment Verification Test {time.time()}",
         "agent_id": "macklemore-qa",
-        "memory_type": "observation",
+        "memory_type": "fact",
         "metadata": {"source": "deployment_test", "mode": "async"},
     }
-    status, body = _request("POST", f"{api_url}/memories/async", api_key=api_key, json_body=ingest_payload)
-    if status != 200:
+    status, body = _request("POST", _endpoint(api_url, "/memories/async", "/memories/async"), api_key=api_key, json_body=ingest_payload)
+    ingest_ok = status == 200
+    checks.append({"name": "async_ingest", "passed": ingest_ok, "detail": f"status={status}" if not ingest_ok else "accepted"})
+    if not ingest_ok:
         print(f"❌ Async ingestion failed: {status} - {body}")
-        return False
+        return False, checks
 
     search_payload = {"query": "deployment_test", "agent_id": "macklemore-qa", "limit": 1}
-    status, body = _request("POST", f"{api_url}/search/async", api_key=api_key, json_body=search_payload)
-    if status != 200:
+    status, body = _request("POST", _endpoint(api_url, "/search/async", "/search/async"), api_key=api_key, json_body=search_payload)
+    search_ok = status == 200
+    checks.append({"name": "async_search", "passed": search_ok, "detail": f"status={status}" if not search_ok else "accepted"})
+    if not search_ok:
         print(f"❌ Async search failed: {status} - {body}")
-        return False
+        return False, checks
 
     print("✅ Async endpoints accepted requests.")
+    return True, checks
+
+
+def _build_proof(
+    gate: str,
+    api_url: str,
+    api_key: str,
+    checks: list[dict],
+    overall: bool,
+) -> dict:
+    """Build a machine-readable proof artifact with secrets redacted."""
+    proof: dict = {
+        "schema_version": 1,
+        "gate": gate,
+        "api_url": api_url,
+        "api_key": "[REDACTED]",
+        "timestamp_utc": datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "checks": checks,
+        "overall": "pass" if overall else "fail",
+    }
+    if gate == "federation":
+        gateway_id = os.environ.get("GATEWAY_ID", "").strip()
+        nats_url = os.environ.get("NATS_RAILWAY_URL", "").strip()
+        if gateway_id:
+            proof["gateway_id"] = gateway_id
+        if nats_url:
+            proof["nats_railway_url"] = _redact_nats_url(nats_url)
+        proof["evidence_memory_ids"] = [
+            c["evidence_memory_id"] for c in checks if "evidence_memory_id" in c
+        ]
+    return proof
+
+
+def _write_proof(proof: dict, path: str) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(proof, f, indent=2)
+    print(f"\n📄 Proof artifact written to {path}")
+
+
+def _verify_single(
+    api_url: str,
+    api_key: str,
+    check_federation: bool,
+    check_async: bool,
+    proof_out: str | None,
+) -> bool:
+    gate = "core"
+    all_checks: list[dict] = []
+
+    health_ok, health_detail = _check_health(api_url)
+    all_checks.append({"name": "health", "passed": health_ok, "detail": health_detail})
+    if not health_ok:
+        if proof_out:
+            _write_proof(_build_proof(gate, api_url, api_key, all_checks, False), proof_out)
+        return False
+
+    content, write_detail = _write_sync_memory(api_url, api_key)
+    all_checks.append({"name": "canonical_write", "passed": content is not None, "detail": write_detail})
+    if not content:
+        if proof_out:
+            _write_proof(_build_proof(gate, api_url, api_key, all_checks, False), proof_out)
+        return False
+
+    search_ok, search_detail = _verify_search_text(api_url, api_key, content)
+    all_checks.append({"name": "search_text", "passed": search_ok, "detail": search_detail})
+    if not search_ok:
+        if proof_out:
+            _write_proof(_build_proof(gate, api_url, api_key, all_checks, False), proof_out)
+        return False
+
+    recall_ok, recall_detail = _verify_memory_retrieval(api_url, api_key, content)
+    all_checks.append({"name": "memory_retrieval", "passed": recall_ok, "detail": recall_detail})
+    if not recall_ok:
+        if proof_out:
+            _write_proof(_build_proof(gate, api_url, api_key, all_checks, False), proof_out)
+        return False
+
+    if check_federation:
+        gate = "federation"
+        fed_ok, fed_checks = _check_federation(api_url, api_key)
+        all_checks.extend(fed_checks)
+        if not fed_ok:
+            if proof_out:
+                _write_proof(_build_proof(gate, api_url, api_key, all_checks, False), proof_out)
+            return False
+
+    if check_async:
+        if gate == "core":
+            gate = "async"
+        async_ok, async_checks = _check_async(api_url, api_key)
+        all_checks.extend(async_checks)
+        if not async_ok:
+            if proof_out:
+                _write_proof(_build_proof(gate, api_url, api_key, all_checks, False), proof_out)
+            return False
+
+    print(f"\n🎉 Deployment verification complete: SUCCESS ({api_url})")
+    if proof_out:
+        _write_proof(_build_proof(gate, api_url, api_key, all_checks, True), proof_out)
     return True
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Verify a memU deployment without mutating infra config.")
-    parser.add_argument("--api-url", default=_default_api_url(), help="Base URL for memU API")
+    parser.add_argument(
+        "--api-url",
+        default=None,
+        help=(
+            "Base URL for memU API. Defaults to MEMU_VERIFY_BASE_URL, "
+            "MEMU_API_URL, MEMU_BASE_URL, then http://127.0.0.1:8000."
+        ),
+    )
     parser.add_argument("--api-key", default=None, help="memU API key (defaults to env/secrets lookup)")
+    parser.add_argument("--check-federation", action="store_true", help="Also verify Federation Readiness gate (idempotency write/replay, searchable memory proof)")
     parser.add_argument("--check-async", action="store_true", help="Also verify Temporal-backed async endpoints")
+    parser.add_argument("--proof-out", default=None, metavar="FILE", help="Write machine-readable JSON proof artifact to FILE (secrets redacted)")
     args = parser.parse_args()
 
-    api_url = args.api_url.rstrip("/")
     api_key = _resolve_api_key(args.api_key)
+    failures: list[str] = []
+    for api_url in _api_candidates(args.api_url):
+        print(f"\n=== Verifying {api_url} ===")
+        if _verify_single(api_url, api_key, args.check_federation, args.check_async, args.proof_out):
+            return 0
+        failures.append(api_url)
 
-    if not _check_health(api_url):
-        return 1
-
-    content = _write_sync_memory(api_url, api_key)
-    if not content or not _verify_ingestion(api_url, api_key, content):
-        return 1
-
-    if args.check_async and not _check_async(api_url, api_key):
-        return 1
-
-    print("\n🎉 Deployment verification complete: SUCCESS")
-    return 0
+    print(f"\n❌ Deployment verification failed for: {', '.join(failures)}")
+    return 1
 
 
 if __name__ == "__main__":

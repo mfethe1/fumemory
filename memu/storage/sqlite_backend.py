@@ -1,57 +1,58 @@
 """SQLite-backed storage (Tier 1).
 
 Mirrors the markdown backend's semantics but uses SQLite with FTS5 for
-sub-second keyword search. Vector search plugs in via ``sqlite-vec`` when
-available; if the extension cannot be loaded, :meth:`search_fts` still
-works and vector calls degrade gracefully.
+sub-second keyword search. Vector search is a pure-Python cosine linear
+scan over BLOB-stored float32 embeddings — good enough for vaults under
+~10K nodes, no C extension required. Graph traversal uses a recursive
+CTE on the links table, so 1–3-hop neighborhoods stay cheap.
 """
 from __future__ import annotations
 
+import array
 import json
+import math
 import re
 import sqlite3
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import AsyncIterator, Literal, Optional
+from typing import AsyncIterator, Iterable, Literal, Optional
 
-from ..lane_lock import FencingTokenError
+_IS_BIG_ENDIAN = sys.byteorder == "big"
+
 from .base import (
     LinkRecord,
     NodeKind,
     SearchHit,
-    StorageBackend,
     WikiNode,
 )
 
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS nodes (
-    id                  TEXT PRIMARY KEY,
-    slug                TEXT UNIQUE NOT NULL,
-    kind                TEXT NOT NULL,
-    title               TEXT NOT NULL,
-    body                TEXT NOT NULL,
-    tags_json           TEXT NOT NULL DEFAULT '[]',
-    metadata_json       TEXT NOT NULL DEFAULT '{}',
-    extra_json          TEXT NOT NULL DEFAULT '{}',
-    source_json         TEXT,
-    agent_id            TEXT NOT NULL DEFAULT 'user',
-    memory_type         TEXT NOT NULL DEFAULT 'observation',
-    salience            REAL NOT NULL DEFAULT 0.5,
-    confidence          REAL NOT NULL DEFAULT 1.0,
-    created_at          TEXT NOT NULL,
-    updated_at          TEXT NOT NULL,
-    happened_at         TEXT,
-    reinforcement_count INTEGER NOT NULL DEFAULT 0,
-    last_reinforced_at  TEXT
+    id            TEXT PRIMARY KEY,
+    slug          TEXT UNIQUE NOT NULL,
+    kind          TEXT NOT NULL,
+    title         TEXT NOT NULL,
+    body          TEXT NOT NULL,
+    tags_json     TEXT NOT NULL DEFAULT '[]',
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    extra_json    TEXT NOT NULL DEFAULT '{}',
+    source_json   TEXT,
+    agent_id      TEXT NOT NULL DEFAULT 'user',
+    memory_type   TEXT NOT NULL DEFAULT 'observation',
+    salience      REAL NOT NULL DEFAULT 0.5,
+    confidence    REAL NOT NULL DEFAULT 1.0,
+    created_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL,
+    happened_at   TEXT
 );
 
 CREATE INDEX IF NOT EXISTS nodes_kind_idx       ON nodes(kind);
 CREATE INDEX IF NOT EXISTS nodes_updated_idx    ON nodes(updated_at);
--- ``nodes_happened_idx`` and ``nodes_reinforce_idx`` are created by
--- ``_apply_idempotent_migrations`` so that legacy DBs without the
--- underlying columns don't error on the CREATE INDEX step before the
--- columns are added.
+-- ``nodes_happened_idx`` is created by ``_apply_idempotent_migrations``
+-- so that legacy DBs without the ``happened_at`` column don't error
+-- on the CREATE INDEX step before the column is added.
 
 CREATE TABLE IF NOT EXISTS slug_registry (
     slug    TEXT PRIMARY KEY,
@@ -69,28 +70,17 @@ CREATE TABLE IF NOT EXISTS links (
 
 CREATE INDEX IF NOT EXISTS links_dst_idx ON links(dst_slug);
 
+CREATE TABLE IF NOT EXISTS embeddings (
+    node_id    TEXT PRIMARY KEY REFERENCES nodes(id) ON DELETE CASCADE,
+    dims       INTEGER NOT NULL,
+    model      TEXT,
+    vector     BLOB NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS nodes_fts USING fts5(
     slug, title, body, tags,
     content='nodes', content_rowid='rowid', tokenize='porter'
-);
-
--- Neighborhood lock registry (see ``memu/neighborhood_lock.py``).
--- One row per held slug; ``root_slug`` records which acquisition owns
--- the row so release can reclaim every slug in a single neighborhood.
-CREATE TABLE IF NOT EXISTS neighborhood_locks (
-    slug           TEXT PRIMARY KEY,
-    agent          TEXT NOT NULL,
-    fencing_token  INTEGER NOT NULL,
-    acquired_at    TEXT NOT NULL,
-    expires_at     TEXT NOT NULL,
-    root_slug      TEXT NOT NULL
-);
-
--- Monotonic fencing-token counter, one row per slug. Survives lock
--- releases so every acquire issues a strictly-higher token.
-CREATE TABLE IF NOT EXISTS fencing_tokens (
-    slug   TEXT PRIMARY KEY,
-    value  INTEGER NOT NULL
 );
 """
 
@@ -113,6 +103,8 @@ END;
 
 
 class SqliteBackend:
+    capabilities = frozenset({"fts", "vector", "graph"})
+
     def __init__(self, path: str):
         self.path = path
         self._conn: Optional[sqlite3.Connection] = None
@@ -159,106 +151,18 @@ class SqliteBackend:
         return self._conn
 
     # ---- node CRUD
-    async def put_node(
-        self,
-        node: WikiNode,
-        *,
-        fencing_token: int | None = None,
-    ) -> WikiNode:
+    async def put_node(self, node: WikiNode) -> WikiNode:
         now = datetime.now(timezone.utc)
         if node.created_at is None:
             node.created_at = now
         node.updated_at = now
-        if fencing_token is not None:
-            # Split-brain guard: require the caller to prove they hold
-            # the current neighborhood lock. Runs in the same implicit
-            # transaction as the INSERT/UPDATE below so a racing
-            # acquirer can't slip between the check and the write.
-            row = self.conn.execute(
-                "SELECT fencing_token FROM neighborhood_locks WHERE slug = ?",
-                (node.slug,),
-            ).fetchone()
-            if row is None:
-                raise FencingTokenError(
-                    f"No neighborhood lock held for slug {node.slug!r}; "
-                    f"cannot validate fencing token {fencing_token}."
-                )
-            held = int(row["fencing_token"])
-            if held != fencing_token:
-                raise FencingTokenError(
-                    f"Fencing token mismatch on slug {node.slug!r}: "
-                    f"caller has {fencing_token}, registry has {held}. "
-                    f"Split-brain prevented."
-                )
-        # Reinforcement-on-duplicate: if the same slug is already in the
-        # index with an identical ``content_hash()``, treat this as a
-        # "seen again" signal and bump the counter/timestamp instead of
-        # overwriting the row. Upstream memU does this to let summaries
-        # surface the most-reinforced items first.
-        existing_row = self.conn.execute(
-            """SELECT id, title, body, reinforcement_count, created_at
-               FROM nodes WHERE slug = ? LIMIT 1""",
-            (node.slug,),
-        ).fetchone()
-        if existing_row is not None and _row_content_hash(existing_row) == node.content_hash():
-            new_count = int(existing_row["reinforcement_count"] or 0) + 1
-            # Reinforcement preserves title+body (that's what equivalence
-            # means) but still refreshes side-channel fields the caller
-            # may have set on the incoming node (``happened_at``,
-            # ``metadata``, ``extra``, ``tags``, ``source``, ``agent_id``,
-            # etc.). Without this, callers who re-put a known-good node
-            # after enriching its metadata would silently lose the
-            # enrichment.
-            self.conn.execute(
-                """UPDATE nodes
-                      SET reinforcement_count = ?,
-                          last_reinforced_at  = ?,
-                          updated_at          = ?,
-                          happened_at         = ?,
-                          tags_json           = ?,
-                          metadata_json       = ?,
-                          extra_json          = ?,
-                          source_json         = ?,
-                          agent_id            = ?,
-                          memory_type         = ?,
-                          salience            = ?,
-                          confidence          = ?
-                    WHERE id = ?""",
-                (
-                    new_count,
-                    now.isoformat(),
-                    now.isoformat(),
-                    node.happened_at.isoformat() if node.happened_at else None,
-                    json.dumps(list(node.tags)),
-                    json.dumps(node.metadata or {}),
-                    json.dumps(node.extra or {}),
-                    json.dumps(node.source) if node.source else None,
-                    node.agent_id,
-                    node.memory_type,
-                    node.salience,
-                    node.confidence,
-                    existing_row["id"],
-                ),
-            )
-            self.conn.commit()
-            # Return the stored node so the caller observes the bumped
-            # counter + merged side-channel fields.
-            stored = await self.get_node(existing_row["id"])
-            return stored if stored is not None else node
-        # Different content — this is a real write. Reset reinforcement
-        # because the node has changed; upstream considers edits a new
-        # "generation" of the memory.
-        if existing_row is not None:
-            node.reinforcement_count = 0
-            node.last_reinforced_at = None
         self.conn.execute(
             """
             INSERT INTO nodes(id, slug, kind, title, body, tags_json, metadata_json,
                               extra_json, source_json, agent_id, memory_type, salience,
-                              confidence, created_at, updated_at, happened_at,
-                              reinforcement_count, last_reinforced_at)
+                              confidence, created_at, updated_at, happened_at)
             VALUES(:id,:slug,:kind,:title,:body,:tags,:meta,:extra,:source,:agent,:mtype,
-                   :sal,:conf,:created,:updated,:happened,:rcount,:rat)
+                   :sal,:conf,:created,:updated,:happened)
             ON CONFLICT(id) DO UPDATE SET
                 slug=excluded.slug,
                 kind=excluded.kind,
@@ -273,9 +177,7 @@ class SqliteBackend:
                 salience=excluded.salience,
                 confidence=excluded.confidence,
                 updated_at=excluded.updated_at,
-                happened_at=excluded.happened_at,
-                reinforcement_count=excluded.reinforcement_count,
-                last_reinforced_at=excluded.last_reinforced_at
+                happened_at=excluded.happened_at
             """,
             {
                 "id": node.id,
@@ -294,8 +196,6 @@ class SqliteBackend:
                 "created": node.created_at.isoformat(),
                 "updated": node.updated_at.isoformat(),
                 "happened": node.happened_at.isoformat() if node.happened_at else None,
-                "rcount": int(node.reinforcement_count or 0),
-                "rat": node.last_reinforced_at.isoformat() if node.last_reinforced_at else None,
             },
         )
         await self.register_slug(node.slug, node.id, node.kind)
@@ -309,25 +209,6 @@ class SqliteBackend:
             )
         self.conn.commit()
         return node
-
-    async def reinforce_node(self, ref: str) -> Optional[WikiNode]:
-        now = datetime.now(timezone.utc)
-        row = self.conn.execute(
-            "SELECT id FROM nodes WHERE id = ? OR slug = ? LIMIT 1",
-            (ref, ref),
-        ).fetchone()
-        if row is None:
-            return None
-        self.conn.execute(
-            """UPDATE nodes
-                  SET reinforcement_count = reinforcement_count + 1,
-                      last_reinforced_at  = ?,
-                      updated_at          = ?
-                WHERE id = ?""",
-            (now.isoformat(), now.isoformat(), row["id"]),
-        )
-        self.conn.commit()
-        return await self.get_node(row["id"])
 
     async def get_node(self, ref: str) -> Optional[WikiNode]:
         row = self.conn.execute(
@@ -427,6 +308,136 @@ class SqliteBackend:
             )
         return out
 
+    # ---- embeddings + vector search
+    async def put_embedding(
+        self,
+        node_id: str,
+        embedding: list[float],
+        *,
+        model: Optional[str] = None,
+    ) -> None:
+        if not embedding:
+            return
+        blob = _pack_vector(embedding)
+        self.conn.execute(
+            """INSERT INTO embeddings(node_id, dims, model, vector, updated_at)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT(node_id) DO UPDATE SET
+                 dims=excluded.dims,
+                 model=excluded.model,
+                 vector=excluded.vector,
+                 updated_at=excluded.updated_at""",
+            (node_id, len(embedding), model, blob, datetime.now(timezone.utc).isoformat()),
+        )
+        self.conn.commit()
+
+    async def search_vector(
+        self,
+        embedding: list[float],
+        k: int = 10,
+        kind: Optional[NodeKind] = None,
+    ) -> list[SearchHit]:
+        if not embedding:
+            return []
+        query_vec = tuple(float(x) for x in embedding)
+        query_norm = math.sqrt(sum(x * x for x in query_vec)) or 1.0
+        if kind:
+            rows = self.conn.execute(
+                """SELECT n.*, e.dims, e.vector FROM embeddings e
+                   JOIN nodes n ON n.id = e.node_id
+                   WHERE n.kind = ?""",
+                (kind,),
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                """SELECT n.*, e.dims, e.vector FROM embeddings e
+                   JOIN nodes n ON n.id = e.node_id"""
+            ).fetchall()
+        scored: list[tuple[float, sqlite3.Row]] = []
+        for row in rows:
+            vec = _unpack_vector(row["vector"], row["dims"])
+            if len(vec) != len(query_vec):
+                continue
+            dot = 0.0
+            norm = 0.0
+            for a, b in zip(query_vec, vec):
+                dot += a * b
+                norm += b * b
+            denom = query_norm * (math.sqrt(norm) or 1.0)
+            scored.append((dot / denom, row))
+        scored.sort(key=lambda t: t[0], reverse=True)
+        return [
+            SearchHit(node=self._row_to_node(r), score=s, reason="vector")
+            for s, r in scored[:k]
+        ]
+
+    # ---- graph (recursive CTE)
+    async def search_graph(
+        self,
+        start_slug: str,
+        hops: int = 1,
+        rel_types: Optional[list[str]] = None,
+    ) -> list[SearchHit]:
+        if hops < 1 or not start_slug:
+            return []
+        start_id = await self.resolve_slug(start_slug)
+        if start_id is None:
+            return []
+        # Bidirectional BFS expressed as a recursive CTE. ``depth`` counts
+        # hops from the start; we cap via the SQL predicate so SQLite's
+        # recursion limit never bites.
+        params: list = [start_slug, start_id, hops]
+        type_filter = ""
+        if rel_types:
+            placeholders = ",".join("?" for _ in rel_types)
+            type_filter = f" AND l.type IN ({placeholders})"
+            params.extend(rel_types)
+            params.append(hops)  # second occurrence in the UNION ALL branch
+            params = [start_slug, start_id, hops] + list(rel_types) + [hops] + list(rel_types)
+        cte = f"""
+        WITH RECURSIVE expand(node_id, slug, depth) AS (
+            SELECT n.id, n.slug, 0 FROM nodes n WHERE n.id = ?
+            UNION
+            SELECT n2.id, n2.slug, e.depth + 1
+            FROM expand e
+            JOIN links l ON l.src_id = e.node_id
+            JOIN slug_registry s ON s.slug = l.dst_slug
+            JOIN nodes n2 ON n2.id = s.node_id
+            WHERE e.depth < ?{type_filter}
+            UNION
+            SELECT n3.id, n3.slug, e.depth + 1
+            FROM expand e
+            JOIN links l ON l.dst_slug = e.slug
+            JOIN nodes n3 ON n3.id = l.src_id
+            WHERE e.depth < ?{type_filter}
+        )
+        SELECT n.*, e.depth AS _depth FROM expand e
+        JOIN nodes n ON n.id = e.node_id
+        WHERE e.depth > 0 AND n.slug != ?
+        ORDER BY e.depth, n.slug
+        """
+        if rel_types:
+            sql_params: list = [start_id, hops, *rel_types, hops, *rel_types, start_slug]
+        else:
+            sql_params = [start_id, hops, hops, start_slug]
+        rows = self.conn.execute(cte, sql_params).fetchall()
+        # Dedup by node id (the CTE can reach the same node via both
+        # directions; we keep the shallowest depth).
+        seen: dict[str, tuple[int, sqlite3.Row]] = {}
+        for row in rows:
+            prev = seen.get(row["id"])
+            if prev is None or row["_depth"] < prev[0]:
+                seen[row["id"]] = (row["_depth"], row)
+        _ = start_slug  # reserved for future weighting by link strength
+        return [
+            SearchHit(
+                node=self._row_to_node(r),
+                score=1.0 / (1 + d),
+                reason="graph",
+            )
+            for d, r in sorted(seen.values(), key=lambda t: (t[0], t[1]["slug"]))
+        ]
+
     # ---- search
     async def search_fts(
         self, query: str, k: int = 10, kind: Optional[NodeKind] = None
@@ -479,8 +490,6 @@ class SqliteBackend:
         ).fetchall()
         extra_json = _column_or_default(row, "extra_json", "{}")
         happened_at_val = _column_or_default(row, "happened_at", None)
-        rc = _column_or_default(row, "reinforcement_count", 0) or 0
-        lra = _column_or_default(row, "last_reinforced_at", None)
         return WikiNode(
             id=row["id"],
             slug=row["slug"],
@@ -498,8 +507,6 @@ class SqliteBackend:
             created_at=_parse(row["created_at"]),
             updated_at=_parse(row["updated_at"]),
             happened_at=_parse(happened_at_val) if happened_at_val else None,
-            reinforcement_count=int(rc),
-            last_reinforced_at=_parse(lra) if lra else None,
             links=[
                 LinkRecord(
                     src_slug=row["slug"],
@@ -522,23 +529,6 @@ def _parse(val: Optional[str]) -> Optional[datetime]:
         return None
 
 
-def _row_content_hash(row: sqlite3.Row) -> str:
-    """Content hash of a raw ``nodes`` row (title + body).
-
-    Uses the same normalization as :meth:`WikiNode.content_hash` so
-    ``put_node`` can decide reinforce-vs-overwrite without materializing
-    a full ``WikiNode`` first.
-    """
-    # Build a throwaway WikiNode-like object just to call the method;
-    # avoids duplicating the normalization logic here.
-    from .base import WikiNode as _WN  # local import avoids cycle at module load
-    return _WN(
-        id="", slug="", kind="note",
-        title=row["title"] or "",
-        body=row["body"] or "",
-    ).content_hash()
-
-
 def _apply_idempotent_migrations(conn: sqlite3.Connection) -> None:
     """Bring older SQLite vaults forward without a separate migration tool.
 
@@ -559,20 +549,12 @@ def _apply_idempotent_migrations(conn: sqlite3.Connection) -> None:
     migrations: list[tuple[str, str]] = [
         ("extra_json", "ALTER TABLE nodes ADD COLUMN extra_json TEXT NOT NULL DEFAULT '{}'"),
         ("happened_at", "ALTER TABLE nodes ADD COLUMN happened_at TEXT"),
-        (
-            "reinforcement_count",
-            "ALTER TABLE nodes ADD COLUMN reinforcement_count INTEGER NOT NULL DEFAULT 0",
-        ),
-        ("last_reinforced_at", "ALTER TABLE nodes ADD COLUMN last_reinforced_at TEXT"),
     ]
     for column, ddl in migrations:
         if column not in existing:
             conn.execute(ddl)
     conn.execute(
         "CREATE INDEX IF NOT EXISTS nodes_happened_idx ON nodes(happened_at)"
-    )
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS nodes_reinforce_idx ON nodes(reinforcement_count)"
     )
 
 
@@ -598,6 +580,25 @@ def _column_or_default(row: sqlite3.Row, name: str, default):
 
 
 _FTS_TOKEN_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_\-]*")
+
+
+def _pack_vector(values: Iterable[float]) -> bytes:
+    """Serialize a float list as packed little-endian float32 bytes."""
+    buf = array.array("f", (float(v) for v in values))
+    if _IS_BIG_ENDIAN:
+        buf.byteswap()
+    return buf.tobytes()
+
+
+def _unpack_vector(blob: bytes, dims: int) -> tuple[float, ...]:
+    buf = array.array("f")
+    buf.frombytes(blob)
+    if _IS_BIG_ENDIAN:
+        buf.byteswap()
+    if len(buf) != dims:
+        # Corrupt or mismatched row — surface as empty so callers skip it.
+        return ()
+    return tuple(buf)
 
 
 def _escape_fts_query(query: str) -> str:

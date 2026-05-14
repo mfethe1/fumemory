@@ -21,6 +21,27 @@ class MemoryType(str, Enum):
     # Procedural memory — parameterized skill templates (Phase 3)
     procedural = "procedural"
 
+
+class MemoryKind(str, Enum):
+    """Primary discriminator between immutable execution proof and reusable knowledge.
+
+    evidence — append-only, task-bound execution proof written by OpenClaw gateways.
+    learning — derived, reusable knowledge distilled from one or more evidence records.
+
+    Distinct from memory_type, which is a semantic taxonomy (decision, lesson, etc.).
+    """
+    evidence = "evidence"
+    learning = "learning"
+
+
+class ReviewStatus(str, Enum):
+    """Lifecycle state for Learning Memory, tracking reflection review progress."""
+    proposed = "proposed"
+    accepted = "accepted"
+    accepted_by_timeout = "accepted_by_timeout"
+    rejected = "rejected"
+    legacy = "legacy"
+
 class Relationship(BaseModel):
     """Graph-Lite entity/relationship tag for memory connections."""
     entity: str = Field(..., description="Entity name or ID being referenced")
@@ -31,6 +52,7 @@ class Relationship(BaseModel):
 class MemoryCreate(BaseModel):
     content: str
     memory_type: MemoryType = MemoryType.observation
+    memory_kind: MemoryKind = MemoryKind.learning
     agent_id: str
     metadata: Optional[dict] = None
     parent_id: Optional[UUID] = None
@@ -40,11 +62,21 @@ class MemoryCreate(BaseModel):
     invalidates: list[UUID] = Field(default_factory=list)
     salience_score: float = Field(0.5, ge=0.0, le=1.0, description="Salience: 0.0=routine, 1.0=critical")
     allowed_roles: list[str] = Field(default_factory=lambda: ["*"], description="ABAC: roles that may access this memory. ['*'] = unrestricted.")
+    idempotency_key: Optional[str] = Field(
+        None,
+        max_length=255,
+        description=(
+            "Tenant-scoped idempotency key for Evidence Memory. "
+            "Exact replay returns the same ID; same key with a different canonical "
+            "payload returns 409 Conflict."
+        ),
+    )
 
 class Memory(BaseModel):
     id: UUID
     content: str
     memory_type: str
+    memory_kind: str = "learning"
     agent_id: str
     metadata: dict
     parent_id: Optional[UUID]
@@ -53,8 +85,15 @@ class Memory(BaseModel):
     decay_score: Optional[float] = None
     salience_score: float = 0.5
     searchable: bool = True
+    review_status: Optional[str] = None
     created_at: datetime
     updated_at: datetime
+
+class RecallMode(str, Enum):
+    """Explicit recall mode. learning is the default; forensic must be requested."""
+    learning = "learning"
+    forensic = "forensic"
+
 
 class SearchRequest(BaseModel):
     query: str
@@ -71,6 +110,55 @@ class SearchRequest(BaseModel):
     time_window_end: datetime | None = None
     entity_weight: float = 0.15
     agent_roles: list[str] | None = Field(None, description="ABAC: caller's roles for access filtering. None = no filtering.")
+
+
+class ForensicRecallRequest(BaseModel):
+    """Request shape for Forensic Recall — returns Evidence Memory with replay-grade provenance."""
+    query: Optional[str] = Field(None, description="Optional semantic/lexical query to narrow evidence records.")
+    task_id: Optional[str] = Field(None, description="Filter by OpenClaw task ID stored in metadata.")
+    session_id: Optional[str] = Field(None, description="Filter by session ID stored in metadata.")
+    gateway_id: Optional[str] = Field(None, description="Filter by gateway ID stored in metadata.")
+    agent_id: Optional[str] = Field(None, description="Filter by agent_id column.")
+    event_type: Optional[str] = Field(None, description="Filter by event_type stored in metadata.")
+    time_window_start: Optional[datetime] = Field(None, description="Earliest created_at to include.")
+    time_window_end: Optional[datetime] = Field(None, description="Latest created_at to include.")
+    artifact_ref: Optional[str] = Field(None, description="Filter evidence whose artifact_refs contain this value.")
+    limit: int = Field(20, ge=1, le=200)
+    cursor: Optional[str] = Field(None, description="Opaque pagination cursor from a previous response.")
+    include_content: bool = Field(True, description="When False, content is redacted from all items.")
+    agent_roles: Optional[list[str]] = Field(None, description="ABAC: caller roles for per-record access filtering.")
+
+
+class ForensicRecallItem(BaseModel):
+    """Single evidence record returned by Forensic Recall with replay-grade provenance."""
+    evidence_id: UUID
+    memory_kind: str
+    memory_type: str
+    content: Optional[str] = None
+    redacted: bool = False
+    redaction_reason: Optional[str] = None
+    event_type: Optional[str] = None
+    event_at: Optional[datetime] = None
+    task_id: Optional[str] = None
+    session_id: Optional[str] = None
+    gateway_id: Optional[str] = None
+    agent_id: str
+    source: Optional[str] = None
+    source_ref: Optional[str] = None
+    artifact_refs: list[str] = Field(default_factory=list)
+    allowed_roles: list[str] = Field(default_factory=lambda: ["*"])
+    provenance_links: list[str] = Field(
+        default_factory=list,
+        description="Source evidence IDs for learning records or correction record IDs for evidence.",
+    )
+    created_at: datetime
+
+
+class ForensicRecallResponse(BaseModel):
+    """Paginated response for Forensic Recall."""
+    items: list[ForensicRecallItem]
+    next_cursor: Optional[str] = None
+    total_count: Optional[int] = None
 
 class SearchResult(BaseModel):
     memory: Memory
@@ -239,3 +327,78 @@ class GatewayLeaseAcquireResponse(BaseModel):
     ok: bool = True
     status: str
     lease: GatewayLease
+
+
+# ---------------------------------------------------------------------------
+# Reflection Review Queue models (Issue #28)
+# ---------------------------------------------------------------------------
+
+class ReflectionSource(str, Enum):
+    """Origin of a reflection proposal."""
+    task_close = "task_close"
+    idle_dream = "idle_dream"
+
+
+class ReflectionProposalStatus(str, Enum):
+    """Lifecycle state for a reflection proposal."""
+    pending = "pending"
+    accepted = "accepted"
+    accepted_by_timeout = "accepted_by_timeout"
+    rejected = "rejected"
+    superseded = "superseded"
+
+
+class ReflectionAction(str, Enum):
+    """Actions a reviewer can take on a pending proposal."""
+    approve = "approve"
+    deny = "deny"
+    edit = "edit"
+    inspect = "inspect"
+
+
+class ReflectionProposal(BaseModel):
+    proposal_id: UUID
+    tenant_id: str
+    status: str
+    source: str
+    summary: str
+    content: str
+    confidence: float
+    risk_flags: list[str]
+    source_task_id: Optional[str]
+    source_session_id: Optional[str]
+    source_evidence_ids: list[str]
+    expires_at: datetime
+    telegram_message_id: Optional[str]
+    memory_id: Optional[UUID]
+    superseded_by: Optional[UUID]
+    agent_id: str
+    created_at: datetime
+    updated_at: datetime
+
+
+class ReflectionProposalCreate(BaseModel):
+    source: ReflectionSource
+    summary: str
+    content: str
+    confidence: float = Field(0.7, ge=0.0, le=1.0)
+    risk_flags: list[str] = Field(default_factory=list)
+    source_task_id: Optional[str] = None
+    source_session_id: Optional[str] = None
+    source_evidence_ids: list[str] = Field(default_factory=list)
+    agent_id: str
+
+
+class ReflectionActionRequest(BaseModel):
+    actor: str
+    decision: ReflectionAction
+    notes: Optional[str] = None
+    edited_content: Optional[str] = None
+
+
+class ReflectionActionResponse(BaseModel):
+    proposal_id: UUID
+    decision: str
+    status: str
+    memory_id: Optional[UUID] = None
+    supersedes_id: Optional[UUID] = None

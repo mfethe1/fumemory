@@ -6,15 +6,19 @@ import os
 import sys
 from datetime import datetime, timezone
 
+import nats
+
 # Force unbuffered output
 sys.stdout.reconfigure(line_buffering=True)
 sys.stderr.reconfigure(line_buffering=True)
 
-import nats
-
 NATS_URLS = [
-    os.environ.get("NATS_LOCAL_URL", "nats://100.76.63.58:4222"),
-    os.environ.get("NATS_RAILWAY_URL", "nats://gondola.proxy.rlwy.net:22393"),
+    url
+    for url in (
+        os.environ.get("NATS_LOCAL_URL", "nats://127.0.0.1:4222"),
+        os.environ.get("NATS_RAILWAY_URL"),
+    )
+    if url
 ]
 
 

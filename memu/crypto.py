@@ -21,7 +21,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any
 from uuid import UUID
 
@@ -32,7 +32,6 @@ _BACKEND: str = "none"
 
 try:
     from nacl.signing import SigningKey, VerifyKey
-    from nacl.exceptions import BadSignatureError
     _BACKEND = "nacl"
 except ImportError:
     try:
@@ -41,7 +40,6 @@ except ImportError:
             Ed25519PublicKey,
         )
         from cryptography.hazmat.primitives import serialization
-        from cryptography.exceptions import InvalidSignature
         _BACKEND = "cryptography"
     except ImportError:
         logger.warning(

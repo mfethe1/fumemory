@@ -36,7 +36,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest", "pytest-asyncio", "ruff", "mypy", "respx"]
+dev = ["pytest", "pytest-asyncio", "ruff", "mypy", "respx", "PyYAML>=6"]
 
 [project.urls]
 Homepage = "https://github.com/protelynx/memu"

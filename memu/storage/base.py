@@ -14,13 +14,11 @@ from datetime import datetime
 from typing import (
     Any,
     AsyncIterator,
-    Iterable,
     Literal,
     Optional,
     Protocol,
     runtime_checkable,
 )
-from uuid import UUID
 
 
 _WS_RE = re.compile(r"\s+")
@@ -181,13 +179,26 @@ class SearchHit:
     reason: str = "vector"  # vector | fts | graph | slug
 
 
+Capability = Literal["fts", "vector", "graph"]
+
+
 @runtime_checkable
 class StorageBackend(Protocol):
     """Protocol every storage tier implements.
 
     All methods are async-friendly; synchronous backends (markdown) wrap
     their sync calls but still present an async interface.
+
+    Capabilities
+    ------------
+    Backends declare which retrieval paths they support via
+    :attr:`capabilities`. ``"fts"`` is always present; ``"vector"`` and
+    ``"graph"`` are optional. Callers (like the RLM retriever) inspect
+    this set to decide which ``search_*`` methods to invoke — unsupported
+    methods either raise :class:`NotImplementedError` or return ``[]``.
     """
+
+    capabilities: frozenset[Capability]
 
     async def init(self) -> None: ...
 
@@ -239,6 +250,38 @@ class StorageBackend(Protocol):
 
     # --- search ---
     async def search_fts(self, query: str, k: int = 10, kind: Optional[NodeKind] = None) -> list[SearchHit]: ...
+
+    async def search_vector(
+        self,
+        embedding: list[float],
+        k: int = 10,
+        kind: Optional[NodeKind] = None,
+    ) -> list[SearchHit]:
+        """Nearest-neighbor search by vector similarity.
+
+        Backends without ``"vector"`` in :attr:`capabilities` may return
+        ``[]`` (preferred) or raise :class:`NotImplementedError`.
+        """
+        return []
+
+    async def search_graph(
+        self,
+        start_slug: str,
+        hops: int = 1,
+        rel_types: Optional[list[str]] = None,
+    ) -> list[SearchHit]:
+        """K-hop neighborhood expansion from a starting slug.
+
+        Backends without ``"graph"`` in :attr:`capabilities` may return
+        ``[]``.
+        """
+        return []
+
+    async def put_embedding(
+        self, node_id: str, embedding: list[float], *, model: Optional[str] = None
+    ) -> None:
+        """Store an embedding for a node. No-op on FTS-only backends."""
+        return None
 
     # --- iteration (for sync/migration) ---
     async def iter_changed(self, since: Optional[datetime] = None) -> AsyncIterator[WikiNode]: ...

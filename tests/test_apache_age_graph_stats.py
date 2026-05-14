@@ -4,7 +4,7 @@ All tests use mocks — no live DB required.
 """
 import pathlib
 import sys
-from unittest.mock import AsyncMock, call
+from unittest.mock import AsyncMock
 
 import pytest
 from fastapi import HTTPException

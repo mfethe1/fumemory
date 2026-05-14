@@ -43,9 +43,9 @@ def test_sqlite_crud_and_fts(tmp_path):
 
         # Outbound + inbound links
         out = await backend.list_links("beta", direction="out")
-        assert [l.dst_slug for l in out] == ["alpha"]
+        assert [link.dst_slug for link in out] == ["alpha"]
         inbound = await backend.list_links("alpha", direction="in")
-        assert [l.src_slug for l in inbound] == ["beta"]
+        assert [link.src_slug for link in inbound] == ["beta"]
 
         # Kind filter
         hits_code = await backend.search_fts("quick", k=5, kind="code")

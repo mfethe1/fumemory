@@ -312,7 +312,7 @@ async def _run_standalone() -> None:
     import nats
 
     nc = await nats.connect(primary_nats_url())
-    js = nc.jetstream()
+    nc.jetstream()
 
     cluster = NATSClusterManager()
     await cluster.connect()

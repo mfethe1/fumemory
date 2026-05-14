@@ -9,7 +9,6 @@ The same dispatcher powers the MCP server, so behavior is identical.
 from __future__ import annotations
 
 import asyncio
-from typing import Iterable
 
 from memu.mcp import tools
 from memu.storage import get_backend

@@ -39,7 +39,7 @@ def test_wiki_write_then_search(tmp_path):
 
         read = await tools.dispatch(backend, "wiki_read", {"ref": "quick"})
         assert read["slug"] == "quick"
-        assert any(l["dst_slug"] == "beta" for l in read["outbound"])
+        assert any(link["dst_slug"] == "beta" for link in read["outbound"])
 
         await backend.close()
 

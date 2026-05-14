@@ -22,7 +22,7 @@ from typing import Any
 from uuid import UUID
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from memu.cluster import NATSClusterManager
 from memu.nats_publisher import tenant_subject

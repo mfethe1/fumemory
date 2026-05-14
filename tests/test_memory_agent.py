@@ -1,10 +1,8 @@
 """Tests for the memU memory agent — compaction, concept indexing, and RRF fusion."""
 
-import asyncio
-import json
 import math
 import uuid
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -230,14 +228,16 @@ class TestMigrationIdempotency:
         assert path.exists()
 
     def test_uses_if_not_exists_for_tables(self):
-        import pathlib, re
+        import pathlib
+        import re
         sql = (pathlib.Path(__file__).parent.parent / "memu" / "migrations" / "014_memory_agent.sql").read_text()
         # Every CREATE TABLE should have IF NOT EXISTS
         bare_creates = re.findall(r"CREATE\s+TABLE\s+(?!IF\s+NOT\s+EXISTS)", sql, re.IGNORECASE)
         assert len(bare_creates) == 0, f"Non-idempotent CREATE TABLE: {bare_creates}"
 
     def test_uses_if_not_exists_for_indexes(self):
-        import pathlib, re
+        import pathlib
+        import re
         sql = (pathlib.Path(__file__).parent.parent / "memu" / "migrations" / "014_memory_agent.sql").read_text()
         # CREATE INDEX (outside DO blocks) should have IF NOT EXISTS
         # Only check top-level statements, not those inside DO $$ blocks

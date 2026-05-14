@@ -24,7 +24,6 @@ import os
 import sys
 import time
 from datetime import datetime, timezone
-from uuid import UUID
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +37,28 @@ NATS_RAILWAY_URL = os.environ.get("NATS_RAILWAY_URL")
 MEMU_API_URL = os.environ.get("MEMU_API_URL", "http://localhost:8000")
 MEMU_API_KEY = os.environ.get("MEMU_API_KEY", "memu-dev-key")
 MAX_HYDRATION_TOKENS = int(os.environ.get("MAX_HYDRATION_TOKENS", "8000"))
+
+
+def _current_tenant_id() -> str | None:
+    return os.environ.get("TENANT_ID") or None
+
+
+def _swarm_subject(subject: str) -> str:
+    from memu.nats_publisher import tenant_subject
+
+    return tenant_subject(_current_tenant_id(), subject)
+
+
+async def _publish_gateway_offline(cluster) -> None:
+    nc = cluster.active_connection
+    await nc.publish(
+        _swarm_subject("swarm.discovery"),
+        json.dumps({
+            "gateway_id": GATEWAY_ID,
+            "status": "offline",
+            "reason": "graceful_shutdown",
+        }).encode(),
+    )
 
 
 async def hydrate_state() -> dict:
@@ -162,14 +183,9 @@ async def _summarize(client, text: str, max_tokens: int) -> str:
 
 async def register_with_mesh():
     """Connect to NATS, generate signing keypair, and announce this gateway's capabilities."""
-    import nats
-
     from memu.cluster import NATSClusterManager
     from memu.crypto import GatewayKeyPair, get_backend
-    from memu.nats_publisher import tenant_subject
     from memu.swarm_models import GatewayAnnounce, GatewayStatus
-
-    _tenant_id = os.environ.get("TENANT_ID") or None
 
     cluster = NATSClusterManager(
         local_url=NATS_LOCAL_URL,
@@ -215,8 +231,8 @@ async def register_with_mesh():
             pass
 
     # Subscribe to both the specific and wildcard suicide channels
-    await nc.subscribe(tenant_subject(_tenant_id, f"swarm.advisory.suicide.{GATEWAY_ID}"), cb=_suicide_handler)
-    await nc.subscribe(tenant_subject(_tenant_id, "swarm.advisory.suicide.*"), cb=_suicide_handler)
+    await nc.subscribe(_swarm_subject(f"swarm.advisory.suicide.{GATEWAY_ID}"), cb=_suicide_handler)
+    await nc.subscribe(_swarm_subject("swarm.advisory.suicide.*"), cb=_suicide_handler)
     logger.info(f"Suicide signal listener active on swarm.advisory.suicide.{GATEWAY_ID}")
 
     # Announce presence (include public key for signature verification)
@@ -234,7 +250,7 @@ async def register_with_mesh():
     )
 
     await nc.publish(
-        tenant_subject(_tenant_id, "swarm.discovery"),
+        _swarm_subject("swarm.discovery"),
         announce.model_dump_json().encode(),
     )
 
@@ -249,7 +265,7 @@ async def start_heartbeat(cluster, interval_s: float = 3.0):
     while True:
         try:
             await nc.publish(
-                tenant_subject(_tenant_id, "swarm.warden.heartbeat"),
+                _swarm_subject("swarm.warden.heartbeat"),
                 json.dumps({
                     "gateway_id": GATEWAY_ID,
                     "task_id": TASK_ID,
@@ -327,7 +343,7 @@ async def main():
         format=f"%(asctime)s [{GATEWAY_ID}] %(levelname)s %(message)s",
     )
 
-    logger.info(f"=== Gateway Boot ===")
+    logger.info("=== Gateway Boot ===")
     logger.info(f"  ID:   {GATEWAY_ID}")
     logger.info(f"  Role: {GATEWAY_ROLE}")
     logger.info(f"  Task: {TASK_ID or 'none (warm standby)'}")
@@ -374,15 +390,7 @@ async def main():
         if cluster:
             # Publish draining status before exit
             try:
-                nc = cluster.active_connection
-                await nc.publish(
-                    tenant_subject(_tenant_id, "swarm.discovery"),
-                    json.dumps({
-                        "gateway_id": GATEWAY_ID,
-                        "status": "offline",
-                        "reason": "graceful_shutdown",
-                    }).encode(),
-                )
+                await _publish_gateway_offline(cluster)
             except Exception:
                 pass
             # Drain NATS before closing to flush in-flight messages

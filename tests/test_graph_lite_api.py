@@ -9,7 +9,6 @@ import httpx
 import os
 import sys
 import pytest
-from uuid import uuid4
 
 pytestmark = pytest.mark.skip(reason="manual integration script; requires live memU API")
 
@@ -126,18 +125,18 @@ async def test_graph_lite_api():
         # Verify our memories are in the results
         result_ids = [r["memory"]["id"] for r in search_results]
         assert base_memory_id in result_ids, "Base memory not found in search results"
-        print(f"✓ Base memory found in search results")
+        print("✓ Base memory found in search results")
         
         # Test 5: Verify relationship link was created
         print("\n[Test 5] Verifying relationship link via direct query...")
         # This would require a custom endpoint or database access
         # For now, we verify the memory was created successfully
-        print(f"✓ Relationship link creation verified (memory created successfully)")
+        print("✓ Relationship link creation verified (memory created successfully)")
         
         print("\n" + "=" * 80)
         print("✅ All Graph-Lite API tests passed!")
         print("=" * 80)
-        print(f"\nCreated memories:")
+        print("\nCreated memories:")
         print(f"  - Base: {base_memory_id}")
         print(f"  - Related: {related_memory_id}")
         print(f"  - Entity-tagged: {entity_memory_id}")

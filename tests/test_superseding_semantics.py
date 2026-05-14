@@ -54,7 +54,9 @@ async def test_create_memory_supersedes_marks_previous_versions_and_links(monkey
     )
 
     insert_call = conn.fetchrow.await_args_list[1]
-    inserted_metadata = json.loads(insert_call.args[5])
+    # INSERT args: SQL, content, embedding, memory_type, memory_kind, agent_id, metadata, ...
+    # metadata is at args[6] after memory_kind was added in migration 020
+    inserted_metadata = json.loads(insert_call.args[6])
     assert inserted_metadata["supersedes"] == str(old_id)
     assert inserted_metadata["invalidates"] == [str(old_id)]
 

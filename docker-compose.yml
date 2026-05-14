@@ -59,7 +59,7 @@ services:
       DATABASE_URL: postgresql://memu:memu@postgres:5432/memu
       MEMU_API_KEY: ${MEMU_API_KEY:-memu-dev-key}
       OPENAI_API_KEY: ${OPENAI_API_KEY}
-      EMBEDDING_BASE_URL: http://ollama:11434
+      EMBEDDING_API_BASE: http://ollama:11434
       EMBEDDING_MODEL: ${EMBEDDING_MODEL:-qwen3-embedding}
       EMBEDDING_DIMS: ${EMBEDDING_DIMS:-4096}
       NATS_LOCAL_URL: nats://nats:4222
@@ -125,6 +125,9 @@ services:
     restart: unless-stopped
     build: .
     command: ["python", "-m", "memu.ws_bridge"]
+    environment:
+      NATS_LOCAL_URL: nats://nats:4222
+      NATS_RAILWAY_URL: ${NATS_RAILWAY_URL:-nats://nats:4222}
 
   event-consumer:
     restart: unless-stopped
