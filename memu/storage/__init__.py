@@ -49,7 +49,17 @@ def get_backend(dsn: str | None = None) -> StorageBackend:
     if scheme == "sqlite":
         from .sqlite_backend import SqliteBackend
 
-        path = os.path.expanduser(parsed.path.lstrip("/") or ":memory:")
+        # Follow the SQLAlchemy convention:
+        #   sqlite:///relative/path  -> parsed.path = '/relative/path'   -> relative
+        #   sqlite:////abs/path      -> parsed.path = '//abs/path'       -> absolute
+        # ``urlparse`` leaves the leading slashes in ``parsed.path``;
+        # we strip exactly one to recover the intended path.
+        raw = parsed.path or ""
+        if raw.startswith("//"):
+            raw = raw[1:]  # keep the leading slash -> absolute
+        elif raw.startswith("/"):
+            raw = raw[1:]  # drop the scheme's own slash -> relative
+        path = os.path.expanduser(raw or ":memory:")
         return SqliteBackend(path=path)
     if scheme in {"postgres", "postgresql"}:
         from .postgres_backend import PostgresBackend
