@@ -382,7 +382,12 @@ def _build_node(
         source["commit"] = commit_sha
     if repo_url:
         source["repo"] = repo_url
-    metadata = {"content_hash": parsed.content_hash}
+    # ``source_hash`` — SHA-256 over the raw source file, powering the
+    # ingester's "skip unchanged" fast path. Distinct from
+    # :meth:`WikiNode.content_hash` (which hashes the rendered wiki
+    # body+title for reinforcement-on-duplicate). Namespaced to avoid
+    # collision when both concerns coexist.
+    metadata = {"source_hash": parsed.content_hash}
     return WikiNode(
         id=str(uuid.uuid4()),
         slug=slug,
@@ -404,15 +409,27 @@ def _build_node(
 async def _put_with_hash(
     backend: StorageBackend,
     node: WikiNode,
-    content_hash: str,
+    source_hash: str,
     result: IngestResult,
     *,
     force: bool,
 ) -> None:
+    """Skip-if-unchanged helper keyed on the raw-source-file hash.
+
+    ``source_hash`` is the ingester's SHA-256 of the file bytes. It
+    lives in ``metadata['source_hash']`` and is independent of
+    :meth:`WikiNode.content_hash`, which hashes the rendered wiki body
+    and drives reinforcement-on-duplicate inside the backend's
+    ``put_node``.
+    """
     existing = await backend.get_node(node.slug)
     if existing is not None:
-        existing_hash = (existing.metadata or {}).get("content_hash")
-        if not force and existing_hash == content_hash:
+        meta = existing.metadata or {}
+        # Accept both the new ``source_hash`` key and the legacy
+        # ``content_hash`` key so vaults built before the rename stay
+        # incremental across an upgrade.
+        existing_hash = meta.get("source_hash") or meta.get("content_hash")
+        if not force and existing_hash == source_hash:
             result.unchanged.append(node.slug)
             return
         node.id = existing.id

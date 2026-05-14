@@ -52,10 +52,71 @@ class MarkdownBackend:
         return [p for p in self.layout.root.rglob("*.md") if "_index" not in p.parts]
 
     # ----------------------------------------------------------------- CRUD
-    async def put_node(self, node: WikiNode) -> WikiNode:
-        node.updated_at = datetime.now(timezone.utc)
+    async def put_node(
+        self,
+        node: WikiNode,
+        *,
+        fencing_token: int | None = None,
+    ) -> WikiNode:
+        # TODO(neighborhood-lock): enforce fencing_token against
+        # ``.memu/locks/_fence/<slug>`` (see NEIGHBORHOOD_LOCK_DESIGN §5).
+        # The token is accepted-and-ignored for now so callers can
+        # thread it uniformly across tiers; SQLite is the tier that
+        # actively enforces it in this PR.
+        del fencing_token
+        now = datetime.now(timezone.utc)
+        # Reinforcement-on-duplicate: same slug + same content_hash() =>
+        # bump the counter instead of rewriting. Preserves the original
+        # ``created_at`` and body bytes. Different body resets the
+        # counter (a new generation of the memory).
+        existing = await self._find_by_slug(node.slug)
+        if existing is not None and existing.content_hash() == node.content_hash():
+            # Reinforcement preserves title+body (that's what equivalence
+            # means) but still refreshes side-channel fields the caller
+            # may have set on the incoming node (``happened_at``,
+            # ``metadata``, ``extra``, ``tags``, ``source``, ``agent_id``,
+            # etc.). Without this, callers who re-put a known-good node
+            # after enriching its metadata would silently lose the
+            # enrichment.
+            existing.reinforcement_count = (existing.reinforcement_count or 0) + 1
+            existing.last_reinforced_at = now
+            existing.updated_at = now
+            existing.tags = list(node.tags)
+            existing.metadata = dict(node.metadata or {})
+            existing.extra = dict(node.extra or {})
+            existing.source = node.source
+            existing.happened_at = node.happened_at
+            existing.agent_id = node.agent_id
+            existing.memory_type = node.memory_type
+            existing.salience = node.salience
+            existing.confidence = node.confidence
+            path = self._path_for(existing)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            fm = existing.to_frontmatter()
+            body = existing.body or f"# {existing.title}\n"
+            path.write_text(dump_frontmatter(fm, body), encoding="utf-8")
+            return existing
+        if existing is not None:
+            node.reinforcement_count = 0
+            node.last_reinforced_at = None
+        node.updated_at = now
         if node.created_at is None:
-            node.created_at = node.updated_at
+            node.created_at = now
+        path = self._path_for(node)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fm = node.to_frontmatter()
+        body = node.body or f"# {node.title}\n"
+        path.write_text(dump_frontmatter(fm, body), encoding="utf-8")
+        return node
+
+    async def reinforce_node(self, ref: str) -> Optional[WikiNode]:
+        node = await self.get_node(ref)
+        if node is None:
+            return None
+        now = datetime.now(timezone.utc)
+        node.reinforcement_count = (node.reinforcement_count or 0) + 1
+        node.last_reinforced_at = now
+        node.updated_at = now
         path = self._path_for(node)
         path.parent.mkdir(parents=True, exist_ok=True)
         fm = node.to_frontmatter()
@@ -224,6 +285,8 @@ class MarkdownBackend:
             memory_type=fm.get("memory_type", "observation"),
             source=fm.get("source"),
             extra=dict(fm.get("extra") or {}),
+            reinforcement_count=int(fm.get("reinforcement_count") or 0),
+            last_reinforced_at=_parse_dt(fm.get("last_reinforced_at")),
         )
 
 

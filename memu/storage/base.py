@@ -7,6 +7,8 @@ swapped without touching business logic.
 """
 from __future__ import annotations
 
+import hashlib
+import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import (
@@ -17,6 +19,19 @@ from typing import (
     Protocol,
     runtime_checkable,
 )
+
+
+_WS_RE = re.compile(r"\s+")
+
+
+def _normalize_for_hash(text: str) -> str:
+    """Whitespace/case-insensitive normalization for content hashing.
+
+    Collapses CRLF/LF/tabs/runs of spaces into single spaces, strips
+    leading/trailing whitespace, and lowercases. Storage retains the
+    original text — normalization is only for the hash itself.
+    """
+    return _WS_RE.sub(" ", text.replace("\r\n", "\n")).strip().lower()
 
 
 NodeKind = Literal["note", "code", "paper", "task"]
@@ -65,6 +80,27 @@ class WikiNode:
     memory_type: str = "observation"
     source: Optional[dict[str, Any]] = None  # {path, symbol, commit} for code/paper nodes
     extra: dict[str, Any] = field(default_factory=dict)
+    reinforcement_count: int = 0
+    last_reinforced_at: Optional[datetime] = None
+
+    def content_hash(self) -> str:
+        """SHA-256 over normalized body+title.
+
+        Stable under whitespace-only edits (one extra newline, trailing
+        spaces, CRLF vs LF, tab vs space, leading/trailing blanks) and
+        case changes. Changes when title or the textual body changes.
+
+        Distinct from ``metadata['source_hash']`` used by the codebase
+        ingester (that one hashes the raw source file; this one hashes
+        the rendered wiki body+title and powers reinforcement-on-dup).
+        """
+        norm_title = _normalize_for_hash(self.title or "")
+        norm_body = _normalize_for_hash(self.body or "")
+        digest = hashlib.sha256()
+        digest.update(norm_title.encode("utf-8"))
+        digest.update(b"\x00")  # separator so title|body cannot collide with body|title
+        digest.update(norm_body.encode("utf-8"))
+        return digest.hexdigest()
 
     def to_frontmatter(self) -> dict[str, Any]:
         """Serializable frontmatter dict (ordered for readability)."""
@@ -100,6 +136,10 @@ class WikiNode:
             fm["metadata"] = self.metadata
         if self.extra:
             fm["extra"] = self.extra
+        if self.reinforcement_count:
+            fm["reinforcement_count"] = self.reinforcement_count
+        if self.last_reinforced_at:
+            fm["last_reinforced_at"] = self.last_reinforced_at.isoformat()
         return fm
 
     def effective_time(self) -> Optional[datetime]:
@@ -163,7 +203,23 @@ class StorageBackend(Protocol):
     async def init(self) -> None: ...
 
     # --- node CRUD ---
-    async def put_node(self, node: WikiNode) -> WikiNode: ...
+    async def put_node(
+        self,
+        node: WikiNode,
+        *,
+        fencing_token: int | None = None,
+    ) -> WikiNode:
+        """Persist ``node``.
+
+        ``fencing_token`` is an optional guard produced by
+        :class:`memu.neighborhood_lock.NeighborhoodLock`. When provided,
+        the backend must verify the token matches the currently-held
+        lock on ``node.slug`` (inside the same transaction that mutates
+        the row) and raise :class:`memu.lane_lock.FencingTokenError` on
+        mismatch. When ``None`` (default) the backend skips the check
+        so existing callers stay unchanged.
+        """
+
     async def get_node(self, ref: str) -> Optional[WikiNode]:
         """Fetch by id or slug. Backends should accept either."""
 
@@ -172,6 +228,17 @@ class StorageBackend(Protocol):
     async def list_nodes(
         self, kind: Optional[NodeKind] = None, limit: int = 100
     ) -> list[WikiNode]: ...
+
+    async def reinforce_node(self, ref: str) -> Optional[WikiNode]:
+        """Atomically bump ``reinforcement_count`` + ``last_reinforced_at``.
+
+        Returns the updated node, or ``None`` if no node matches ``ref``.
+        Never mutates title/body/tags/links/metadata — a pure salience
+        signal for duplicate-on-write or explicit "I saw this again"
+        callers. Also invoked internally by :meth:`put_node` when the
+        incoming node's ``content_hash()`` matches the stored node's.
+        """
+        ...
 
     # --- slug registry ---
     async def register_slug(self, slug: str, node_id: str, kind: NodeKind) -> None: ...
