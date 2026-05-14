@@ -69,6 +69,22 @@ def _build_parser() -> argparse.ArgumentParser:
     serve = sub.add_parser("serve", help="Start a server")
     serve.add_argument("kind", choices=["mcp"])
 
+    sync = sub.add_parser("sync", help="Sync the vault filesystem into the index")
+    sync_sub = sync.add_subparsers(dest="sync_kind", required=True)
+    sync_run = sync_sub.add_parser("run", help="One-shot full reindex")
+    sync_run.add_argument("vault", help="Vault root directory")
+    sync_watch = sync_sub.add_parser("watch", help="Start a long-running watcher")
+    sync_watch.add_argument("vault")
+    sync_watch.add_argument(
+        "--poll", type=float, default=1.0, help="Polling interval in seconds (default 1.0)."
+    )
+    sync_watch.add_argument(
+        "--debounce",
+        type=int,
+        default=500,
+        help="Per-path debounce window in ms (default 500).",
+    )
+
     ingest = sub.add_parser("ingest", help="Ingest external sources")
     ingest_sub = ingest.add_subparsers(dest="ingest_kind", required=True)
     ingest_code = ingest_sub.add_parser("code", help="Ingest a codebase")
@@ -205,6 +221,39 @@ async def _cmd_serve(args: argparse.Namespace, backend: StorageBackend) -> int:
     return 1
 
 
+async def _cmd_sync_run(args: argparse.Namespace, backend: StorageBackend) -> int:
+    from ..wiki.sync import VaultSyncer
+
+    syncer = VaultSyncer(backend, Path(args.vault).expanduser().resolve())
+    report = await syncer.reindex_all()
+    print(f"Synced vault at {syncer.vault_root}")
+    print(f"  {report.summary()}")
+    return 0
+
+
+async def _cmd_sync_watch(args: argparse.Namespace, backend: StorageBackend) -> int:
+    from ..wiki.sync import SyncDaemon
+
+    vault = Path(args.vault).expanduser().resolve()
+    daemon = SyncDaemon(
+        backend,
+        vault,
+        poll_seconds=args.poll,
+        debounce_ms=args.debounce,
+    )
+    print(f"Watching {vault} (poll={args.poll}s debounce={args.debounce}ms)")
+    await daemon.start()
+    if daemon.last_report:
+        print(f"Initial reindex: {daemon.last_report.summary()}")
+    print("Press Ctrl-C to stop.")
+    try:
+        # Block until cancelled.
+        await asyncio.Event().wait()
+    finally:
+        await daemon.stop()
+    return 0
+
+
 async def _cmd_ingest_code(args: argparse.Namespace, backend: StorageBackend) -> int:
     from ..ingest import ingest_codebase
 
@@ -253,6 +302,11 @@ async def _dispatch(argv: Optional[list[str]] = None) -> int:
         if args.cmd == "ingest":
             if args.ingest_kind == "code":
                 return await _cmd_ingest_code(args, backend)
+        if args.cmd == "sync":
+            if args.sync_kind == "run":
+                return await _cmd_sync_run(args, backend)
+            if args.sync_kind == "watch":
+                return await _cmd_sync_watch(args, backend)
     finally:
         await backend.close()
     return 1
