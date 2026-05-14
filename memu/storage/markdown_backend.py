@@ -35,6 +35,8 @@ def slugify(text: str) -> str:
 class MarkdownBackend:
     """Filesystem backend. One markdown file per node."""
 
+    capabilities = frozenset({"fts"})
+
     def __init__(self, root: str | os.PathLike[str]):
         self.layout = VaultLayout(Path(root))
 
