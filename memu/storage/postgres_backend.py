@@ -72,5 +72,8 @@ class PostgresBackend:
         if False:  # pragma: no cover
             yield  # type: ignore[misc]
 
+    def get_lock_registry(self):  # pragma: no cover - stub
+        raise NotImplementedError
+
     async def close(self) -> None:  # pragma: no cover
         return None

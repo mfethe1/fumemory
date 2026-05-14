@@ -286,4 +286,13 @@ class StorageBackend(Protocol):
     # --- iteration (for sync/migration) ---
     async def iter_changed(self, since: Optional[datetime] = None) -> AsyncIterator[WikiNode]: ...
 
+    # --- concurrency ---
+    def get_lock_registry(self) -> "Any":
+        """Return the neighborhood lock registry bound to this backend.
+
+        See :mod:`memu.neighborhood_lock` for the exact protocol. Declared as
+        ``Any`` here to avoid a circular import; implementations return
+        something that satisfies :class:`memu.neighborhood_lock.LockRegistry`.
+        """
+
     async def close(self) -> None: ...

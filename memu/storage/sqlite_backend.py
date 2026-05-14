@@ -150,6 +150,13 @@ class SqliteBackend:
             raise RuntimeError("SqliteBackend.init() must be called before use")
         return self._conn
 
+    def get_lock_registry(self):
+        """Return a :class:`SqliteLockRegistry` sharing this backend's
+        connection. Callers must still ``await registry.init()`` before use."""
+        from ..neighborhood_lock import SqliteLockRegistry
+
+        return SqliteLockRegistry(conn=self.conn)
+
     # ---- node CRUD
     async def put_node(self, node: WikiNode) -> WikiNode:
         now = datetime.now(timezone.utc)
